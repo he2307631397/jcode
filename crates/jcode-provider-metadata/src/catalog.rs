@@ -80,6 +80,53 @@ pub const CORTECS_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     requires_api_key: true,
 };
 
+// OpenRouter also has a dedicated provider implementation elsewhere, but it
+// speaks the standard OpenAI-compatible /api/v1 endpoint, so it can be driven
+// by `provider-doctor` / `provider-test-coverage` like any other
+// OpenAI-compatible provider. `default_model` is None so the doctor selects the
+// live catalog's first model unless `--model` is passed.
+pub const OPENROUTER_OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "openrouter",
+    display_name: "OpenRouter",
+    api_base: "https://openrouter.ai/api/v1",
+    api_key_env: "OPENROUTER_API_KEY",
+    env_file: "openrouter.env",
+    setup_url: "https://openrouter.ai/keys",
+    default_model: None,
+    requires_api_key: true,
+};
+
+// Anthropic and OpenAI also expose OpenAI-compatible `/v1/chat/completions`
+// endpoints, so they can be driven by `provider-doctor` /
+// `provider-test-coverage` as OpenAI-compatible profiles. These profile ids
+// alias the native login-provider ids (`anthropic-api`, `openai-api`); auth
+// activation deliberately routes them through the native runtime, while the
+// live HTTP probes hit these hosts (Anthropic needs `x-api-key` +
+// `anthropic-version`, handled in the probe layer). `default_model` is None so
+// the doctor selects from the live catalog unless `--model` is passed.
+pub const ANTHROPIC_OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "anthropic-api",
+    display_name: "Anthropic API",
+    api_base: "https://api.anthropic.com/v1",
+    api_key_env: "ANTHROPIC_API_KEY",
+    env_file: "anthropic.env",
+    setup_url: "https://docs.anthropic.com/en/api/openai-sdk",
+    default_model: None,
+    requires_api_key: true,
+};
+
+pub const OPENAI_NATIVE_OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
+    id: "openai-api",
+    display_name: "OpenAI API",
+    api_base: "https://api.openai.com/v1",
+    api_key_env: "OPENAI_API_KEY",
+    env_file: "openai.env",
+    setup_url: "https://platform.openai.com/api-keys",
+    default_model: None,
+    requires_api_key: true,
+};
+
+
 pub const DEEPSEEK_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     id: "deepseek",
     display_name: "DeepSeek",
@@ -311,7 +358,7 @@ pub const CEREBRAS_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfile {
     api_key_env: "CEREBRAS_API_KEY",
     env_file: "cerebras.env",
     setup_url: "https://inference-docs.cerebras.ai/introduction",
-    default_model: Some("qwen-3-235b-a22b-instruct-2507"),
+    default_model: Some("gpt-oss-120b"),
     requires_api_key: true,
 };
 
@@ -359,7 +406,7 @@ pub const OPENAI_COMPAT_PROFILE: OpenAiCompatibleProfile = OpenAiCompatibleProfi
     requires_api_key: true,
 };
 
-pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 32] = [
+pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 35] = [
     OPENCODE_PROFILE,
     OPENCODE_GO_PROFILE,
     ZAI_PROFILE,
@@ -370,6 +417,9 @@ pub(crate) const OPENAI_COMPAT_PROFILES: [OpenAiCompatibleProfile; 32] = [
     AI302_PROFILE,
     BASETEN_PROFILE,
     CORTECS_PROFILE,
+    OPENROUTER_OPENAI_COMPAT_PROFILE,
+    ANTHROPIC_OPENAI_COMPAT_PROFILE,
+    OPENAI_NATIVE_OPENAI_COMPAT_PROFILE,
     DEEPSEEK_PROFILE,
     COMTEGRA_PROFILE,
     FPT_PROFILE,
@@ -405,6 +455,19 @@ pub const CLAUDE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     recommended: true,
     target: LoginProviderTarget::Claude,
     order: LoginProviderSurfaceOrder::new(Some(1), Some(1), Some(1), Some(1), Some(1)),
+};
+
+pub const ANTHROPIC_API_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
+    id: "anthropic-api",
+    display_name: "Anthropic API",
+    auth_kind: LoginProviderAuthKind::ApiKey,
+    auth_state_key: LoginProviderAuthStateKey::Anthropic,
+    auth_status_method: "API key",
+    aliases: &["claude-api", "anthropic-key", "claude-key"],
+    menu_detail: "direct Anthropic Messages API",
+    recommended: false,
+    target: LoginProviderTarget::ClaudeApiKey,
+    order: LoginProviderSurfaceOrder::new(Some(2), Some(2), Some(2), Some(2), Some(2)),
 };
 
 pub const AUTO_IMPORT_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescriptor {
@@ -990,9 +1053,10 @@ pub const GOOGLE_LOGIN_PROVIDER: LoginProviderDescriptor = LoginProviderDescript
     order: LoginProviderSurfaceOrder::new(Some(13), None, None, None, None),
 };
 
-pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 45] = [
+pub(crate) const LOGIN_PROVIDERS: [LoginProviderDescriptor; 46] = [
     AUTO_IMPORT_LOGIN_PROVIDER,
     CLAUDE_LOGIN_PROVIDER,
+    ANTHROPIC_API_LOGIN_PROVIDER,
     OPENAI_LOGIN_PROVIDER,
     OPENAI_API_LOGIN_PROVIDER,
     JCODE_LOGIN_PROVIDER,

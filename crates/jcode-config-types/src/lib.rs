@@ -437,9 +437,9 @@ pub struct KeybindingsConfig {
     pub scroll_prompt_down: String,
     /// Scroll bookmark toggle key (default: "ctrl+g")
     pub scroll_bookmark: String,
-    /// Scroll up fallback key (default: "cmd+k")
+    /// Scroll up fallback key (default: unset; Cmd+K moves up by prompt on macOS)
     pub scroll_up_fallback: String,
-    /// Scroll down fallback key (default: "cmd+j")
+    /// Scroll down fallback key (default: unset; Cmd+J moves down by prompt on macOS)
     pub scroll_down_fallback: String,
     /// Workspace navigation left key (default: "alt+h")
     pub workspace_left: String,
@@ -449,6 +449,18 @@ pub struct KeybindingsConfig {
     pub workspace_up: String,
     /// Workspace navigation right key (default: "alt+l")
     pub workspace_right: String,
+    /// Toggle the side panel (default: "alt+m")
+    pub side_panel_toggle: String,
+    /// Toggle copy/selection mode (default: "alt+y")
+    pub copy_selection_toggle: String,
+    /// Toggle the diagram pane position (default: "alt+t")
+    pub diagram_pane_toggle: String,
+    /// Toggle typing scroll lock (default: "alt+s")
+    pub typing_scroll_lock_toggle: String,
+    /// Cycle inline diff display mode (default: "alt+g")
+    pub diff_mode_cycle: String,
+    /// Toggle the info widget (default: "alt+i")
+    pub info_widget_toggle: String,
     /// Session picker Enter action: "current-terminal" (default) or "new-terminal".
     /// Ctrl+Enter performs the alternate action.
     pub session_picker_enter: SessionPickerResumeAction,
@@ -469,12 +481,18 @@ impl Default for KeybindingsConfig {
             scroll_prompt_up: "ctrl+[".to_string(),
             scroll_prompt_down: "ctrl+]".to_string(),
             scroll_bookmark: "ctrl+g".to_string(),
-            scroll_up_fallback: "cmd+k".to_string(),
-            scroll_down_fallback: "cmd+j".to_string(),
+            scroll_up_fallback: String::new(),
+            scroll_down_fallback: String::new(),
             workspace_left: "alt+h".to_string(),
             workspace_down: "alt+j".to_string(),
             workspace_up: "alt+k".to_string(),
             workspace_right: "alt+l".to_string(),
+            side_panel_toggle: "alt+m".to_string(),
+            copy_selection_toggle: "alt+y".to_string(),
+            diagram_pane_toggle: "alt+t".to_string(),
+            typing_scroll_lock_toggle: "alt+s".to_string(),
+            diff_mode_cycle: "alt+g".to_string(),
+            info_widget_toggle: "alt+i".to_string(),
             session_picker_enter: SessionPickerResumeAction::CurrentTerminal,
         }
     }
@@ -544,6 +562,8 @@ pub struct DisplayConfig {
     pub redraw_fps: u32,
     /// Show a truncated preview of the previous prompt at the top when it scrolls out of view (default: true)
     pub prompt_preview: bool,
+    /// Override the Alt/Option label shown in copy badges. Empty = auto (⌥ on macOS, Alt elsewhere).
+    pub copy_badge_alt_label: String,
     /// Native terminal scrollbar configuration for scrollable panes
     pub native_scrollbars: NativeScrollbarConfig,
 }
@@ -570,6 +590,7 @@ impl Default for DisplayConfig {
             animation_fps: 60,
             redraw_fps: 60,
             prompt_preview: true,
+            copy_badge_alt_label: String::new(),
             native_scrollbars: NativeScrollbarConfig::default(),
         }
     }
@@ -597,6 +618,9 @@ pub struct FeatureConfig {
     pub swarm: bool,
     /// Inject timestamps into user messages and tool results sent to the model (default: true)
     pub message_timestamps: bool,
+    /// Persist auto-recalled memory injections into normal session history instead of sending
+    /// them as request-only ephemeral suffix messages (default: false)
+    pub persist_memory_injections: bool,
     /// Update channel: "stable" (releases only) or "main" (latest commits)
     pub update_channel: UpdateChannel,
 }
@@ -607,6 +631,7 @@ impl Default for FeatureConfig {
             memory: true,
             swarm: true,
             message_timestamps: true,
+            persist_memory_injections: false,
             update_channel: UpdateChannel::default(),
         }
     }
@@ -671,12 +696,14 @@ impl Default for WebSearchConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
-    /// Default model to use (e.g. "claude-opus-4-6", "copilot:claude-opus-4.6")
+    /// Default model to use (e.g. "claude-opus-4-8", "copilot:claude-opus-4.6")
     pub default_model: Option<String>,
     /// Default provider to use (claude|openai|copilot|openrouter)
     pub default_provider: Option<String>,
     /// Reasoning effort for OpenAI Responses API (none|low|medium|high|xhigh)
     pub openai_reasoning_effort: Option<String>,
+    /// Reasoning effort for Anthropic Messages API output_config (none|low|medium|high|xhigh; max aliases to strongest supported)
+    pub anthropic_reasoning_effort: Option<String>,
     /// OpenAI transport mode (auto|websocket|https)
     pub openai_transport: Option<String>,
     /// OpenAI service tier override (priority|flex)
@@ -685,6 +712,8 @@ pub struct ProviderConfig {
     pub openai_native_compaction_mode: String,
     /// Token threshold at which OpenAI auto native compaction should trigger.
     pub openai_native_compaction_threshold_tokens: usize,
+    /// Preserve provider-native reasoning/thinking items for future-turn context when supported.
+    pub preserve_reasoning_context: bool,
     /// How to handle cross-provider failover when the same input would be resent elsewhere.
     pub cross_provider_failover: CrossProviderFailoverMode,
     /// Whether jcode should automatically try another account on the same provider
@@ -701,10 +730,12 @@ impl Default for ProviderConfig {
             default_model: None,
             default_provider: None,
             openai_reasoning_effort: Some("low".to_string()),
+            anthropic_reasoning_effort: None,
             openai_transport: None,
             openai_service_tier: Some("priority".to_string()),
             openai_native_compaction_mode: "auto".to_string(),
             openai_native_compaction_threshold_tokens: 200_000,
+            preserve_reasoning_context: true,
             cross_provider_failover: CrossProviderFailoverMode::Countdown,
             same_provider_account_failover: true,
             copilot_premium: None,
@@ -804,6 +835,20 @@ pub struct SafetyConfig {
     pub discord_bot_user_id: Option<String>,
     /// Enable Discord reply → agent directive feature (default: false)
     pub discord_reply_enabled: bool,
+    /// Enable the Jade cloud relay channel (remote control via cloud mailbox, default: false)
+    pub jade_relay_enabled: bool,
+    /// Jade relay API base URL (e.g. https://...lambda-url.us-east-1.on.aws/)
+    pub jade_relay_api_base: Option<String>,
+    /// Jade relay bearer token (prefer JCODE_JADE_RELAY_TOKEN env var)
+    pub jade_relay_token: Option<String>,
+    /// Jade relay token id header (x-jade-token-id), used for fast token lookup
+    pub jade_relay_token_id: Option<String>,
+    /// Jade relay user id (channel scope; defaults to the token's user when omitted)
+    pub jade_relay_user_id: Option<String>,
+    /// Jade relay session id to bind this laptop's listener to (the channel = user_id/session_id)
+    pub jade_relay_session_id: Option<String>,
+    /// Enable Jade relay prompt → agent directive feature (default: false)
+    pub jade_relay_reply_enabled: bool,
 }
 
 impl Default for SafetyConfig {
@@ -830,6 +875,13 @@ impl Default for SafetyConfig {
             discord_channel_id: None,
             discord_bot_user_id: None,
             discord_reply_enabled: false,
+            jade_relay_enabled: false,
+            jade_relay_api_base: None,
+            jade_relay_token: None,
+            jade_relay_token_id: None,
+            jade_relay_user_id: None,
+            jade_relay_session_id: None,
+            jade_relay_reply_enabled: false,
         }
     }
 }

@@ -13,9 +13,18 @@ pub struct RenderedMessage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenderedCompactedHistoryInfo {
+    /// Number of compacted historical messages that can render visibly in the UI.
+    /// Hidden internal reminders are excluded from this count.
     pub total_messages: usize,
+    /// Number of renderable compacted historical messages included in this payload.
     pub visible_messages: usize,
+    /// Number of older renderable compacted historical messages still hidden.
     pub remaining_messages: usize,
+    /// Number of user prompts (turns) that are hidden before the first rendered
+    /// message. Used to keep prompt numbering correct when older history is
+    /// truncated (e.g. the first visible prompt is really the 5th, not the 1st).
+    #[serde(default)]
+    pub hidden_user_prompts: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

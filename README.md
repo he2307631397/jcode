@@ -2,11 +2,11 @@
 
 # jcode
 
-[![Latest Release](https://img.shields.io/github/v/release/1jehuang/jcode?style=flat-square)](https://github.com/1jehuang/jcode/releases)
-[![License](https://img.shields.io/github/license/1jehuang/jcode?style=flat-square)](LICENSE)
+[![Latest Release](https://badgen.net/github/release/1jehuang/jcode?icon=github)](https://github.com/1jehuang/jcode/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Linux%20%7C%20macOS%20%7C%20Windows-blue?style=flat-square)](https://github.com/1jehuang/jcode/releases)
-[![Commit Activity](https://img.shields.io/github/commit-activity/m/1jehuang/jcode?style=flat-square)](https://github.com/1jehuang/jcode/commits/master)
-[![GitHub Stars](https://img.shields.io/github/stars/1jehuang/jcode?style=flat-square)](https://github.com/1jehuang/jcode/stargazers)
+[![Last Commit](https://badgen.net/github/last-commit/1jehuang/jcode/master?icon=github)](https://github.com/1jehuang/jcode/commits/master)
+[![GitHub Stars](https://badgen.net/github/stars/1jehuang/jcode?icon=github)](https://github.com/1jehuang/jcode/stargazers)
 
 The next generation coding agent harness to raise the skill ceiling. <br>
 Built for multi-session workflows, infinite customizability, and performance. 
@@ -372,6 +372,22 @@ jcode provider add local-vllm \
   --set-default
 ```
 
+Built-in local profiles are available for the common desktop/local runtimes:
+
+```bash
+# Ollama: start the local server and install a model first.
+ollama pull llama3.2
+jcode login --provider ollama
+jcode --provider ollama --model llama3.2 run 'hello'
+
+# LM Studio: start the Local Server, load a chat model, then use the exact
+# model identifier shown by LM Studio or by curl http://localhost:1234/v1/models.
+jcode login --provider lmstudio
+jcode --provider lmstudio --model '<model-id>' run 'hello'
+```
+
+Ollama and LM Studio both expose OpenAI-compatible `/v1/models` and `/v1/chat/completions` endpoints. jcode uses streaming chat completions, function/tool calling, and OpenAI-style image content for vision-capable local models. If a local server requires a token, enter it during `jcode login` or create a named profile with `--api-key-stdin`.
+
 Useful flags:
 
 - `--api-key-env NAME`: reference an existing environment variable instead of storing a key.
@@ -708,6 +724,15 @@ This is intended to be a copy-paste bootstrap prompt for jcode itself or any oth
 curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.sh | bash
 ```
 
+On Termux, install the glibc runtime and `patchelf` first so the installer can
+patch the downloaded Linux binary to Termux's glibc dynamic linker and create a
+launcher that avoids Termux's `LD_PRELOAD` shim:
+
+```bash
+pkg install glibc patchelf
+curl -fsSL https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.sh | bash
+```
+
 ```powershell
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/1jehuang/jcode/master/scripts/install.ps1 | iex
@@ -753,5 +778,6 @@ scripts/install_release.sh
 | **Linux** x86_64 / aarch64 | Fully supported |
 | **macOS** Apple Silicon & Intel | Supported |
 | **Windows** x86_64 | Supported (native + WSL2) |
+| **Termux** aarch64 / x86_64 | Supported with `pkg install glibc patchelf` |
 
 </div>

@@ -20,6 +20,60 @@ pub async fn run() -> Result<()> {
     logging::cleanup_old_logs();
     startup_profile::mark("log_cleanup");
     logging::info("jcode starting");
+
+    // Wire config-reload reactions without making config depend on auth/bus:
+    // when the config cache reloads, invalidate the auth-status cache and
+    // broadcast a models-updated event.
+    crate::config::on_config_reloaded(|| crate::auth::AuthStatus::invalidate_cache());
+    crate::config::on_config_reloaded(|| crate::bus::Bus::global().publish_models_updated());
+
+    // Invert the legacy provider_catalog -> auth dependency: provider_catalog
+    // consults registered fallback resolvers, and auth (the higher layer)
+    // registers its external-CLI credential scan here.
+    crate::provider_catalog::register_api_key_fallback_resolver(
+        crate::auth::external::load_api_key_for_env,
+    );
+
+    // Invert the legacy safety -> notifications dependency: safety raises a
+    // permission request and the notifications layer (which depends on safety
+    // types) delivers it via the dispatcher registered here.
+    crate::safety::register_permission_notifier(|action, description, request_id| {
+        crate::notifications::NotificationDispatcher::new().dispatch_permission_request(
+            action,
+            description,
+            request_id,
+        );
+    });
+
+    // Invert the legacy memory -> skill dependency: memory collects synthetic
+    // entries from registered providers, and skill (the higher layer that
+    // depends on MemoryEntry) registers its registry->memory adapter here.
+    crate::memory::register_synthetic_entry_provider(|| {
+        crate::skill::SkillRegistry::shared_snapshot()
+            .list()
+            .into_iter()
+            .map(|skill| skill.as_memory_entry())
+            .collect()
+    });
+
+    // Invert the legacy server -> tui dependency: the TUI session picker owns
+    // the session-list cache and registers its invalidator here, so the server
+    // can drop the cache (e.g. after a rename) without referencing tui.
+    crate::session_list_cache::register_invalidator(
+        crate::tui::session_picker::invalidate_session_list_cache,
+    );
+
+    // Invert the legacy tui -> cli dependency for shared-server spawning: the
+    // CLI owns the provider-bootstrap spawn logic and registers it here, so the
+    // TUI reconnect loop can request a replacement server via server_spawn
+    // without referencing cli.
+    crate::server_spawn::register_default_server_spawner(Box::new(|| {
+        Box::pin(async {
+            dispatch::spawn_server(&crate::cli::provider_init::ProviderChoice::Auto, None, None)
+                .await
+        })
+    }));
+
     crate::platform::raise_nofile_limit_best_effort(8_192);
     startup_profile::mark("nofile_limit");
 
@@ -63,7 +117,7 @@ fn parse_and_prepare_args() -> Result<Args> {
         server::set_socket_path(socket);
     }
 
-    crate::process_title::set_initial_title(&args);
+    crate::cli::proctitle::set_initial_title(&args);
 
     Ok(args)
 }
@@ -84,7 +138,8 @@ fn spawn_background_update_check(args: &Args) {
                 logging::info(&format!("Update available: {} -> {}", current, latest));
             }
             update::UpdateCheckResult::UpdateInstalled { version, path } => {
-                update::print_centered(&format!("✅ Updated to {}. Restarting...", version));
+                logging::info(&format!("Updated to {}. Restarting...", version));
+                std::thread::sleep(std::time::Duration::from_millis(250));
                 let args: Vec<String> = std::env::args().skip(1).collect();
                 let exec_path = build::client_update_candidate(false)
                     .map(|(p, _)| p)
@@ -103,13 +158,25 @@ fn spawn_background_update_check(args: &Args) {
         });
     } else {
         std::thread::spawn(move || {
+            use crate::bus::{Bus, BusEvent, UpdateStatus};
+
             let start = std::time::Instant::now();
+            Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Checking));
             if let Some(update_available) = hot_exec::check_for_updates()
                 && update_available
             {
+                Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Available {
+                    current: jcode_build_meta::VERSION.to_string(),
+                    latest: "latest source".to_string(),
+                }));
                 if auto_update {
                     logging::info("Update available - auto-updating...");
+                    Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::Installing {
+                        version: "latest source".to_string(),
+                    }));
                     if let Err(e) = hot_exec::run_auto_update() {
+                        Bus::global()
+                            .publish(BusEvent::UpdateStatus(UpdateStatus::Error(e.to_string())));
                         logging::error(&format!(
                             "Auto-update failed: {}. Continuing with current version.",
                             e
@@ -118,6 +185,8 @@ fn spawn_background_update_check(args: &Args) {
                 } else {
                     logging::info("Update available! Run `jcode update` or `/reload` to update.");
                 }
+            } else {
+                Bus::global().publish(BusEvent::UpdateStatus(UpdateStatus::UpToDate));
             }
             logging::info(&format!(
                 "[TIMING] background_update_check: auto_update={}, total={}ms",
@@ -133,7 +202,7 @@ fn should_spawn_background_update_check(args: &Args) -> bool {
         && !args.no_update
         && !matches!(
             args.command,
-            Some(Command::Update) | Some(Command::Serve { .. })
+            Some(Command::Update) | Some(Command::Serve { .. }) | Some(Command::Acp)
         )
         && args.resume.is_none()
 }
