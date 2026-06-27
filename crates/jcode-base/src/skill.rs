@@ -321,9 +321,19 @@ impl SkillRegistry {
         self.skills.get(name)
     }
 
-    /// List all available skills
+    /// List all available skills.
+    ///
+    /// Sorted by skill name so the ordering is deterministic. The backing store
+    /// is a `HashMap`, whose iteration order is randomized per instance; without
+    /// this sort, two snapshots of the same skill set (e.g. the lock-contended
+    /// `self.skills.clone()` fallback in `current_skills_snapshot`) could emit
+    /// the "Available Skills" prompt section in different orders. That produces a
+    /// system prompt with identical length but different bytes, silently busting
+    /// the Anthropic strict-prefix KV cache mid-conversation.
     pub fn list(&self) -> Vec<&Skill> {
-        self.skills.values().collect()
+        let mut skills: Vec<&Skill> = self.skills.values().collect();
+        skills.sort_by(|a, b| a.name.cmp(&b.name));
+        skills
     }
 
     /// Reload a specific skill by name
@@ -415,6 +425,209 @@ impl SkillRegistry {
             None
         }
     }
+
+    /// Return true if a skill with the given name is currently loaded.
+    pub fn contains(&self, name: &str) -> bool {
+        self.skills.contains_key(name)
+    }
+}
+
+/// A skill recommended/curated by jcode that the user may want to install.
+#[derive(Debug, Clone, Copy)]
+pub struct EndorsedSkill {
+    /// Skill name (matches the `name` field in SKILL.md and the slash command).
+    pub name: &'static str,
+    /// One-line description of what the skill does.
+    pub description: &'static str,
+    /// Grouping label used to organize the endorsed list (e.g. "jcode",
+    /// "NVIDIA CUDA-X").
+    pub category: &'static str,
+    /// Where users can get the skill (repo path, URL, or short note).
+    pub source: &'static str,
+    /// Optional install command/hint shown when the skill is not installed.
+    pub install: Option<&'static str>,
+}
+
+/// Curated list of skills endorsed by jcode. Used by the `/skills` command to
+/// show users which recommended skills they have installed and which they are
+/// missing. This is the single source of truth for endorsed skills.
+///
+/// The NVIDIA CUDA-X entries mirror the official NVIDIA-verified catalog at
+/// <https://github.com/NVIDIA/skills>; install them with
+/// `npx skills add nvidia/skills --skill <name> --yes`.
+pub const ENDORSED_SKILLS: &[EndorsedSkill] = &[
+    EndorsedSkill {
+        name: "optimization",
+        description: "Improve performance, latency, throughput, memory usage, or general efficiency by defining metrics, measuring, attributing bottlenecks, and prioritizing macro-optimizations.",
+        category: "jcode",
+        source: "bundled in jcode repo (.jcode/skills/optimization)",
+        install: None,
+    },
+    EndorsedSkill {
+        name: "todo-planning-skill",
+        description: "Create thorough, well-structured todo lists for long tasks, including reflection, static analysis, verification, and next-step updates.",
+        category: "jcode",
+        source: "bundled with jcode / Claude Code skills",
+        install: None,
+    },
+    EndorsedSkill {
+        name: "firefox-browser",
+        description: "Control the user's Firefox browser with their logins and cookies intact to browse, fill forms, click, screenshot, and read authenticated pages.",
+        category: "jcode",
+        source: "bundled with jcode / Claude Code skills",
+        install: None,
+    },
+    // Anthropic official skills (github.com/anthropics/skills, Apache-2.0).
+    EndorsedSkill {
+        name: "frontend-design",
+        description: "Create distinctive, production-grade frontend interfaces with high design quality (web components, pages, apps). Generates creative, polished code that avoids generic AI aesthetics.",
+        category: "Anthropic Design",
+        source: "anthropics/skills (official Anthropic catalog)",
+        install: Some(
+            "npx skills add anthropics/skills --skill frontend-design --yes (or Claude Code: /plugin marketplace add anthropics/skills)",
+        ),
+    },
+    // NVIDIA CUDA-X / GPU accelerated-computing skills from the official
+    // NVIDIA-verified catalog (github.com/NVIDIA/skills).
+    EndorsedSkill {
+        name: "cuopt-developer",
+        description: "Modify, build, test, debug, and contribute to NVIDIA cuOpt (C++/CUDA, Python, server, CI) — solver internals, PRs, DCO, and code conventions.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cuopt-developer --yes"),
+    },
+    EndorsedSkill {
+        name: "cuopt-install",
+        description: "Install NVIDIA cuOpt for Python, C, or server via pip, conda, or Docker, and verify the install.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cuopt-install --yes"),
+    },
+    EndorsedSkill {
+        name: "cuopt-numerical-optimization-api-c",
+        description: "Solve LP, MILP, and QP (beta) with the cuOpt C API for embedding optimization in C/C++.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some(
+            "npx skills add nvidia/skills --skill cuopt-numerical-optimization-api-c --yes",
+        ),
+    },
+    EndorsedSkill {
+        name: "cuopt-numerical-optimization-api-cli",
+        description: "Solve LP, MILP, and QP (beta) with cuOpt from MPS files via the cuopt_cli command line.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some(
+            "npx skills add nvidia/skills --skill cuopt-numerical-optimization-api-cli --yes",
+        ),
+    },
+    EndorsedSkill {
+        name: "cuopt-numerical-optimization-api-python",
+        description: "Solve LP, MILP, and QP (beta) with the cuOpt Python API — linear/quadratic objectives, integer variables, scheduling, portfolio, and least squares.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some(
+            "npx skills add nvidia/skills --skill cuopt-numerical-optimization-api-python --yes",
+        ),
+    },
+    EndorsedSkill {
+        name: "cuopt-numerical-optimization-formulation",
+        description: "LP, MILP, and QP concepts and formulation patterns (parameters, constraints, decisions, objective). Concepts only; no API.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some(
+            "npx skills add nvidia/skills --skill cuopt-numerical-optimization-formulation --yes",
+        ),
+    },
+    EndorsedSkill {
+        name: "cuopt-routing-api-python",
+        description: "Solve vehicle routing (VRP, TSP, PDP) with the cuOpt Python API.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cuopt-routing-api-python --yes"),
+    },
+    EndorsedSkill {
+        name: "cuopt-routing-formulation",
+        description: "Vehicle routing (VRP, TSP, PDP) problem types and data requirements. Domain concepts; no API or interface.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cuopt-routing-formulation --yes"),
+    },
+    EndorsedSkill {
+        name: "cuopt-server-api-python",
+        description: "Run the cuOpt REST server — start it, call endpoints, and use Python/curl client examples.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cuopt-server-api-python --yes"),
+    },
+    EndorsedSkill {
+        name: "cuopt-server-common",
+        description: "Understand what the cuOpt REST server does and how requests flow. Concepts only; no deploy or client code.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cuopt-server-common --yes"),
+    },
+    EndorsedSkill {
+        name: "cuopt-user-rules",
+        description: "Base rules for end users calling NVIDIA cuOpt (routing/LP/MILP/QP/install/server).",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cuopt-user-rules --yes"),
+    },
+    EndorsedSkill {
+        name: "cupynumeric-install",
+        description: "Install and verify NVIDIA cuPyNumeric (NumPy/SciPy on multi-node multi-GPU) for Python — requirements, commands, and verification.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cupynumeric-install --yes"),
+    },
+    EndorsedSkill {
+        name: "cupynumeric-migration-readiness",
+        description: "Assess NumPy code before porting to cuPyNumeric — which patterns scale on GPU, what must be refactored, and a READY/REFACTOR/NOT-RECOMMENDED verdict.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cupynumeric-migration-readiness --yes"),
+    },
+    EndorsedSkill {
+        name: "cupynumeric-hdf5",
+        description: "Read and write large cuPyNumeric arrays to HDF5 with Legate's parallel, distributed HDF5 I/O (legate.io.hdf5), including GPUDirect Storage.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cupynumeric-hdf5 --yes"),
+    },
+    EndorsedSkill {
+        name: "cupynumeric-parallel-data-load",
+        description: "Load sharded on-disk datasets (.npy, Parquet/Arrow, raw binary, sharded HDF5) into a distributed cuPyNumeric ndarray via manual partition + leaf task launch.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cupynumeric-parallel-data-load --yes"),
+    },
+    EndorsedSkill {
+        name: "accelerated-computing-cudf",
+        description: "Official NVIDIA guidance for cuDF GPU DataFrames, pandas acceleration, dask-cuDF, ETL, joins, groupby, CSV/Parquet I/O, and multi-GPU DataFrame workloads.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill accelerated-computing-cudf --yes"),
+    },
+    EndorsedSkill {
+        name: "cudaq-guide",
+        description: "NVIDIA CUDA-Q (CUDA Quantum) onboarding guide for installation, test programs, GPU simulation, QPU hardware, and quantum applications.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill cudaq-guide --yes"),
+    },
+    EndorsedSkill {
+        name: "tilegym-adding-cutile-kernel",
+        description: "Add a new cuTile GPU kernel operator to NVIDIA TileGym — dispatch registration, cuTile backend implementation, exports, tests, and benchmarks.",
+        category: "NVIDIA CUDA-X",
+        source: "NVIDIA/skills (official NVIDIA-verified catalog)",
+        install: Some("npx skills add nvidia/skills --skill tilegym-adding-cutile-kernel --yes"),
+    },
+];
+
+/// Return the curated list of skills endorsed by jcode.
+pub fn endorsed_skills() -> &'static [EndorsedSkill] {
+    ENDORSED_SKILLS
 }
 
 impl Skill {
@@ -438,28 +651,22 @@ impl Skill {
 
     pub fn as_memory_entry(&self) -> crate::memory::MemoryEntry {
         let now = Utc::now() - chrono::Duration::days(365);
-        crate::memory::MemoryEntry {
-            id: format!("skill:{}", self.name),
-            category: crate::memory::MemoryCategory::Custom("Skills".to_string()),
-            content: format!(
+        let mut entry = crate::memory::MemoryEntry::new(
+            crate::memory::MemoryCategory::Custom("Skills".to_string()),
+            format!(
                 "Use skill `/{} ` when relevant.\n\n{}",
                 self.name,
                 self.get_prompt()
             ),
-            tags: vec!["skill".to_string(), self.name.clone()],
-            search_text: self.search_text.clone(),
-            created_at: now,
-            updated_at: now,
-            access_count: 0,
-            source: Some("skill_registry".to_string()),
-            trust: crate::memory::TrustLevel::Medium,
-            strength: 1,
-            active: true,
-            superseded_by: None,
-            reinforcements: Vec::new(),
-            embedding: None,
-            confidence: 1.0,
-        }
+        )
+        .with_id(format!("skill:{}", self.name))
+        .with_tags(vec!["skill".to_string(), self.name.clone()])
+        .with_source("skill_registry")
+        .with_trust(crate::memory::TrustLevel::Medium)
+        .with_timestamps(now, now);
+        // Use the precomputed skill search text rather than the tag-derived one.
+        entry.search_text = self.search_text.clone();
+        entry
     }
 }
 
@@ -509,6 +716,43 @@ mod tests {
     }
 
     #[test]
+    fn list_is_sorted_by_name_regardless_of_insertion_order() {
+        // The "Available Skills" system-prompt section is built from `list()`.
+        // The backing store is a HashMap (per-instance randomized iteration
+        // order), and `current_skills_snapshot` can hand back a *different*
+        // HashMap instance via its lock-contended `self.skills.clone()` fallback.
+        // If `list()` did not sort, two snapshots of the same skill set could
+        // serialize the section in different orders: a same-length but
+        // different-bytes system prompt that silently busts the KV cache.
+        let names = ["zebra", "alpha", "mango", "beta", "yak"];
+
+        let mut reg_a = SkillRegistry::default();
+        for name in names {
+            reg_a
+                .skills
+                .insert(name.to_string(), test_skill(name, "d", "c"));
+        }
+
+        // Build a second registry with the reverse insertion order to maximize
+        // the chance of a differing HashMap layout.
+        let mut reg_b = SkillRegistry::default();
+        for name in names.iter().rev() {
+            reg_b
+                .skills
+                .insert(name.to_string(), test_skill(name, "d", "c"));
+        }
+
+        let order_a: Vec<&str> = reg_a.list().iter().map(|s| s.name.as_str()).collect();
+        let order_b: Vec<&str> = reg_b.list().iter().map(|s| s.name.as_str()).collect();
+
+        assert_eq!(order_a, vec!["alpha", "beta", "mango", "yak", "zebra"]);
+        assert_eq!(
+            order_a, order_b,
+            "list() ordering must be identical across HashMap instances"
+        );
+    }
+
+    #[test]
     fn skill_as_memory_entry_formats_invocation_and_prompt() {
         let skill = test_skill(
             "firefox-browser",
@@ -554,5 +798,102 @@ mod tests {
 
         assert!(count >= 1);
         assert!(registry.get("session-skill").is_some());
+    }
+
+    #[test]
+    fn endorsed_skills_have_unique_nonempty_metadata() {
+        let endorsed = endorsed_skills();
+        assert!(!endorsed.is_empty(), "expected at least one endorsed skill");
+
+        let mut seen = std::collections::HashSet::new();
+        for skill in endorsed {
+            assert!(!skill.name.is_empty(), "endorsed skill name must be set");
+            assert!(
+                !skill.description.is_empty(),
+                "endorsed skill {} needs a description",
+                skill.name
+            );
+            assert!(
+                !skill.category.is_empty(),
+                "endorsed skill {} needs a category",
+                skill.name
+            );
+            assert!(
+                !skill.source.is_empty(),
+                "endorsed skill {} needs a source",
+                skill.name
+            );
+            assert!(
+                !skill.name.starts_with('/'),
+                "endorsed skill name should not include the leading slash"
+            );
+            if let Some(install) = skill.install {
+                assert!(
+                    install.contains(skill.name),
+                    "endorsed skill {} install hint should reference its name",
+                    skill.name
+                );
+            }
+            assert!(
+                seen.insert(skill.name),
+                "duplicate endorsed skill name: {}",
+                skill.name
+            );
+        }
+    }
+
+    #[test]
+    fn endorsed_skills_include_nvidia_cuda_x_catalog() {
+        let endorsed = endorsed_skills();
+        // Spot-check representative NVIDIA CUDA-X skills sourced from the
+        // official NVIDIA/skills catalog.
+        for expected in [
+            "cuopt-numerical-optimization-api-python",
+            "cupynumeric-install",
+            "accelerated-computing-cudf",
+            "cudaq-guide",
+            "tilegym-adding-cutile-kernel",
+        ] {
+            let skill = endorsed
+                .iter()
+                .find(|s| s.name == expected)
+                .unwrap_or_else(|| panic!("expected endorsed NVIDIA skill {expected}"));
+            assert_eq!(skill.category, "NVIDIA CUDA-X");
+            assert!(
+                skill
+                    .install
+                    .is_some_and(|cmd| cmd.contains("nvidia/skills")),
+                "NVIDIA skill {expected} should have an nvidia/skills install hint"
+            );
+        }
+    }
+
+    #[test]
+    fn endorsed_skills_include_anthropic_frontend_design() {
+        let skill = endorsed_skills()
+            .iter()
+            .find(|s| s.name == "frontend-design")
+            .expect("expected endorsed Anthropic frontend-design skill");
+        assert_eq!(skill.category, "Anthropic Design");
+        assert!(
+            skill.source.contains("anthropics/skills"),
+            "frontend-design should be sourced from anthropics/skills"
+        );
+        assert!(
+            skill
+                .install
+                .is_some_and(|cmd| cmd.contains("anthropics/skills")),
+            "frontend-design should have an anthropics/skills install hint"
+        );
+    }
+
+    #[test]
+    fn registry_contains_reports_loaded_skills() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        write_test_skill(temp.path(), ".jcode", "present-skill");
+
+        let registry = SkillRegistry::load_for_working_dir(Some(temp.path())).expect("load skills");
+        assert!(registry.contains("present-skill"));
+        assert!(!registry.contains("missing-skill"));
     }
 }

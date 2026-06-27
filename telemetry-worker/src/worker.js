@@ -52,7 +52,79 @@ export default {
       return jsonResponse({ error: "Internal error" }, 500);
     }
   },
+
+  // Nightly retention pruning. D1 hard-caps databases at 500 MB; without this
+  // the raw events table eventually fills the cap and every insert starts
+  // returning 500s (which silently drops all telemetry). High-volume raw rows
+  // are pruned on a schedule while aggregate signal is preserved in the
+  // daily_active_users rollup and in long-retention lifecycle events.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(pruneOldEvents(env));
+  },
 };
+
+// Retention windows, in days, per event type. Children (turn_details /
+// session_details) are deleted before their parent events rows to satisfy the
+// FOREIGN KEY (event_id) constraints.
+//
+// Rationale:
+// - turn_end / session_start / onboarding_step are the high-volume rows that
+//   filled the database; their aggregate signal is captured in the
+//   daily_active_users rollup at insert time.
+// - session_end / session_crash power the headline "total users" and crash
+//   metrics; keep them for 12 months per the documented retention policy.
+// - install and feedback rows are tiny and act as identity/product anchors;
+//   they are never pruned here.
+const RETENTION_DAYS = {
+  turn_end: 30,
+  session_start: 30,
+  onboarding_step: 30,
+  upgrade: 60,
+  auth_success: 180,
+  session_end: 365,
+  session_crash: 365,
+};
+
+const PRUNE_BATCH_LIMIT = 10000;
+const PRUNE_MAX_BATCHES_PER_RUN = 12;
+
+async function pruneOldEvents(env) {
+  let batchesUsed = 0;
+  for (const [eventType, days] of Object.entries(RETENTION_DAYS)) {
+    const cutoff = `-${days} days`;
+    while (batchesUsed < PRUNE_MAX_BATCHES_PER_RUN) {
+      batchesUsed += 1;
+      try {
+        // Delete detail children first so the events FK never blocks the prune.
+        await env.DB.prepare(
+          `DELETE FROM turn_details WHERE event_id IN (
+             SELECT event_id FROM events
+             WHERE event = ? AND created_at < datetime('now', ?) AND event_id IS NOT NULL
+             LIMIT ?)`
+        ).bind(eventType, cutoff, PRUNE_BATCH_LIMIT).run();
+        await env.DB.prepare(
+          `DELETE FROM session_details WHERE event_id IN (
+             SELECT event_id FROM events
+             WHERE event = ? AND created_at < datetime('now', ?) AND event_id IS NOT NULL
+             LIMIT ?)`
+        ).bind(eventType, cutoff, PRUNE_BATCH_LIMIT).run();
+        const result = await env.DB.prepare(
+          `DELETE FROM events WHERE id IN (
+             SELECT id FROM events
+             WHERE event = ? AND created_at < datetime('now', ?)
+             LIMIT ?)`
+        ).bind(eventType, cutoff, PRUNE_BATCH_LIMIT).run();
+        const changes = result?.meta?.changes ?? result?.changes ?? 0;
+        if (changes < PRUNE_BATCH_LIMIT) {
+          break;
+        }
+      } catch (err) {
+        console.warn(`retention prune failed for ${eventType}`, err?.message || err);
+        break;
+      }
+    }
+  }
+}
 
 async function insertEvent(env, body) {
   const columns = await getEventColumns(env);
@@ -300,6 +372,17 @@ async function insertTurnDetails(env, body, columns) {
   }
   const values = [
     ["event_id", body.event_id],
+    ["turn_index", body.turn_index ?? null],
+    ["turn_started_ms", body.turn_started_ms ?? null],
+    ["turn_active_duration_ms", body.turn_active_duration_ms ?? null],
+    ["idle_before_turn_ms", body.idle_before_turn_ms ?? null],
+    ["idle_after_turn_ms", body.idle_after_turn_ms ?? null],
+    ["turn_success", boolToInt(body.turn_success)],
+    ["turn_abandoned", boolToInt(body.turn_abandoned)],
+    ["turn_end_reason", body.turn_end_reason || null],
+    ["input_tokens", body.input_tokens || 0],
+    ["output_tokens", body.output_tokens || 0],
+    ["total_tokens", body.total_tokens || 0],
     ["assistant_responses", body.assistant_responses || 0],
     ["first_assistant_response_ms", body.first_assistant_response_ms ?? null],
     ["first_tool_call_ms", body.first_tool_call_ms ?? null],
@@ -361,6 +444,7 @@ async function recordDailyActivity(env, body) {
   const meaningful = isMeaningfulLifecycleEvent(body) ? 1 : 0;
   const release = body.build_channel === "release" ? 1 : 0;
   const meaningfulRelease = meaningful && release ? 1 : 0;
+  const isCi = boolToInt(body.is_ci);
   const sessionStartCount = body.event === "session_start" ? 1 : 0;
   const turnEndCount = body.event === "turn_end" ? 1 : 0;
   const sessionEndCount = body.event === "session_end" ? 1 : 0;
@@ -379,8 +463,10 @@ async function recordDailyActivity(env, body) {
         turn_end_count,
         session_end_count,
         session_crash_count,
+        ci_active,
+        last_is_ci,
         last_build_channel
-      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(activity_date, telemetry_id) DO UPDATE SET
         last_seen_at = datetime('now'),
         raw_active = 1,
@@ -391,6 +477,8 @@ async function recordDailyActivity(env, body) {
         turn_end_count = turn_end_count + excluded.turn_end_count,
         session_end_count = session_end_count + excluded.session_end_count,
         session_crash_count = session_crash_count + excluded.session_crash_count,
+        ci_active = MAX(ci_active, excluded.ci_active),
+        last_is_ci = excluded.last_is_ci,
         last_build_channel = COALESCE(excluded.last_build_channel, daily_active_users.last_build_channel)
     `).bind(
       activityDate,
@@ -402,6 +490,8 @@ async function recordDailyActivity(env, body) {
       turnEndCount,
       sessionEndCount,
       sessionCrashCount,
+      isCi,
+      isCi,
       body.build_channel || null,
     ).run();
   } catch (err) {
@@ -413,22 +503,41 @@ async function recordDailyActivity(env, body) {
 
 function isMeaningfulLifecycleEvent(body) {
   const errors = body.errors || {};
-  return ["session_end", "session_crash"].includes(body.event) && (
-    (body.turns || 0) > 0
-    || boolToInt(body.had_user_prompt) > 0
-    || boolToInt(body.had_assistant_response) > 0
-    || (body.assistant_responses || 0) > 0
-    || (body.tool_calls || 0) > 0
-    || (body.executed_tool_calls || 0) > 0
-    || (body.duration_secs || 0) > 0
-    || (errors.provider_timeout || 0) > 0
-    || (errors.auth_failed || 0) > 0
-    || (errors.tool_error || 0) > 0
-    || (errors.mcp_error || 0) > 0
-    || (errors.rate_limited || 0) > 0
-    || (body.provider_switches || 0) > 0
-    || (body.model_switches || 0) > 0
-  );
+  if (["session_end", "session_crash"].includes(body.event)) {
+    return (
+      (body.turns || 0) > 0
+      || boolToInt(body.had_user_prompt) > 0
+      || boolToInt(body.had_assistant_response) > 0
+      || (body.assistant_responses || 0) > 0
+      || (body.tool_calls || 0) > 0
+      || (body.executed_tool_calls || 0) > 0
+      || (body.duration_secs || 0) > 0
+      || (errors.provider_timeout || 0) > 0
+      || (errors.auth_failed || 0) > 0
+      || (errors.tool_error || 0) > 0
+      || (errors.mcp_error || 0) > 0
+      || (errors.rate_limited || 0) > 0
+      || (body.provider_switches || 0) > 0
+      || (body.model_switches || 0) > 0
+    );
+  }
+  // A turn_end event only fires after a real user turn completes (a prompt was
+  // submitted and the agent did work), so it is strong evidence of meaningful
+  // activity even when the session_end/session_crash event is lost (process
+  // killed, machine shutdown, network drop on the final flush, or a session
+  // still open at UTC midnight). Counting it here avoids undercounting the
+  // headline meaningful DAU for those users.
+  if (body.event === "turn_end") {
+    return (
+      (body.assistant_responses || 0) > 0
+      || (body.tool_calls || 0) > 0
+      || (body.executed_tool_calls || 0) > 0
+      || (body.file_write_calls || 0) > 0
+      || (body.tests_run || 0) > 0
+      || boolToInt(body.turn_success) > 0
+    );
+  }
+  return false;
 }
 
 async function insertSessionDetails(env, body, columns) {
@@ -437,6 +546,17 @@ async function insertSessionDetails(env, body, columns) {
   }
   const values = [
     ["event_id", body.event_id],
+    ["session_start_hour_utc", body.session_start_hour_utc ?? null],
+    ["session_start_weekday_utc", body.session_start_weekday_utc ?? null],
+    ["session_end_hour_utc", body.session_end_hour_utc ?? null],
+    ["session_end_weekday_utc", body.session_end_weekday_utc ?? null],
+    ["previous_session_gap_secs", body.previous_session_gap_secs ?? null],
+    ["sessions_started_24h", body.sessions_started_24h || 0],
+    ["sessions_started_7d", body.sessions_started_7d || 0],
+    ["active_sessions_at_start", body.active_sessions_at_start || 0],
+    ["other_active_sessions_at_start", body.other_active_sessions_at_start || 0],
+    ["max_concurrent_sessions", body.max_concurrent_sessions || 0],
+    ["multi_sessioned", boolToInt(body.multi_sessioned)],
     ["first_file_edit_ms", body.first_file_edit_ms || null],
     ["first_test_pass_ms", body.first_test_pass_ms || null],
     ["tool_cat_read_search", body.tool_cat_read_search || 0],

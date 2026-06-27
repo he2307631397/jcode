@@ -252,7 +252,8 @@ fn reload_timeout_secs_ignores_empty_invalid_and_zero_values() {
 
 #[test]
 fn schema_only_advertises_core_selfdev_fields() {
-    let schema = SelfDevTool::new().parameters_schema();
+    // The full (self-dev) schema exposes the build/test/reload surface.
+    let schema = SelfDevTool::schema_for(true);
     let props = schema["properties"]
         .as_object()
         .expect("selfdev schema should have properties");
@@ -267,6 +268,76 @@ fn schema_only_advertises_core_selfdev_fields() {
     assert!(props.contains_key("task_id"));
     assert!(!props.contains_key("notify"));
     assert!(!props.contains_key("wake"));
+
+    let actions: Vec<&str> = schema["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    for expected in [
+        "enter",
+        "setup",
+        "build",
+        "build-reload",
+        "test",
+        "cancel-build",
+        "reload",
+        "status",
+        "find-config",
+        "socket-info",
+        "socket-help",
+    ] {
+        assert!(actions.contains(&expected), "missing action {expected}");
+    }
+}
+
+#[test]
+fn non_selfdev_schema_only_exposes_onramp_actions() {
+    // The default schema (what a regular session advertises) is the on-ramp
+    // surface: no build/test/socket actions, only enter/setup/reload/status/
+    // find-config.
+    let default_schema = SelfDevTool::new().parameters_schema();
+    let onramp_schema = SelfDevTool::schema_for(false);
+    assert_eq!(default_schema, onramp_schema);
+
+    let props = onramp_schema["properties"]
+        .as_object()
+        .expect("schema properties");
+    assert!(props.contains_key("action"));
+    assert!(props.contains_key("prompt"));
+    // Build/test-only fields are hidden outside self-dev mode.
+    assert!(!props.contains_key("reason"));
+    assert!(!props.contains_key("target"));
+    assert!(!props.contains_key("command"));
+    assert!(!props.contains_key("request_id"));
+    assert!(!props.contains_key("task_id"));
+
+    let actions: Vec<&str> = onramp_schema["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action enum")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    let mut sorted = actions.clone();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        vec!["enter", "find-config", "reload", "setup", "status"]
+    );
+    for hidden in [
+        "build",
+        "build-reload",
+        "test",
+        "cancel-build",
+        "socket-info",
+        "socket-help",
+    ] {
+        assert!(
+            !actions.contains(&hidden),
+            "on-ramp schema should not expose {hidden}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -453,11 +524,13 @@ async fn enter_falls_back_to_fresh_session_when_parent_missing() {
 }
 
 #[tokio::test]
-async fn reload_requires_selfdev_session() {
+async fn reload_in_non_selfdev_session_is_upgrade_in_place() {
     let _storage_guard = crate::storage::lock_test_env();
     let _lock = lock_env();
     let temp_home = tempfile::TempDir::new().expect("temp home");
     let _home_guard = EnvVarGuard::set("JCODE_HOME", temp_home.path());
+    // Test mode short-circuits the actual server reload signal.
+    let _test_guard = EnvVarGuard::set("JCODE_TEST_SESSION", "1");
 
     let mut session = session::Session::create(None, Some("Normal Session".to_string()));
     session.save().expect("save session");
@@ -467,14 +540,99 @@ async fn reload_requires_selfdev_session() {
     let output = tool
         .execute(json!({"action": "reload"}), ctx)
         .await
-        .expect("reload should return guidance instead of failing");
+        .expect("reload should route to upgrade-in-place");
 
+    // It must NOT be the old "only available inside a self-dev session" error;
+    // a regular session can reload into a newer installed build.
     assert!(
-        output
+        !output
             .output
             .contains("only available inside a self-dev session")
     );
-    assert!(output.output.contains("selfdev enter"));
+    assert!(output.output.contains("Test mode"));
+}
+
+#[tokio::test]
+async fn socket_actions_require_selfdev_session() {
+    let _storage_guard = crate::storage::lock_test_env();
+    let _lock = lock_env();
+    let temp_home = tempfile::TempDir::new().expect("temp home");
+    let _home_guard = EnvVarGuard::set("JCODE_HOME", temp_home.path());
+
+    let mut session = session::Session::create(None, Some("Normal Session".to_string()));
+    session.save().expect("save session");
+
+    let tool = SelfDevTool::new();
+    for action in ["socket-info", "socket-help"] {
+        let ctx = create_test_context(&session.id, session.working_dir.clone().map(Into::into));
+        let output = tool
+            .execute(json!({"action": action}), ctx)
+            .await
+            .expect("socket action should return guidance instead of failing");
+        assert!(
+            output
+                .output
+                .contains("only available inside a self-dev session"),
+            "{action} should be gated"
+        );
+        assert!(output.output.contains("selfdev enter"));
+    }
+}
+
+#[tokio::test]
+async fn find_config_reports_key_paths() {
+    let _storage_guard = crate::storage::lock_test_env();
+    let _lock = lock_env();
+    let temp_home = tempfile::TempDir::new().expect("temp home");
+    let _home_guard = EnvVarGuard::set("JCODE_HOME", temp_home.path());
+
+    let mut session = session::Session::create(None, Some("Normal Session".to_string()));
+    session.save().expect("save session");
+
+    let tool = SelfDevTool::new();
+    let ctx = create_test_context(&session.id, None);
+    let output = tool
+        .execute(json!({"action": "find-config"}), ctx)
+        .await
+        .expect("find-config should succeed");
+
+    assert!(output.output.contains("Config file:"));
+    assert!(output.output.contains("config.toml"));
+    assert!(output.output.contains("Build channels"));
+    let metadata = output.metadata.expect("find-config metadata");
+    assert!(metadata["config_path"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn setup_reports_dependency_checks() {
+    let _storage_guard = crate::storage::lock_test_env();
+    let _lock = lock_env();
+    let temp_home = tempfile::TempDir::new().expect("temp home");
+    let _home_guard = EnvVarGuard::set("JCODE_HOME", temp_home.path());
+    // Test mode avoids attempting a real git clone when no repo is detected.
+    let _test_guard = EnvVarGuard::set("JCODE_TEST_SESSION", "1");
+    let repo = create_repo_fixture();
+
+    let mut session = session::Session::create(None, Some("Normal Session".to_string()));
+    session.save().expect("save session");
+
+    let tool = SelfDevTool::new();
+    let ctx = create_test_context(&session.id, Some(repo.path().to_path_buf()));
+    let output = tool
+        .execute(json!({"action": "setup"}), ctx)
+        .await
+        .expect("setup should succeed");
+
+    assert!(output.output.contains("Self-dev setup"));
+    assert!(output.output.contains("**cargo**") || output.output.contains("cargo"));
+    assert!(output.output.contains("repository"));
+    let metadata = output.metadata.expect("setup metadata");
+    assert!(metadata["checks"].as_array().is_some());
+    // The fixture repo should be detected as the repository.
+    assert_eq!(
+        metadata["repo_dir"].as_str(),
+        Some(repo.path().to_string_lossy().as_ref())
+    );
 }
 
 #[tokio::test]
@@ -570,6 +728,66 @@ async fn build_queues_background_tasks_and_reports_queue_status() {
     .expect("request two exists");
     assert_eq!(request_one.state, BuildRequestState::Completed);
     assert_eq!(request_two.state, BuildRequestState::Completed);
+}
+
+#[tokio::test]
+async fn build_reload_waits_for_build_then_reloads() {
+    let _storage_guard = crate::storage::lock_test_env();
+    let _lock = lock_env();
+    let temp_home = tempfile::TempDir::new().expect("temp home");
+    let _home_guard = EnvVarGuard::set("JCODE_HOME", temp_home.path());
+    let _test_guard = EnvVarGuard::set("JCODE_TEST_SESSION", "1");
+    let repo = create_repo_fixture();
+
+    let mut session = session::Session::create(None, Some("Build+reload session".to_string()));
+    session.is_canary = true;
+    session.short_name = Some("gamma".to_string());
+    session.save().expect("save session");
+
+    // The reload phase blocks on a server ack. Spawn a watcher that mirrors the
+    // server: it observes reload signals and acknowledges them so the inline
+    // reload can complete deterministically in test mode. It keeps acking every
+    // signal it sees (the RELOAD_SIGNAL channel is a process-global shared by
+    // parallel tests, and `wait_for_reload_ack` matches by request id, so acking
+    // unrelated/stale signals is harmless).
+    let mut signal_rx = server::subscribe_reload_signal_for_tests();
+    let acker = tokio::spawn(async move {
+        if let Some(signal) = signal_rx.borrow_and_update().clone() {
+            server::acknowledge_reload_signal(&signal);
+        }
+        while signal_rx.changed().await.is_ok() {
+            if let Some(signal) = signal_rx.borrow_and_update().clone() {
+                server::acknowledge_reload_signal(&signal);
+            }
+        }
+    });
+
+    let tool = SelfDevTool::new();
+    let output = tool
+        .execute(
+            json!({"action": "build-reload", "reason": "combined build and reload"}),
+            create_test_context(&session.id, Some(repo.path().to_path_buf())),
+        )
+        .await
+        .expect("build-reload should succeed");
+
+    acker.abort();
+
+    assert!(
+        output.output.contains("Build completed successfully"),
+        "unexpected output: {}",
+        output.output
+    );
+    let meta = output.metadata.expect("build-reload metadata");
+    assert_eq!(meta["phase"].as_str(), Some("reload"));
+    assert_eq!(meta["build_finished"].as_bool(), Some(true));
+    assert_eq!(meta["build_succeeded"].as_bool(), Some(true));
+
+    let request_id = meta["request_id"].as_str().expect("request id in metadata");
+    let request = BuildRequest::load(request_id)
+        .expect("load request")
+        .expect("request exists");
+    assert_eq!(request.state, BuildRequestState::Completed);
 }
 
 #[tokio::test]
@@ -721,7 +939,10 @@ fn status_output_prunes_stale_pending_requests() {
         repo_scope: source.repo_scope.clone(),
         worktree_scope: source.worktree_scope.clone(),
         command: "scripts/dev_cargo.sh build --profile selfdev -p jcode --bin jcode".to_string(),
-        requested_at: Utc::now().to_rfc3339(),
+        // Outside the bootstrap grace window: a request with a missing status
+        // file is only pruned once it is old enough that the queue handler
+        // cannot still be mid-spawn.
+        requested_at: (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339(),
         started_at: Some(Utc::now().to_rfc3339()),
         completed_at: None,
         state: BuildRequestState::Building,
@@ -757,6 +978,68 @@ fn status_output_prunes_stale_pending_requests() {
             .contains("pruning stale self-dev build request"),
         "stale request should record why it was pruned"
     );
+}
+
+#[test]
+fn freshly_queued_request_survives_reconcile_before_task_metadata_exists() {
+    // Regression: the queue handler saves the request *before* spawning its
+    // background task, so for a moment it has no task id / status file. A
+    // concurrent reconcile (status output, another agent's queue poll, or the
+    // task's own first wait_for_turn iteration) used to prune it as stale,
+    // killing the build instantly with "Queued build request disappeared".
+    let _storage_guard = crate::storage::lock_test_env();
+    let _lock = lock_env();
+    let temp_home = tempfile::TempDir::new().expect("temp home");
+    let _home_guard = EnvVarGuard::set("JCODE_HOME", temp_home.path());
+
+    let mut session = session::Session::create(None, Some("Fresh Build".to_string()));
+    session.save().expect("save session");
+
+    let source = test_source_state(std::path::Path::new("/tmp/jcode"));
+    let request = BuildRequest {
+        request_id: "fresh-request".to_string(),
+        // No background task metadata yet: mid-bootstrap.
+        background_task_id: None,
+        session_id: session.id.clone(),
+        session_short_name: session.short_name.clone(),
+        session_title: Some("Fresh Build".to_string()),
+        reason: "fresh reason".to_string(),
+        repo_dir: "/tmp/jcode".to_string(),
+        repo_scope: source.repo_scope.clone(),
+        worktree_scope: source.worktree_scope.clone(),
+        command: "scripts/dev_cargo.sh build --profile selfdev -p jcode --bin jcode".to_string(),
+        requested_at: Utc::now().to_rfc3339(),
+        started_at: None,
+        completed_at: None,
+        state: BuildRequestState::Queued,
+        version: Some("fresh-build".to_string()),
+        dedupe_key: Some("fresh-dedupe".to_string()),
+        requested_source: Some(source.clone()),
+        built_source: None,
+        published_version: None,
+        last_progress: Some("queued".to_string()),
+        validated: false,
+        error: None,
+        output_file: None,
+        status_file: None,
+        attached_to_request_id: None,
+    };
+    request.save().expect("save fresh request");
+
+    let pending =
+        BuildRequest::pending_requests_for_scope(&source.worktree_scope).expect("pending requests");
+    assert!(
+        pending
+            .iter()
+            .any(|request| request.request_id == "fresh-request"),
+        "freshly queued request must stay pending during the bootstrap grace window"
+    );
+
+    let reloaded = BuildRequest::load("fresh-request")
+        .expect("load fresh request")
+        .expect("fresh request exists");
+    assert_eq!(reloaded.state, BuildRequestState::Queued);
+    assert!(reloaded.error.is_none());
 }
 
 #[tokio::test]
@@ -808,7 +1091,11 @@ async fn build_ignores_stale_pending_requests_when_computing_queue_position() {
         repo_scope: source.repo_scope.clone(),
         worktree_scope: source.worktree_scope.clone(),
         command: "scripts/dev_cargo.sh build --profile selfdev -p jcode --bin jcode".to_string(),
-        requested_at: Utc::now().to_rfc3339(),
+        // Backdated beyond the 30s bootstrap grace so reconciliation treats the
+        // dead-task request as genuinely stale (a fresh timestamp would keep it
+        // alive and Queued, which is the bootstrap-race protection, not the
+        // staleness path under test).
+        requested_at: (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339(),
         started_at: Some(Utc::now().to_rfc3339()),
         completed_at: None,
         state: BuildRequestState::Queued,
@@ -937,4 +1224,90 @@ fn reconcile_pending_state_maps_superseded_background_status() {
             .unwrap_or_default()
             .contains("source changed before activation")
     );
+}
+
+#[test]
+fn reconcile_keeps_running_request_not_yet_registered_in_live_task_map() {
+    // Regression: spawn_with_notify writes the Running status file and starts
+    // the build future *before* inserting the task into the in-process task
+    // map. The build's own first wait_for_turn iteration (or another agent's
+    // queue poll) could then see status=Running + is_live_task=false and prune
+    // the request instantly: "Queued build request disappeared". Within the
+    // bootstrap grace window a Running-but-unregistered task must survive.
+    let _storage_guard = crate::storage::lock_test_env();
+    let _lock = lock_env();
+    let temp_home = tempfile::TempDir::new().expect("temp home");
+    let _home_guard = EnvVarGuard::set("JCODE_HOME", temp_home.path());
+
+    let mut session = session::Session::create(None, Some("Racing Build".to_string()));
+    session.save().expect("save session");
+
+    let status_path = temp_home.path().join("racing.status.json");
+    storage::write_json(
+        &status_path,
+        &background::TaskStatusFile {
+            task_id: "racing-task-not-in-live-map".to_string(),
+            tool_name: "selfdev-build".to_string(),
+            display_name: Some("selfdev build".to_string()),
+            session_id: session.id.clone(),
+            status: BackgroundTaskStatus::Running,
+            exit_code: None,
+            error: None,
+            started_at: Utc::now().to_rfc3339(),
+            completed_at: None,
+            duration_secs: None,
+            pid: None,
+            detached: false,
+            notify: true,
+            wake: true,
+            progress: None,
+            event_history: Vec::new(),
+        },
+    )
+    .expect("write running status file");
+
+    let source = test_source_state(std::path::Path::new("/tmp/jcode"));
+    let request = BuildRequest {
+        request_id: "racing-request".to_string(),
+        background_task_id: Some("racing-task-not-in-live-map".to_string()),
+        session_id: session.id.clone(),
+        session_short_name: session.short_name.clone(),
+        session_title: Some("Racing Build".to_string()),
+        reason: "racing reason".to_string(),
+        repo_dir: "/tmp/jcode".to_string(),
+        repo_scope: source.repo_scope.clone(),
+        worktree_scope: source.worktree_scope.clone(),
+        command: "scripts/dev_cargo.sh build --profile selfdev -p jcode --bin jcode".to_string(),
+        requested_at: Utc::now().to_rfc3339(),
+        started_at: None,
+        completed_at: None,
+        state: BuildRequestState::Queued,
+        version: Some("racing-build".to_string()),
+        dedupe_key: Some("racing-dedupe".to_string()),
+        requested_source: Some(source.clone()),
+        built_source: None,
+        published_version: None,
+        last_progress: Some("queued".to_string()),
+        validated: false,
+        error: None,
+        output_file: None,
+        status_file: Some(status_path.display().to_string()),
+        attached_to_request_id: None,
+    };
+    request.save().expect("save racing request");
+
+    let pending =
+        BuildRequest::pending_requests_for_scope(&source.worktree_scope).expect("pending requests");
+    assert!(
+        pending
+            .iter()
+            .any(|request| request.request_id == "racing-request"),
+        "running-but-unregistered request must stay pending during bootstrap grace"
+    );
+
+    let reloaded = BuildRequest::load("racing-request")
+        .expect("load racing request")
+        .expect("racing request exists");
+    assert_eq!(reloaded.state, BuildRequestState::Queued);
+    assert!(reloaded.error.is_none());
 }

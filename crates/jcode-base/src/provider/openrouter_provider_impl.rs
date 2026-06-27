@@ -14,6 +14,15 @@ impl Provider for OpenRouterProvider {
         let model = self.model.read().await.clone();
         let reasoning_effort = self.reasoning_effort();
         let thinking_override = Self::thinking_override();
+        // Moonshot's dedicated Kimi coding endpoint enables thinking server-side
+        // by default and rejects any assistant tool-call message that lacks
+        // `reasoning_content`, even though its model id (`kimi-for-coding`) is
+        // not a moonshotai/kimi-k2 model and the profile runs without OpenRouter
+        // provider features (issue #322). We must attach `reasoning_content` to
+        // those messages, but must NOT add the OpenRouter-specific top-level
+        // `thinking` field (the endpoint already manages thinking itself), so
+        // this is kept separate from `thinking_enabled`.
+        let kimi_coding_endpoint = self.is_kimi_coding_endpoint(&model);
         let thinking_enabled = thinking_override.or_else(|| {
             if Self::is_kimi_model(&model) {
                 Some(true)
@@ -21,9 +30,22 @@ impl Provider for OpenRouterProvider {
                 None
             }
         });
-        let allow_reasoning = self.supports_provider_features && thinking_enabled != Some(false);
-        let include_reasoning_content =
-            thinking_enabled == Some(true) || (allow_reasoning && Self::is_kimi_model(&model));
+        let allow_reasoning = (self.supports_provider_features || kimi_coding_endpoint)
+            && thinking_enabled != Some(false);
+        let include_reasoning_content = thinking_enabled == Some(true)
+            || (allow_reasoning && Self::is_kimi_model(&model))
+            || kimi_coding_endpoint;
+
+        // Some OpenAI-compatible providers (e.g. Mistral) strictly enforce the
+        // OpenAI schema and reject the non-standard `reasoning_content` message
+        // field and top-level `thinking` request field with a 422 error
+        // ("Extra inputs are not permitted"). Suppress both for those endpoints
+        // regardless of any thinking override (issue #261).
+        let strict_openai_schema =
+            Self::strict_openai_schema_endpoint(self.profile_id.as_deref(), &self.api_base);
+        let allow_reasoning = allow_reasoning && !strict_openai_schema;
+        let include_reasoning_content = include_reasoning_content && !strict_openai_schema;
+        let allow_image_input = self.supports_image_input();
 
         let mut effective_messages: Vec<Message> = messages.to_vec();
         let cache_supported = self.model_supports_cache(&model).await;
@@ -33,465 +55,13 @@ impl Provider for OpenRouterProvider {
             false
         };
 
-        // Build messages in OpenAI format
-        let mut api_messages = Vec::new();
-
-        // Add system message if provided
-        if !system.is_empty() {
-            api_messages.push(serde_json::json!({
-                "role": "system",
-                "content": system
-            }));
-        }
-
-        let content_from_parts = |parts: Vec<Value>| -> Option<Value> {
-            if parts.is_empty() {
-                return None;
-            }
-            if parts.len() == 1 {
-                let part = &parts[0];
-                let has_cache = part.get("cache_control").is_some();
-                if !has_cache && let Some(text) = part.get("text").and_then(|v| v.as_str()) {
-                    return Some(serde_json::json!(text));
-                }
-            }
-            Some(Value::Array(parts))
-        };
-
-        let mut tool_result_last_pos: HashMap<String, usize> = HashMap::new();
-        for (idx, msg) in effective_messages.iter().enumerate() {
-            if let Role::User = msg.role {
-                for block in &msg.content {
-                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                        tool_result_last_pos.insert(tool_use_id.clone(), idx);
-                    }
-                }
-            }
-        }
-
-        let missing_output = format!("[Error] {}", TOOL_OUTPUT_MISSING_TEXT);
-        let mut injected_missing = 0usize;
-        let mut delayed_results = 0usize;
-        let mut skipped_results = 0usize;
-        let mut tool_calls_seen: HashSet<String> = HashSet::new();
-        let mut pending_tool_results: HashMap<String, String> = HashMap::new();
-        let mut used_tool_results: HashSet<String> = HashSet::new();
-
-        // Convert messages
-        for (idx, msg) in effective_messages.iter().enumerate() {
-            match msg.role {
-                Role::User => {
-                    let mut pending_user_parts: Vec<Value> = Vec::new();
-                    for block in &msg.content {
-                        match block {
-                            ContentBlock::Text {
-                                text,
-                                cache_control,
-                            } => {
-                                let mut part = serde_json::json!({
-                                    "type": "text",
-                                    "text": text
-                                });
-                                if let Some(cache_control) = cache_control {
-                                    part["cache_control"] =
-                                        serde_json::to_value(cache_control).unwrap_or(Value::Null);
-                                }
-                                pending_user_parts.push(part);
-                            }
-                            ContentBlock::Image { media_type, data } => {
-                                pending_user_parts.push(serde_json::json!({
-                                    "type": "image_url",
-                                    "image_url": {
-                                        "url": format!("data:{};base64,{}", media_type, data)
-                                    }
-                                }));
-                            }
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } => {
-                                if let Some(content) =
-                                    content_from_parts(std::mem::take(&mut pending_user_parts))
-                                {
-                                    api_messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": content
-                                    }));
-                                }
-
-                                if used_tool_results.contains(tool_use_id) {
-                                    skipped_results += 1;
-                                    continue;
-                                }
-                                let output = if is_error == &Some(true) {
-                                    format!("[Error] {}", content)
-                                } else {
-                                    content.clone()
-                                };
-                                if tool_calls_seen.contains(tool_use_id) {
-                                    api_messages.push(serde_json::json!({
-                                        "role": "tool",
-                                        "tool_call_id": crate::message::sanitize_tool_id(tool_use_id),
-                                        "content": output
-                                    }));
-                                    used_tool_results.insert(tool_use_id.clone());
-                                } else if pending_tool_results.contains_key(tool_use_id) {
-                                    skipped_results += 1;
-                                } else {
-                                    pending_tool_results.insert(tool_use_id.clone(), output);
-                                    delayed_results += 1;
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    if let Some(content) =
-                        content_from_parts(std::mem::take(&mut pending_user_parts))
-                    {
-                        api_messages.push(serde_json::json!({
-                            "role": "user",
-                            "content": content
-                        }));
-                    }
-                }
-                Role::Assistant => {
-                    let mut text_content = String::new();
-                    let mut reasoning_content = String::new();
-                    let mut tool_calls = Vec::new();
-                    let mut post_tool_outputs: Vec<(String, String)> = Vec::new();
-                    let mut missing_tool_outputs: Vec<String> = Vec::new();
-
-                    for block in &msg.content {
-                        match block {
-                            ContentBlock::Text { text, .. } => {
-                                text_content.push_str(text);
-                            }
-                            ContentBlock::Reasoning { text } => {
-                                reasoning_content.push_str(text);
-                            }
-                            ContentBlock::ToolUse { id, name, input } => {
-                                let args = if input.is_object() {
-                                    serde_json::to_string(input).unwrap_or_default()
-                                } else {
-                                    "{}".to_string()
-                                };
-                                tool_calls.push(serde_json::json!({
-                                    "id": crate::message::sanitize_tool_id(id),
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": args
-                                    }
-                                }));
-                                tool_calls_seen.insert(id.clone());
-                                if let Some(output) = pending_tool_results.remove(id) {
-                                    post_tool_outputs.push((id.clone(), output));
-                                    used_tool_results.insert(id.clone());
-                                } else {
-                                    let has_future_output = tool_result_last_pos
-                                        .get(id)
-                                        .map(|pos| *pos > idx)
-                                        .unwrap_or(false);
-                                    if !has_future_output {
-                                        missing_tool_outputs.push(id.clone());
-                                        used_tool_results.insert(id.clone());
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    let mut assistant_msg = serde_json::json!({
-                        "role": "assistant",
-                    });
-
-                    if !text_content.is_empty() {
-                        assistant_msg["content"] = serde_json::json!(text_content);
-                    }
-
-                    if !tool_calls.is_empty() {
-                        assistant_msg["tool_calls"] = serde_json::json!(tool_calls);
-                    }
-
-                    let has_reasoning_content = !reasoning_content.is_empty();
-                    if allow_reasoning
-                        && (include_reasoning_content || has_reasoning_content)
-                        && (has_reasoning_content || !tool_calls.is_empty())
-                    {
-                        let reasoning_payload = if has_reasoning_content {
-                            reasoning_content.clone()
-                        } else {
-                            " ".to_string()
-                        };
-                        assistant_msg["reasoning_content"] = serde_json::json!(reasoning_payload);
-                    }
-
-                    if !text_content.is_empty() || !tool_calls.is_empty() || has_reasoning_content {
-                        api_messages.push(assistant_msg);
-
-                        for (tool_call_id, output) in post_tool_outputs {
-                            api_messages.push(serde_json::json!({
-                                "role": "tool",
-                                "tool_call_id": crate::message::sanitize_tool_id(&tool_call_id),
-                                "content": output
-                            }));
-                        }
-
-                        if !missing_tool_outputs.is_empty() {
-                            injected_missing += missing_tool_outputs.len();
-                            for missing_id in missing_tool_outputs {
-                                api_messages.push(serde_json::json!({
-                                    "role": "tool",
-                                    "tool_call_id": crate::message::sanitize_tool_id(&missing_id),
-                                    "content": missing_output.clone()
-                                }));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if delayed_results > 0 {
-            crate::logging::info(&format!(
-                "[openrouter] Delayed {} tool output(s) to preserve call ordering",
-                delayed_results
-            ));
-        }
-
-        if !pending_tool_results.is_empty() {
-            skipped_results += pending_tool_results.len();
-        }
-
-        if injected_missing > 0 {
-            crate::logging::info(&format!(
-                "[openrouter] Injected {} synthetic tool output(s) to prevent API error",
-                injected_missing
-            ));
-        }
-        if skipped_results > 0 {
-            crate::logging::info(&format!(
-                "[openrouter] Filtered {} orphaned tool result(s) to prevent API error",
-                skipped_results
-            ));
-        }
-
-        // Safety pass: ensure tool-call messages include reasoning_content (when allowed)
-        // and that every tool call has a matching tool output after it.
-        let mut outputs_after: HashSet<String> = HashSet::new();
-        let mut missing_by_index: Vec<Vec<String>> = vec![Vec::new(); api_messages.len()];
-
-        for (idx, msg) in api_messages.iter().enumerate().rev() {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role == "tool" {
-                if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str()) {
-                    outputs_after.insert(id.to_string());
-                }
-                continue;
-            }
-
-            if role == "assistant"
-                && let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array())
-            {
-                for call in tool_calls {
-                    if let Some(id) = call.get("id").and_then(|v| v.as_str())
-                        && !outputs_after.contains(id)
-                    {
-                        outputs_after.insert(id.to_string());
-                        missing_by_index[idx].push(id.to_string());
-                    }
-                }
-            }
-        }
-
-        let mut normalized = Vec::with_capacity(api_messages.len());
-        let mut extra_outputs = 0usize;
-        let mut missing_reasoning = 0usize;
-
-        for (idx, mut msg) in api_messages.into_iter().enumerate() {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role == "assistant"
-                && allow_reasoning
-                && msg.get("tool_calls").and_then(|v| v.as_array()).is_some()
-            {
-                let needs_reasoning = match msg.get("reasoning_content") {
-                    Some(value) => value.as_str().map(|s| s.trim().is_empty()).unwrap_or(true),
-                    None => true,
-                };
-                if needs_reasoning {
-                    msg["reasoning_content"] = serde_json::json!(" ");
-                    missing_reasoning += 1;
-                }
-            }
-
-            normalized.push(msg);
-
-            if let Some(missing) = missing_by_index.get(idx) {
-                for id in missing {
-                    extra_outputs += 1;
-                    normalized.push(serde_json::json!({
-                        "role": "tool",
-                        "tool_call_id": id,
-                        "content": missing_output.clone()
-                    }));
-                }
-            }
-        }
-
-        api_messages = normalized;
-
-        if missing_reasoning > 0 {
-            crate::logging::info(&format!(
-                "[openrouter] Filled reasoning_content on {} tool-call message(s)",
-                missing_reasoning
-            ));
-        }
-        if extra_outputs > 0 {
-            crate::logging::info(&format!(
-                "[openrouter] Safety-injected {} missing tool output(s) at request build",
-                extra_outputs
-            ));
-        }
-
-        // Final safety pass: ensure every tool_call_id has at least one tool response after it.
-        let mut tool_output_positions: HashMap<String, usize> = HashMap::new();
-        for (idx, msg) in api_messages.iter().enumerate() {
-            if msg.get("role").and_then(|v| v.as_str()) == Some("tool")
-                && let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str())
-            {
-                tool_output_positions.entry(id.to_string()).or_insert(idx);
-            }
-        }
-
-        let mut missing_after: HashSet<String> = HashSet::new();
-        for (idx, msg) in api_messages.iter().enumerate() {
-            if msg.get("role").and_then(|v| v.as_str()) != Some("assistant") {
-                continue;
-            }
-            if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                for call in tool_calls {
-                    if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
-                        let has_after = tool_output_positions
-                            .get(id)
-                            .map(|pos| *pos > idx)
-                            .unwrap_or(false);
-                        if !has_after {
-                            missing_after.insert(id.to_string());
-                        }
-                    }
-                }
-            }
-        }
-
-        if !missing_after.is_empty() {
-            for id in missing_after.iter() {
-                api_messages.push(serde_json::json!({
-                    "role": "tool",
-                    "tool_call_id": id,
-                    "content": missing_output.clone()
-                }));
-            }
-            crate::logging::info(&format!(
-                "[openrouter] Appended {} tool output(s) to satisfy call ordering",
-                missing_after.len()
-            ));
-        }
-
-        // Final pass: ensure tool outputs immediately follow assistant tool calls.
-        let mut tool_output_map: HashMap<String, Value> = HashMap::new();
-        for msg in &api_messages {
-            if msg.get("role").and_then(|v| v.as_str()) == Some("tool")
-                && let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str())
-            {
-                let is_missing = msg
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v == missing_output)
-                    .unwrap_or(false);
-                match tool_output_map.get(id) {
-                    Some(existing) => {
-                        let existing_missing = existing
-                            .get("content")
-                            .and_then(|v| v.as_str())
-                            .map(|v| v == missing_output)
-                            .unwrap_or(false);
-                        if existing_missing && !is_missing {
-                            tool_output_map.insert(id.to_string(), msg.clone());
-                        }
-                    }
-                    None => {
-                        tool_output_map.insert(id.to_string(), msg.clone());
-                    }
-                }
-            }
-        }
-
-        let mut reordered: Vec<Value> = Vec::with_capacity(api_messages.len());
-        let mut used_outputs: HashSet<String> = HashSet::new();
-        let mut injected_ordered = 0usize;
-        let mut dropped_orphans = 0usize;
-
-        for msg in api_messages.into_iter() {
-            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            if role == "assistant" {
-                let tool_calls = msg.get("tool_calls").and_then(|v| v.as_array()).cloned();
-                if let Some(tool_calls) = tool_calls {
-                    if tool_calls.is_empty() {
-                        reordered.push(msg);
-                        continue;
-                    }
-                    reordered.push(msg);
-                    for call in tool_calls {
-                        if let Some(id) = call.get("id").and_then(|v| v.as_str()) {
-                            if let Some(tool_msg) = tool_output_map.get(id) {
-                                reordered.push(tool_msg.clone());
-                                used_outputs.insert(id.to_string());
-                            } else {
-                                injected_ordered += 1;
-                                reordered.push(serde_json::json!({
-                                    "role": "tool",
-                                    "tool_call_id": id,
-                                    "content": missing_output.clone()
-                                }));
-                                used_outputs.insert(id.to_string());
-                            }
-                        }
-                    }
-                    continue;
-                }
-            }
-
-            if role == "tool" {
-                if let Some(id) = msg.get("tool_call_id").and_then(|v| v.as_str())
-                    && used_outputs.contains(id)
-                {
-                    dropped_orphans += 1;
-                    continue;
-                }
-                dropped_orphans += 1;
-                continue;
-            }
-
-            reordered.push(msg);
-        }
-
-        api_messages = reordered;
-
-        if injected_ordered > 0 {
-            crate::logging::info(&format!(
-                "[openrouter] Inserted {} tool output(s) to enforce call ordering",
-                injected_ordered
-            ));
-        }
-        if dropped_orphans > 0 {
-            crate::logging::info(&format!(
-                "[openrouter] Dropped {} orphaned tool output(s) during re-ordering",
-                dropped_orphans
-            ));
-        }
+        let api_messages = jcode_provider_openrouter::request::build_chat_messages(
+            &effective_messages,
+            system,
+            allow_reasoning,
+            include_reasoning_content,
+            allow_image_input,
+        );
 
         // Build tools in OpenAI format
         let api_tools: Vec<Value> = tools
@@ -523,7 +93,7 @@ impl Provider for OpenRouterProvider {
 
         let mut sent_reasoning_config = false;
         if let Some(effort) = reasoning_effort.as_deref() {
-            if Self::profile_supports_reasoning_effort(self.profile_id.as_deref()) {
+            if self.supports_deepseek_reasoning_effort() {
                 if effort != "none" {
                     request["reasoning_effort"] = serde_json::json!(effort);
                     sent_reasoning_config = true;
@@ -548,8 +118,11 @@ impl Provider for OpenRouterProvider {
         }
 
         // Optional thinking override for OpenRouter (provider-specific).
+        // Skip for strict OpenAI-schema endpoints (e.g. Mistral) which reject
+        // the non-standard top-level `thinking` field with a 422 (issue #261).
         if let Some(enable) = thinking_enabled
             && !sent_reasoning_config
+            && !strict_openai_schema
         {
             request["thinking"] = serde_json::json!({
                 "type": if enable { "enabled" } else { "disabled" }
@@ -595,6 +168,18 @@ impl Provider for OpenRouterProvider {
 
         if let Some(obj) = provider_obj {
             request["provider"] = obj;
+        }
+
+        // Merge user-configured extra request-body fields last so they can
+        // satisfy non-standard backend requirements (e.g. NVIDIA NIM
+        // DeepSeek-V4 `chat_template_kwargs`) and intentionally override any
+        // jcode-generated field with the same key (issue #341).
+        if let Some(extra) = self.extra_body.as_ref()
+            && let Some(request_obj) = request.as_object_mut()
+        {
+            for (key, value) in extra {
+                request_obj.insert(key.clone(), value.clone());
+            }
         }
 
         let message_items = request
@@ -678,6 +263,10 @@ impl Provider for OpenRouterProvider {
         "openrouter"
     }
 
+    fn display_name(&self) -> String {
+        self.runtime_display_name()
+    }
+
     fn model(&self) -> String {
         self.model
             .try_read()
@@ -686,6 +275,10 @@ impl Provider for OpenRouterProvider {
     }
 
     fn supports_image_input(&self) -> bool {
+        if Self::profile_rejects_image_input(self.profile_id.as_deref()) {
+            return false;
+        }
+
         // Direct OpenAI-compatible local providers such as Ollama and LM Studio
         // document image content support on /v1/chat/completions. We already
         // serialize image blocks using OpenAI's image_url content-part shape in
@@ -702,6 +295,17 @@ impl Provider for OpenRouterProvider {
         if trimmed.is_empty() {
             anyhow::bail!("OpenRouter/OpenAI-compatible model cannot be empty");
         }
+
+        // Session restore persists the model as `<provider-key>:<model>` so the
+        // right slot can be reconstructed (see
+        // `MultiProvider::model_switch_request_for_session_*`). `MultiProvider`
+        // strips this prefix when routing, but the standalone `OpenRouterProvider`
+        // used for a named OpenAI-compatible profile does not, so the prefixed
+        // string would leak to the upstream API and be rejected as an invalid
+        // model id. Normalize the session-routing prefix back to the bare model
+        // id here, while leaving built-in routing prefixes (claude:, openai:, ...)
+        // untouched so cross-provider switches from a saved session still work.
+        let trimmed = self.strip_session_profile_prefix(trimmed);
 
         let (model_id, provider) = if self.supports_provider_features {
             let (model_id, provider) = parse_model_spec(trimmed);
@@ -749,10 +353,7 @@ impl Provider for OpenRouterProvider {
     }
 
     fn reasoning_effort(&self) -> Option<String> {
-        if !Self::supports_reasoning_effort_for_profile(
-            self.profile_id.as_deref(),
-            self.send_openrouter_headers,
-        ) {
+        if !self.supports_any_reasoning_effort() {
             return None;
         }
         self.reasoning_effort
@@ -762,16 +363,12 @@ impl Provider for OpenRouterProvider {
     }
 
     fn set_reasoning_effort(&self, effort: &str) -> Result<()> {
-        if !Self::supports_reasoning_effort_for_profile(
-            self.profile_id.as_deref(),
-            self.send_openrouter_headers,
-        ) {
+        if !self.supports_any_reasoning_effort() {
             anyhow::bail!(
-                "Reasoning effort is only supported for OpenRouter and DeepSeek direct profiles"
+                "Reasoning effort is not supported by the current model/profile. It works for OpenRouter, DeepSeek-family models, and profiles with supports_reasoning_effort = true."
             );
         }
-        let normalized =
-            Self::normalize_reasoning_effort_for_profile(self.profile_id.as_deref(), effort);
+        let normalized = self.normalize_reasoning_effort_for_self(effort);
         let mut current = self.reasoning_effort.try_write().map_err(|_| {
             anyhow::anyhow!("Cannot change reasoning effort while a request is in progress")
         })?;
@@ -780,7 +377,7 @@ impl Provider for OpenRouterProvider {
     }
 
     fn available_efforts(&self) -> Vec<&'static str> {
-        if Self::profile_supports_reasoning_effort(self.profile_id.as_deref()) {
+        if self.supports_deepseek_reasoning_effort() {
             vec!["none", "low", "medium", "high", "max"]
         } else if Self::profile_supports_unified_reasoning(
             self.profile_id.as_deref(),
@@ -1051,7 +648,9 @@ impl Provider for OpenRouterProvider {
             supports_provider_features: self.supports_provider_features,
             supports_model_catalog: self.supports_model_catalog,
             profile_id: self.profile_id.clone(),
+            reasoning_effort_support: self.reasoning_effort_support,
             max_tokens: self.max_tokens,
+            extra_body: self.extra_body.clone(),
             static_models: self.static_models.clone(),
             static_context_limits: self.static_context_limits.clone(),
             send_openrouter_headers: self.send_openrouter_headers,

@@ -10,8 +10,9 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 use crate::{browser, gateway, memory, session, storage, tui};
 
-use super::terminal::{cleanup_tui_runtime, init_tui_runtime};
+use super::terminal::init_tui_runtime;
 
+mod menubar;
 mod provider_setup;
 mod report_info;
 mod restart;
@@ -25,6 +26,7 @@ pub(crate) use super::auth_test::{
 pub use super::auth_test::{
     run_auth_test_command, run_auth_test_context_audit_command, run_auth_test_coverage_command,
 };
+pub use menubar::{ensure_menubar_helper_running, run_menubar_command};
 pub(crate) use provider_setup::{ProviderAddOptions, run_provider_add_command};
 pub use restart::{
     maybe_run_pending_restart_restore_on_startup, run_restart_clear_command,
@@ -160,18 +162,16 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             user_id,
             helper,
             clear,
-        } => {
-            return run_cloud_sessions_configure(
-                api_base,
-                api_token,
-                api_token_env,
-                api_token_id,
-                user_id,
-                helper,
-                clear,
-            );
-        }
-        CloudSessionsSubcommand::Status { json } => return run_cloud_sessions_status(json),
+        } => run_cloud_sessions_configure(
+            api_base,
+            api_token,
+            api_token_env,
+            api_token_id,
+            user_id,
+            helper,
+            clear,
+        ),
+        CloudSessionsSubcommand::Status { json } => run_cloud_sessions_status(json),
         CloudSessionsSubcommand::Dashboard {
             limit,
             output,
@@ -181,18 +181,16 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             profile,
             region,
             helper,
-        } => {
-            return run_cloud_sessions_dashboard(CloudSessionsDashboardRequest {
-                limit,
-                output,
-                open,
-                with_view,
-                user_id,
-                profile,
-                region,
-                helper,
-            });
-        }
+        } => run_cloud_sessions_dashboard(CloudSessionsDashboardRequest {
+            limit,
+            output,
+            open,
+            with_view,
+            user_id,
+            profile,
+            region,
+            helper,
+        }),
         CloudSessionsSubcommand::Sync {
             sessions_dir,
             since_days,
@@ -207,23 +205,21 @@ fn run_cloud_sessions_command(action: CloudSessionsSubcommand) -> Result<()> {
             profile,
             region,
             helper,
-        } => {
-            return run_cloud_sessions_sync(CloudSessionsSyncRequest {
-                sessions_dir,
-                since_days,
-                all,
-                max,
-                min_interval_mins,
-                raw,
-                dry_run,
-                force,
-                json,
-                user_id,
-                profile,
-                region,
-                helper,
-            });
-        }
+        } => run_cloud_sessions_sync(CloudSessionsSyncRequest {
+            sessions_dir,
+            since_days,
+            all,
+            max,
+            min_interval_mins,
+            raw,
+            dry_run,
+            force,
+            json,
+            user_id,
+            profile,
+            region,
+            helper,
+        }),
         other => run_cloud_sessions_helper_command(other),
     }
 }
@@ -1546,7 +1542,7 @@ async fn run_ambient_visible() -> Result<()> {
 
     let result = app.run(terminal).await;
 
-    cleanup_tui_runtime(&tui_runtime, true);
+    tui_runtime.finish(true);
 
     if let Some(cycle_result) = crate::tool::ambient::take_cycle_result() {
         let result_path = VisibleCycleContext::result_path()?;
@@ -2090,6 +2086,330 @@ pub async fn run_usage_command(emit_json: bool) -> Result<()> {
     report_info::run_usage_command(emit_json).await
 }
 
+/// Gracefully reload the running background server onto the newest binary.
+///
+/// This is the preferred upgrade path (issue #291): instead of killing the
+/// daemon and dropping live headless/swarm sessions, we ask it to hand its
+/// sessions off to a freshly exec'd server (the same path `/reload` uses).
+///
+/// Behavior:
+/// - With `force == false` (the default), the server only reloads when it is
+///   provably running older code than an available reload candidate. A server
+///   already on the newest binary reports "already up to date" and does
+///   nothing, which keeps an installer from downgrading a newer/dev daemon or
+///   re-entering the reload-loop family (#277).
+/// - With `force == true`, the server reloads unconditionally.
+/// - If no server is running, this is a successful no-op so installers can call
+///   it unconditionally.
+pub async fn run_server_reload_command(force: bool, emit_json: bool) -> Result<()> {
+    use crate::protocol::ServerEvent;
+    use std::time::Duration;
+
+    let socket = crate::server::socket_path();
+
+    #[derive(Serialize)]
+    struct ServerReloadReport {
+        socket: String,
+        had_listener: bool,
+        forced: bool,
+        reloaded: bool,
+        already_current: bool,
+        handoff_ready: bool,
+        detail: String,
+    }
+
+    let emit = |report: ServerReloadReport| -> Result<()> {
+        if emit_json {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else if !report.detail.is_empty() {
+            println!("{}", report.detail);
+        }
+        Ok(())
+    };
+
+    // No server? Nothing to reload. This is a success so an installer can call
+    // `jcode server reload` unconditionally after swapping the binary.
+    if !crate::server::has_live_listener(&socket).await {
+        // Reap a stale socket left by a crashed daemon so the next launch binds
+        // cleanly instead of wedging in a connect-retry loop.
+        let reaped = crate::server::reap_stale_socket_if_dead(&socket).await;
+        let detail = if reaped {
+            "No running jcode server found; cleared a stale socket.".to_string()
+        } else {
+            "No running jcode server found; nothing to reload.".to_string()
+        };
+        return emit(ServerReloadReport {
+            socket: socket.display().to_string(),
+            had_listener: false,
+            forced: force,
+            reloaded: false,
+            already_current: false,
+            handoff_ready: false,
+            detail,
+        });
+    }
+
+    let mut client = crate::server::Client::connect().await?;
+
+    // Before asking the (possibly older) daemon to reload, repair a stale
+    // `shared-server` channel from the client side. The running server resolves
+    // its reload target from that channel; if it still points at the server's
+    // own old binary (the "current client, stale server" state, e.g. after a
+    // no-op `/update`), a forced reload would just re-exec the same old binary.
+    // Repointing shared-server -> stable when stable is strictly newer gives the
+    // reload a newer binary to exec into. Never downgrades; preserves a fresher
+    // self-dev pin. Best-effort: a failure here must not block the reload.
+    match crate::build::repair_stale_shared_server_channel() {
+        Ok(crate::build::SharedServerRepair::Repaired {
+            repaired_to,
+            previous,
+        }) => {
+            crate::logging::info(&format!(
+                "server reload: repaired stale shared-server channel {:?} -> {} before reload",
+                previous, repaired_to
+            ));
+        }
+        Ok(crate::build::SharedServerRepair::AlreadyCurrent) => {}
+        Err(err) => {
+            crate::logging::warn(&format!(
+                "server reload: shared-server channel repair failed (continuing): {}",
+                err
+            ));
+        }
+    }
+
+    let request_id = client.reload_with_force(force).await?;
+
+    let mut reloading = false;
+    let mut skipped = false;
+
+    // Drive the request to a terminal state. On a real reload the old server
+    // exec's a new process, which drops this connection after it sends Done;
+    // we treat a disconnect after observing Reloading as the expected handoff.
+    loop {
+        match client.read_event().await {
+            Ok(ServerEvent::Ack { id }) if id == request_id => {}
+            Ok(ServerEvent::Reloading { .. }) => {
+                reloading = true;
+            }
+            Ok(ServerEvent::ReloadProgress { step, .. }) if step == "skip" => {
+                skipped = true;
+            }
+            Ok(ServerEvent::ReloadProgress { .. }) => {}
+            Ok(ServerEvent::Done { id }) if id == request_id => break,
+            Ok(ServerEvent::Error { id, message, .. }) if id == request_id => {
+                anyhow::bail!("server reload failed: {message}");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                // A disconnect mid-reload is the expected handoff; otherwise it
+                // is a genuine failure.
+                if reloading {
+                    break;
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    if skipped && !reloading {
+        return emit(ServerReloadReport {
+            socket: socket.display().to_string(),
+            had_listener: true,
+            forced: force,
+            reloaded: false,
+            already_current: true,
+            handoff_ready: true,
+            detail: "jcode server is already running the newest binary; no reload needed."
+                .to_string(),
+        });
+    }
+
+    // Wait (bounded) for the freshly exec'd server to take over the socket so
+    // callers know the upgrade actually landed.
+    let handoff_ready = matches!(
+        crate::server::await_reload_handoff(&socket, Duration::from_secs(30)).await,
+        crate::server::ReloadWaitStatus::Ready
+    );
+
+    let detail = if handoff_ready {
+        "jcode server reloaded onto the newest binary.".to_string()
+    } else {
+        "jcode server reload requested; the new server is still coming up.".to_string()
+    };
+
+    emit(ServerReloadReport {
+        socket: socket.display().to_string(),
+        had_listener: true,
+        forced: force,
+        reloaded: true,
+        already_current: false,
+        handoff_ready,
+        detail,
+    })
+}
+
+/// Stop the running background server gracefully and clear its socket.
+///
+/// Intended for use after an upgrade so the next launch starts the freshly
+/// installed binary instead of a surviving daemon running old code (issue #291).
+///
+/// Steps:
+/// 1. Look up the daemon owning the active socket in the server registry and
+///    send it SIGTERM (the daemon has a graceful SIGTERM handler).
+/// 2. Wait for the listener to go away (bounded), escalating to SIGKILL only if
+///    the process refuses to exit.
+/// 3. Reap any leftover stale socket so a later launch binds cleanly.
+pub async fn run_server_stop_command(force: bool, emit_json: bool) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    if !force {
+        let msg = "`jcode server stop` terminates the daemon and drops any live headless/swarm sessions. \
+Prefer `jcode server reload` to pick up an upgrade gracefully. \
+Re-run with `--force` if you really want to stop the server.";
+        if emit_json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "stopped": false,
+                    "force_required": true,
+                    "detail": msg,
+                })
+            );
+        } else {
+            eprintln!("{msg}");
+        }
+        return Ok(());
+    }
+
+    let socket = crate::server::socket_path();
+    let had_listener = crate::server::has_live_listener(&socket).await;
+    let server_info = crate::registry::find_server_by_socket_sync(&socket);
+
+    #[derive(Serialize)]
+    struct ServerStopReport {
+        socket: String,
+        had_listener: bool,
+        signaled_pid: Option<u32>,
+        stopped: bool,
+        reaped_socket: bool,
+        detail: String,
+    }
+
+    let mut signaled_pid: Option<u32> = None;
+    let mut stopped = false;
+    let detail: String;
+
+    if let Some(info) = server_info.as_ref() {
+        let pid = info.pid;
+        if crate::platform::is_process_running(pid) {
+            #[cfg(unix)]
+            {
+                // The daemon spawns detached with setsid(), so it leads its own
+                // process group. Signal the group so any helper children exit too.
+                match crate::platform::signal_detached_process_group(pid, libc::SIGTERM) {
+                    Ok(()) => {
+                        signaled_pid = Some(pid);
+                        detail = format!("Sent SIGTERM to jcode server (pid {pid}).");
+                    }
+                    Err(e) => {
+                        detail = format!("Failed to signal jcode server (pid {pid}): {e}");
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                match crate::platform::signal_detached_process_group(pid, 0) {
+                    Ok(()) => {
+                        signaled_pid = Some(pid);
+                        detail = format!("Terminated jcode server (pid {pid}).");
+                    }
+                    Err(e) => {
+                        detail = format!("Failed to terminate jcode server (pid {pid}): {e}");
+                    }
+                }
+            }
+        } else {
+            detail = format!("Registered jcode server (pid {pid}) is not running.");
+        }
+    } else if had_listener {
+        // A listener answers but no registry entry maps to it. We deliberately
+        // do not guess a pid; just reap the socket below once the listener is
+        // gone. (This is rare: a daemon that bound the socket but never wrote a
+        // registry entry.)
+        detail = "Found a live server socket with no registry entry.".to_string();
+    } else {
+        detail = "No running jcode server found.".to_string();
+    }
+
+    // Wait for the listener to disappear after signalling. Escalate to SIGKILL
+    // once if the daemon does not exit within the graceful window.
+    if signaled_pid.is_some() || had_listener {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        #[cfg(unix)]
+        let mut escalated = false;
+        loop {
+            let listener_gone = !crate::server::has_live_listener(&socket).await;
+            let process_gone = signaled_pid
+                .map(|pid| !crate::platform::is_process_running(pid))
+                .unwrap_or(true);
+            if listener_gone && process_gone {
+                stopped = true;
+                break;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            #[cfg(unix)]
+            if !escalated
+                && Instant::now() + Duration::from_secs(2) >= deadline
+                && let Some(pid) = signaled_pid
+                && crate::platform::is_process_running(pid)
+            {
+                let _ = crate::platform::signal_detached_process_group(pid, libc::SIGKILL);
+                escalated = true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    } else {
+        stopped = true;
+    }
+
+    // Reap any stale socket the (now-dead) daemon left behind so the next launch
+    // binds cleanly instead of wedging in a connect-retry loop.
+    let reaped = crate::server::reap_stale_socket_if_dead(&socket).await;
+
+    if emit_json {
+        let report = ServerStopReport {
+            socket: socket.display().to_string(),
+            had_listener,
+            signaled_pid,
+            stopped,
+            reaped_socket: reaped,
+            detail: detail.clone(),
+        };
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        if !detail.is_empty() {
+            println!("{detail}");
+        }
+        if stopped && signaled_pid.is_some() {
+            println!("jcode server stopped.");
+        } else if stopped && !had_listener && signaled_pid.is_none() {
+            // Nothing was running; this is still a success for an installer.
+        } else if !stopped {
+            println!(
+                "jcode server did not exit cleanly; it may still be shutting down. Re-run if needed."
+            );
+        }
+        if reaped {
+            println!("Cleared a stale jcode socket.");
+        }
+    }
+
+    Ok(())
+}
+
 pub async fn run_single_message_command(
     choice: &super::provider_init::ProviderChoice,
     model: Option<&str>,
@@ -2104,6 +2424,25 @@ pub async fn run_single_message_command(
         super::provider_init::init_provider_for_validation(choice, model).await?
     };
     let registry = crate::tool::Registry::new(provider.clone()).await;
+    // Load MCP servers from ~/.jcode/mcp.json so headless `jcode run` has the
+    // same `mcp__*` tools as interactive/server sessions. This is non-blocking:
+    // `register_mcp_tools` advertises cached tool schemas synchronously (so the
+    // first locked tool snapshot already contains MCP tools, for zero
+    // prompt-cache miss) and connects in the background (connect-on-first-call).
+    // For a short single-message run, startup latency is unchanged.
+    // (#390, #206 Phase 2)
+    if run_command_mcp_enabled() {
+        registry.register_mcp_tools(None, None, None).await;
+        // Cold-cache gap: when a configured MCP server has no cached schema yet
+        // (first ever use, or reconfigured), advertise-early registers nothing
+        // for it, and a single-turn `jcode run` locks its tool snapshot before
+        // the background connection finishes, so the model would never see those
+        // tools. Long-lived sessions recover on a later turn, but `jcode run`
+        // has no later turn. So, only when the cache is cold for some configured
+        // server, briefly wait for the first connection to register tools before
+        // the agent runs. Warm runs skip this entirely and stay instant. (#390)
+        wait_for_cold_cache_mcp_tools(&registry).await;
+    }
     let mut agent = crate::agent::Agent::new(provider.clone(), registry);
     restore_agent_session_if_requested(&mut agent, resume_session)?;
 
@@ -2134,6 +2473,91 @@ fn run_command_auto_poke_enabled() -> bool {
             !matches!(value.as_str(), "0" | "false" | "off" | "no")
         })
         .unwrap_or(true)
+}
+
+/// Whether headless `jcode run` should load MCP servers from `~/.jcode/mcp.json`.
+/// Enabled by default; set `JCODE_RUN_MCP=0` (or `false`/`off`/`no`) to skip MCP
+/// registration for latency-sensitive scripting. (#390)
+fn run_command_mcp_enabled() -> bool {
+    std::env::var("JCODE_RUN_MCP")
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(true)
+}
+
+/// Max time `jcode run` waits for cold-cache MCP servers to register their
+/// tools before running the single turn. Override with `JCODE_RUN_MCP_WAIT_MS`
+/// (0 disables the wait).
+fn run_command_mcp_cold_wait() -> std::time::Duration {
+    let ms = std::env::var("JCODE_RUN_MCP_WAIT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(5000);
+    std::time::Duration::from_millis(ms)
+}
+
+/// Returns the set of MCP servers configured for this run that have no usable
+/// cached schema yet (cold cache). Advertise-early can only pre-register tools
+/// for servers whose schemas are cached, so these are the servers whose tools
+/// would otherwise miss the single-turn snapshot.
+fn cold_cache_mcp_servers() -> Vec<String> {
+    let config = crate::mcp::McpConfig::load();
+    if config.servers.is_empty() {
+        return Vec::new();
+    }
+    let cache = crate::mcp::McpSchemaCache::load();
+    config
+        .servers
+        .iter()
+        .filter(|(name, cfg)| cache.tools_for(name, cfg).is_none())
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// Bridge the cold-cache gap for `jcode run`: if any configured MCP server has
+/// no cached schema, briefly poll the registry until its `mcp__*` tools appear
+/// (or the budget elapses) so the single turn's locked tool snapshot includes
+/// them. Warm caches return immediately because `cold_cache_mcp_servers` is
+/// empty. (#390)
+async fn wait_for_cold_cache_mcp_tools(registry: &crate::tool::Registry) {
+    let cold_servers = cold_cache_mcp_servers();
+    if cold_servers.is_empty() {
+        return;
+    }
+    let budget = run_command_mcp_cold_wait();
+    if budget.is_zero() {
+        return;
+    }
+    crate::logging::info(&format!(
+        "jcode run: waiting up to {}ms for cold-cache MCP server(s) to register tools: {}",
+        budget.as_millis(),
+        cold_servers.join(", ")
+    ));
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        let names = registry.tool_names().await;
+        let covered = cold_servers.iter().all(|server| {
+            let prefix = format!("mcp__{}__", server);
+            names.iter().any(|name| name.starts_with(&prefix))
+        });
+        if covered {
+            crate::logging::info(
+                "jcode run: cold-cache MCP server(s) registered tools; proceeding",
+            );
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            crate::logging::warn(
+                "jcode run: timed out waiting for cold-cache MCP server(s); \
+                 their tools may be missing from this run",
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 fn run_command_auto_poke_max_turns() -> Option<usize> {
@@ -2323,15 +2747,15 @@ fn build_run_todo_confidence_summary_message(todos: &[crate::todo::TodoItem]) ->
         || missing_completion_confidence > 0
         || below_threshold_count > 0;
     if needs_validation {
-        lines.push(
-            "- Suggested action: validate or test before finalizing. Inspect the result and update completion_confidence when the evidence changes."
-                .to_string(),
-        );
+        lines.push(format!(
+            "- {}",
+            crate::prompt::TODO_CONFIDENCE_NEEDS_VALIDATION_PROMPT.trim()
+        ));
     } else {
-        lines.push(
-            "- Suggested action: use this confidence summary when deciding whether any further validation would materially improve certainty before finalizing."
-                .to_string(),
-        );
+        lines.push(format!(
+            "- {}",
+            crate::prompt::TODO_CONFIDENCE_READY_PROMPT.trim()
+        ));
     }
 
     lines.join("\n")

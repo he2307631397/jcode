@@ -601,10 +601,11 @@ pub(in crate::tui::app) async fn handle_post_connect<B: ratatui::backend::Backen
             terminal
                 .draw(|frame| crate::tui::ui::draw(frame, app))
                 .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            let session_id = app
-                .remote_session_id
-                .clone()
-                .unwrap_or_else(|| crate::id::new_id("ses"));
+            // Resolve the real session id (see `reload_handoff_session_id`):
+            // prefer the live id, then a deferred-history id, then the launch
+            // resume target, and only fabricate as a last resort. Fabricating
+            // eagerly here was the root cause of issue #328.
+            let session_id = app.reload_handoff_session_id();
             if (has_reload_ctx_for_session || !app.reload_info.is_empty())
                 && let Ok(jcode_dir) = crate::storage::jcode_dir()
             {
@@ -695,15 +696,32 @@ pub(in crate::tui::app) async fn handle_post_connect<B: ratatui::backend::Backen
         );
         remote.mark_history_loaded();
         app.clear_remote_startup_phase();
+        app.clear_remote_history_wait();
     } else if !remote.has_loaded_history() {
         app.set_remote_startup_phase(super::super::RemoteStartupPhase::LoadingSession);
+        // Start a fresh history-recovery budget for this connection so the
+        // watchdog can re-request the bootstrap History payload if it never
+        // arrives (otherwise the session is stuck on "loading session…" until
+        // the user runs /restart).
+        app.begin_remote_history_wait();
     } else {
         app.clear_remote_startup_phase();
+        app.clear_remote_history_wait();
     }
 
-    if remote.has_loaded_history() && !app.is_processing && app.has_queued_followups() {
+    // Dispatch restored work once the server history is in place. This must
+    // also cover a pending startup submission (e.g. a headed swarm spawn whose
+    // initial prompt was staged into `app.input` with `submit_input_on_startup`),
+    // not just queued follow-ups. Without this, a freshly spawned visible agent
+    // would show its prompt in the input box but never actually submit it,
+    // because `process_remote_followups` (the only production dispatcher) was
+    // never invoked post-connect. See issues #267/#268/#76.
+    if remote.has_loaded_history()
+        && !app.is_processing
+        && (app.has_queued_followups() || app.has_pending_startup_submission())
+    {
         crate::logging::info(
-            "Post-connect history restored with queued followups; dispatching immediately",
+            "Post-connect history restored with queued followups or startup submission; dispatching immediately",
         );
         if app.pending_queued_dispatch {
             crate::logging::info(

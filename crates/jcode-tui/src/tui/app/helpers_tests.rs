@@ -1,7 +1,7 @@
 use super::{
     build_resume_command, clear_ambient_info_cache_for_tests, extract_bracketed_system_message,
     format_countdown_until, gather_ambient_info, inferred_reasoning_efforts,
-    partition_queued_messages, resume_invocation_args,
+    partition_queued_messages, pretty_model_display_name, resume_invocation_args,
 };
 use crate::ambient::{AmbientManager, Priority, ScheduleRequest, ScheduleTarget};
 use crate::terminal_launch::{detected_resume_terminal, shell_command};
@@ -292,4 +292,112 @@ fn gather_ambient_info_filters_to_session_reminders_when_ambient_disabled() {
             .as_deref()
             .is_some_and(|text| text.starts_with("in 4m") || text.starts_with("in 5m"))
     );
+}
+
+#[test]
+fn pretty_model_display_name_formats_common_models() {
+    assert_eq!(pretty_model_display_name("gpt-5.5"), "GPT-5.5");
+    assert_eq!(pretty_model_display_name("gpt-5.1-codex"), "GPT-5.1-codex");
+    assert_eq!(
+        pretty_model_display_name("claude-opus-4-8"),
+        "Claude Opus 4.8"
+    );
+    assert_eq!(
+        pretty_model_display_name("claude-sonnet-4-5"),
+        "Claude Sonnet 4.5"
+    );
+    assert_eq!(
+        pretty_model_display_name("claude-opus-4-8[1m]"),
+        "Claude Opus 4.8 (1M)"
+    );
+    assert_eq!(
+        pretty_model_display_name("gemini-2.5-pro"),
+        "Gemini 2.5 Pro"
+    );
+}
+
+#[test]
+fn pretty_model_display_name_handles_empty_and_unknown() {
+    assert_eq!(pretty_model_display_name(""), "your default model");
+    assert_eq!(pretty_model_display_name("   "), "your default model");
+    // Unknown shapes fall back to a title-cased dashed rendering.
+    assert_eq!(
+        pretty_model_display_name("some-new-model"),
+        "Some New Model"
+    );
+}
+
+#[test]
+fn invalidate_todos_cache_backdates_entry_so_next_gather_refetches() {
+    use super::{
+        clear_todos_cache_for_tests, gather_todos_for_session, invalidate_todos_cache,
+        todos_cache_entry_age_for_tests,
+    };
+
+    let _env_lock = crate::storage::lock_test_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    clear_todos_cache_for_tests();
+
+    let session_id = "freshness-test-session";
+
+    // No entry yet.
+    assert_eq!(todos_cache_entry_age_for_tests(session_id), None);
+
+    // First gather seeds the cache entry (and spawns the initial fetch). The
+    // entry exists immediately, marked as actively refreshing / freshly stamped.
+    let _ = gather_todos_for_session(Some(session_id));
+    let before = todos_cache_entry_age_for_tests(session_id);
+    assert!(before.is_some(), "first gather must seed a cache entry");
+
+    // Let the background fetch settle so we have a non-refreshing, fresh entry.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let _ = gather_todos_for_session(Some(session_id));
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let settled = todos_cache_entry_age_for_tests(session_id)
+        .expect("entry should exist after gather settles");
+    assert!(
+        settled.0 < 5,
+        "a freshly fetched entry should be recent, got age={}s",
+        settled.0
+    );
+
+    // Invalidation backdates the timestamp far past the TTL and clears the
+    // refreshing flag, so the next gather treats it as expired and refetches.
+    invalidate_todos_cache(session_id);
+    let after = todos_cache_entry_age_for_tests(session_id)
+        .expect("entry should still exist after invalidation");
+    assert!(
+        after.0 >= 1000,
+        "invalidation must backdate the entry well past the 1s TTL, got age={}s",
+        after.0
+    );
+    assert!(
+        !after.1,
+        "invalidation must clear the refreshing flag so the next gather refetches"
+    );
+}
+
+#[test]
+fn fresh_session_command_includes_fresh_spawn_and_socket() {
+    let command = super::build_fresh_session_command(Some("/tmp/test.sock"));
+    assert!(command.fresh_spawn, "must hand off as a fresh spawn");
+    assert_eq!(command.kind.as_deref(), Some("new-terminal"));
+    assert_eq!(command.title.as_deref(), Some("jcode · new session"));
+    assert_eq!(
+        command.args,
+        vec![
+            "--fresh-spawn".to_string(),
+            "--socket".to_string(),
+            "/tmp/test.sock".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn fresh_session_command_omits_blank_socket() {
+    let command = super::build_fresh_session_command(Some("   "));
+    assert_eq!(command.args, vec!["--fresh-spawn".to_string()]);
+    let command = super::build_fresh_session_command(None);
+    assert_eq!(command.args, vec!["--fresh-spawn".to_string()]);
 }

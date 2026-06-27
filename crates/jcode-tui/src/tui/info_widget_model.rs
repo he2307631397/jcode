@@ -10,14 +10,14 @@ pub(super) fn render_model_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
 
     let mut lines: Vec<Line> = Vec::new();
 
-    let short_name = shorten_model_name(model);
+    let short_name = crate::tui::session_facts::pretty_model(model);
     let max_len = inner.width.saturating_sub(2) as usize;
 
     let mut spans = vec![
         Span::styled("⚡ ", Style::default().fg(rgb(140, 180, 255))),
         Span::styled(
             truncate_smart(&short_name, max_len.saturating_sub(2)),
-            Style::default().fg(rgb(180, 180, 190)).bold(),
+            Style::default().fg(rgb(255, 150, 200)).bold(),
         ),
     ];
 
@@ -49,6 +49,23 @@ pub(super) fn render_model_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Lin
                 Style::default().fg(rgb(140, 140, 150)),
             )]));
         }
+    }
+
+    // Current working directory.
+    if let Some(dir) = data
+        .working_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let display = home_relative_dir(dir);
+        lines.push(Line::from(vec![
+            Span::styled(" ", Style::default().fg(rgb(140, 180, 255))),
+            Span::styled(
+                truncate_smart(&display, max_len.saturating_sub(2)),
+                Style::default().fg(rgb(140, 140, 150)),
+            ),
+        ]));
     }
 
     if let Some(provider) = data
@@ -144,7 +161,7 @@ pub(super) fn render_model_info(data: &InfoWidgetData, inner: Rect) -> Vec<Line<
         return Vec::new();
     };
 
-    let short_name = shorten_model_name(model);
+    let short_name = crate::tui::session_facts::pretty_model(model);
     let max_len = inner.width.saturating_sub(2) as usize;
 
     let mut spans = vec![Span::styled(
@@ -252,7 +269,7 @@ pub(super) fn render_model_info(data: &InfoWidgetData, inner: Rect) -> Vec<Line<
     lines
 }
 
-pub(super) fn shorten_model_name(model: &str) -> String {
+pub(crate) fn shorten_model_name(model: &str) -> String {
     if model.contains("claude") {
         if model.contains("opus-4-5") || model.contains("opus-4.5") {
             return "opus-4.5".to_string();
@@ -340,6 +357,11 @@ fn short_service_tier(service_tier: &str) -> Option<&str> {
     })
 }
 
+/// Render a directory path home-relative (e.g. `/home/me/x` -> `~/x`).
+fn home_relative_dir(path: &str) -> String {
+    crate::tui::session_facts::dir_label(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,6 +381,7 @@ mod tests {
             native_compaction_threshold_tokens: None,
             session_count: None,
             session_name: None,
+            working_dir: None,
             client_count: None,
             memory_info: None,
             swarm_info: None,

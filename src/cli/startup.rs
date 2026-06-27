@@ -17,14 +17,25 @@ pub async fn run() -> Result<()> {
 
     logging::init();
     startup_profile::mark("logging_init");
-    logging::cleanup_old_logs();
-    startup_profile::mark("log_cleanup");
+    // Old log pruning now runs on a background thread inside logging::init(),
+    // so it no longer blocks startup. Memory-event logs have a separate,
+    // longer (14-day) retention, so prune them on their own background thread.
+    std::thread::Builder::new()
+        .name("jcode-memlog-cleanup".to_string())
+        .spawn(crate::memory_log::cleanup_old_memory_logs)
+        .ok();
+    // Prune stale per-session `.bak` recovery copies (never the transcripts
+    // themselves) so the sessions directory does not grow without bound.
+    std::thread::Builder::new()
+        .name("jcode-session-bak-prune".to_string())
+        .spawn(crate::session::prune_old_session_backups)
+        .ok();
     logging::info("jcode starting");
 
     // Wire config-reload reactions without making config depend on auth/bus:
     // when the config cache reloads, invalidate the auth-status cache and
     // broadcast a models-updated event.
-    crate::config::on_config_reloaded(|| crate::auth::AuthStatus::invalidate_cache());
+    crate::config::on_config_reloaded(crate::auth::AuthStatus::invalidate_cache);
     crate::config::on_config_reloaded(|| crate::bus::Bus::global().publish_models_updated());
 
     // Invert the legacy provider_catalog -> auth dependency: provider_catalog
@@ -74,6 +85,7 @@ pub async fn run() -> Result<()> {
         })
     }));
 
+    crate::tui::keybind::log_keybinding_default_warnings();
     crate::platform::raise_nofile_limit_best_effort(8_192);
     startup_profile::mark("nofile_limit");
 

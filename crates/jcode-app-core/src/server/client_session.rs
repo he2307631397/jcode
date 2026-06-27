@@ -2,11 +2,12 @@
 
 use super::client_state::{handle_get_history, spawn_model_prefetch_update};
 use super::{
-    ClientConnectionInfo, ClientDebugState, FileAccess, SessionInterruptQueues, SwarmEvent,
+    ClientConnectionInfo, ClientDebugState, FileTouchService, SessionInterruptQueues, SwarmEvent,
     SwarmMember, SwarmState, VersionedPlan, broadcast_swarm_status, fanout_live_client_event,
-    persist_swarm_state_for, register_session_event_sender, register_session_interrupt_queue,
-    remove_plan_participant, remove_session_channel_subscriptions, remove_session_file_touches,
-    remove_session_from_swarm, remove_session_interrupt_queue, rename_plan_participant,
+    persist_swarm_state_for, register_background_tool_signal, register_session_event_sender,
+    register_session_interrupt_queue, remove_background_tool_signal, remove_plan_participant,
+    remove_session_channel_subscriptions, remove_session_from_swarm,
+    remove_session_interrupt_queue, rename_background_tool_signal, rename_plan_participant,
     rename_session_interrupt_queue, swarm_id_for_dir, unregister_session_event_sender,
     update_member_status,
 };
@@ -117,6 +118,8 @@ async fn rename_shutdown_signal(
     if let Some(signal) = signals.remove(old_session_id) {
         signals.insert(new_session_id.to_string(), signal);
     }
+    drop(signals);
+    rename_background_tool_signal(old_session_id, new_session_id);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -134,8 +137,7 @@ pub(super) async fn handle_clear_session(
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    file_touches: &Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: &Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: &FileTouchService,
     channel_subscriptions: &ChannelSubscriptions,
     channel_subscriptions_by_session: &ChannelSubscriptions,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
@@ -205,6 +207,9 @@ pub(super) async fn handle_clear_session(
         let mut signals = shutdown_signals.write().await;
         signals.remove(client_session_id);
         signals.insert(new_id.clone(), agent_guard.graceful_shutdown_signal());
+        drop(signals);
+        remove_background_tool_signal(client_session_id);
+        register_background_tool_signal(&new_id, agent_guard.background_tool_signal());
     }
     remove_session_interrupt_queue(soft_interrupt_queues, client_session_id).await;
 
@@ -228,7 +233,7 @@ pub(super) async fn handle_clear_session(
             swarm.insert(new_id.clone());
         }
     }
-    remove_session_file_touches(client_session_id, file_touches, files_touched_by_session).await;
+    file_touch.clear_session(client_session_id).await;
     remove_session_channel_subscriptions(
         client_session_id,
         channel_subscriptions,
@@ -347,6 +352,7 @@ async fn ensure_client_swarm_member(
                     joined_at: now,
                     last_status_change: now,
                     is_headless: false,
+                    output_tail: None,
                 },
             );
             inserted = true;
@@ -660,11 +666,36 @@ async fn subscribe_should_mark_ready(
 
 pub(super) async fn handle_reload(
     id: u64,
+    force: bool,
     client_session_id: &str,
     agent: &Arc<Mutex<Agent>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
+    // A non-forced reload (e.g. `jcode server reload`) is a graceful upgrade
+    // request: only reload when this server is provably running older code than
+    // an available reload candidate. This keeps us from downgrading a newer
+    // server (such as a self-dev daemon next to an older release client) and
+    // from re-entering the reload-loop family (#277), where a server that merely
+    // "differs" can never make the difference go away by reloading.
+    if !force && !super::server_has_newer_binary() {
+        crate::logging::info(&format!(
+            "handle_reload: skipping non-forced reload for client_session_id={} (no strictly-newer binary)",
+            client_session_id
+        ));
+        // Tell the requester this was a deliberate no-op (not a silent success)
+        // so callers like `jcode server reload` can report "already up to date"
+        // distinctly from an actual reload.
+        let _ = client_event_tx.send(ServerEvent::ReloadProgress {
+            step: "skip".to_string(),
+            message: "Server already running the newest binary; no reload needed.".to_string(),
+            success: Some(true),
+            output: None,
+        });
+        let _ = client_event_tx.send(ServerEvent::Done { id });
+        return;
+    }
+
     let request_id = crate::id::new_id("reload");
     mark_remote_reload_started(&request_id);
 
@@ -737,8 +768,7 @@ async fn cleanup_detached_source_session_if_unused(
     client_connections: &Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    file_touches: &Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: &Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: &FileTouchService,
     channel_subscriptions: &ChannelSubscriptions,
     channel_subscriptions_by_session: &ChannelSubscriptions,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
@@ -777,6 +807,7 @@ async fn cleanup_detached_source_session_if_unused(
         let mut signals = shutdown_signals.write().await;
         signals.remove(old_session_id);
     }
+    remove_background_tool_signal(old_session_id);
     remove_session_interrupt_queue(soft_interrupt_queues, old_session_id).await;
     remove_session_channel_subscriptions(
         old_session_id,
@@ -784,7 +815,7 @@ async fn cleanup_detached_source_session_if_unused(
         channel_subscriptions_by_session,
     )
     .await;
-    remove_session_file_touches(old_session_id, file_touches, files_touched_by_session).await;
+    file_touch.clear_session(old_session_id).await;
 
     let removed_swarm_id = {
         let mut members = swarm_members.write().await;
@@ -825,8 +856,7 @@ pub(super) async fn handle_resume_session(
     client_debug_state: &Arc<RwLock<ClientDebugState>>,
     swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
     swarms_by_id: &Arc<RwLock<HashMap<String, HashSet<String>>>>,
-    file_touches: &Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: &Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: &FileTouchService,
     channel_subscriptions: &ChannelSubscriptions,
     channel_subscriptions_by_session: &ChannelSubscriptions,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
@@ -914,8 +944,7 @@ pub(super) async fn handle_resume_session(
             client_connections,
             swarm_members,
             swarms_by_id,
-            file_touches,
-            files_touched_by_session,
+            file_touch,
             channel_subscriptions,
             channel_subscriptions_by_session,
             swarm_plans,
@@ -1262,8 +1291,7 @@ pub(super) async fn handle_resume_session(
                 channel_subscriptions_by_session,
             )
             .await;
-            remove_session_file_touches(&old_session_id, file_touches, files_touched_by_session)
-                .await;
+            file_touch.clear_session(&old_session_id).await;
             {
                 let mut coordinators = swarm_coordinators.write().await;
                 for coordinator in coordinators.values_mut() {

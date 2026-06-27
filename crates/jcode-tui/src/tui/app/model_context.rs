@@ -21,21 +21,44 @@ impl App {
         "To turn this off, set [provider].cross_provider_failover = \"manual\" in ~/.jcode/config.toml or export JCODE_CROSS_PROVIDER_FAILOVER=manual."
     }
 
+    /// Shared post-switch bookkeeping for every local model/provider switch
+    /// path (/model, model cycling, failover, post-login activation).
+    ///
+    /// Centralized so all paths agree on what a switch means: reset provider
+    /// session ids, drop upstream/status details, invalidate the model picker
+    /// cache, update the context limit, recompute the session provider key,
+    /// and persist the session. Returns the active model after the switch.
+    ///
+    /// `model_request` is the original request string (it may carry an
+    /// explicit provider prefix like `openrouter:`); for provider-level
+    /// switches without a model request, pass the active model name.
+    pub(super) fn finalize_model_switch(&mut self, model_request: &str) -> String {
+        self.provider_session_id = None;
+        self.session.provider_session_id = None;
+        self.upstream_provider = None;
+        self.status_detail = None;
+        self.invalidate_model_picker_cache();
+        let active_model = self.provider.model();
+        self.update_context_limit_for_model(&active_model);
+        self.session.provider_key =
+            crate::provider::MultiProvider::session_provider_key_after_model_switch(
+                model_request,
+                self.provider.name(),
+                self.session.provider_key.as_deref(),
+            );
+        self.session.model = Some(active_model.clone());
+        let _ = self.session.save();
+        active_model
+    }
+
     fn apply_provider_switch_for_failover(
         &mut self,
         prompt: &crate::provider::ProviderFailoverPrompt,
     ) -> anyhow::Result<String> {
         self.provider
             .switch_active_provider_to(&prompt.to_provider)?;
-        self.provider_session_id = None;
-        self.session.provider_session_id = None;
-        self.upstream_provider = None;
-        self.status_detail = None;
         let active_model = self.provider.model();
-        self.update_context_limit_for_model(&active_model);
-        self.session.model = Some(active_model.clone());
-        let _ = self.session.save();
-        Ok(active_model)
+        Ok(self.finalize_model_switch(&active_model))
     }
 
     pub(super) fn cancel_pending_provider_failover(&mut self, notice: impl Into<String>) {
@@ -173,19 +196,7 @@ impl App {
 
         match self.provider.set_model(&next_model) {
             Ok(()) => {
-                self.provider_session_id = None;
-                self.session.provider_session_id = None;
-                self.upstream_provider = None;
-                self.status_detail = None;
-                self.update_context_limit_for_model(&next_model);
-                self.session.provider_key =
-                    crate::provider::MultiProvider::session_provider_key_after_model_switch(
-                        &next_model,
-                        self.provider.name(),
-                        self.session.provider_key.as_deref(),
-                    );
-                self.session.model = Some(self.provider.model());
-                let _ = self.session.save();
+                self.finalize_model_switch(&next_model);
                 let auth_suffix = self
                     .provider
                     .active_auth_method_label()
@@ -313,13 +324,13 @@ impl App {
     }
 
     pub(super) fn current_stream_context_tokens(&self) -> Option<u64> {
-        if self.streaming_input_tokens == 0 {
+        if self.streaming.streaming_input_tokens == 0 {
             return None;
         }
         Some(self.effective_context_tokens_from_usage(
-            self.streaming_input_tokens,
-            self.streaming_cache_read_tokens,
-            self.streaming_cache_creation_tokens,
+            self.streaming.streaming_input_tokens,
+            self.streaming.streaming_cache_read_tokens,
+            self.streaming.streaming_cache_creation_tokens,
         ))
     }
 
@@ -336,12 +347,60 @@ impl App {
         };
     }
 
+    /// Put the prompt that started the failed turn back into the input box so the
+    /// user does not lose what they typed when a turn errors out (for example a
+    /// "token refresh needed" / auth error). Only restores when the input box is
+    /// empty, so we never clobber text the user has already started typing.
+    pub(super) fn restore_failed_input_to_box(&mut self) {
+        let Some(prompt) = self.last_submitted_input.take() else {
+            return;
+        };
+        if prompt.trim().is_empty() {
+            return;
+        }
+        if !self.input.is_empty() {
+            // User already started a new prompt; do not overwrite it.
+            return;
+        }
+        self.input = prompt;
+        self.cursor_pos = self.input.len();
+        self.reset_tab_completion();
+        self.sync_model_picker_preview_from_input();
+        self.set_status_notice("Prompt restored to input after error");
+    }
+
     pub(super) fn handle_turn_error(&mut self, error: impl Into<String>) {
         let error = error.into();
         self.last_stream_error = Some(error.clone());
+        self.restore_failed_input_to_box();
 
         if let Some(prompt) = crate::provider::parse_failover_prompt_message(&error) {
             self.handle_provider_failover_prompt(prompt);
+            return;
+        }
+
+        if is_request_payload_too_large_error(&error) {
+            // 413 is a request body-size rejection driven by inline images.
+            // Strip oversized images now so a manual resubmit (or auto-poke
+            // retry) goes through, and keep auto-poke alive.
+            let stripped = self
+                .session
+                .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+            if stripped > 0 {
+                self.messages.clear();
+                self.reseed_compaction_from_provider_messages();
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Error: {} Dropped {} oversized image(s); you can retry.",
+                    error, stripped
+                )));
+            } else {
+                self.push_display_message(DisplayMessage::error(format!(
+                    "Error: {} Request body was too large but no inline images could be dropped. Run /fix to try manual recovery.",
+                    error
+                )));
+                super::commands::stop_auto_poke_for_non_retryable_error(self, &error);
+                self.stop_overnight_auto_poke_for_non_retryable_error(&error);
+            }
             return;
         }
 
@@ -428,6 +487,45 @@ impl App {
         }
     }
 
+    /// Attempt recovery after a provider HTTP 413 "request too large" error by
+    /// stripping oversized inline images (oldest-first) from the persisted
+    /// transcript, then retrying the turn. Returns true if the retry succeeded.
+    ///
+    /// This is the byte-size counterpart to `try_auto_compact_and_retry`: 413 is
+    /// driven by base64 image payload size, which token-budget compaction
+    /// deliberately undercounts, so ordinary compaction would not shrink the
+    /// request and the retry would 413 again.
+    pub(super) async fn try_recover_payload_too_large_and_retry(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        event_stream: &mut EventStream,
+    ) -> bool {
+        if self.is_remote {
+            return false;
+        }
+
+        let stripped = self
+            .session
+            .strip_oversized_images(crate::compaction::PAYLOAD_IMAGE_CHAR_BUDGET);
+        if stripped == 0 {
+            return false;
+        }
+
+        // Transcript changed: drop the local materialized scratch copy so the
+        // next API call rebuilds from the reduced session, and reseed compaction
+        // bookkeeping from the new provider view.
+        self.messages.clear();
+        self.reseed_compaction_from_provider_messages();
+
+        self.push_display_message(DisplayMessage::system(format!(
+            "⚡ Request was too large; dropped {} oversized image(s) and retrying...",
+            stripped
+        )));
+
+        self.reset_state_for_compaction_retry();
+        self.run_compaction_retry_turn(terminal, event_stream).await
+    }
+
     /// Reset session and streaming state so a turn can be safely retried after
     /// an emergency compaction or truncation changed the context.
     ///
@@ -442,11 +540,11 @@ impl App {
         self.clear_streaming_render_state();
         self.stream_buffer.clear();
         self.streaming_tool_calls.clear();
-        self.streaming_input_tokens = 0;
-        self.streaming_output_tokens = 0;
-        self.streaming_cache_read_tokens = None;
-        self.streaming_cache_creation_tokens = None;
-        self.current_api_usage_recorded = false;
+        self.streaming.streaming_input_tokens = 0;
+        self.streaming.streaming_output_tokens = 0;
+        self.streaming.streaming_cache_read_tokens = None;
+        self.streaming.streaming_cache_creation_tokens = None;
+        self.kv_cache.current_api_usage_recorded = false;
         self.thought_line_inserted = false;
         self.thinking_prefix_emitted = false;
         self.thinking_buffer.clear();
@@ -955,20 +1053,7 @@ pub(super) fn handle_model_command(app: &mut App, trimmed: &str) -> bool {
         let model_name = model_name.trim();
         match app.provider.set_model(model_name) {
             Ok(()) => {
-                app.provider_session_id = None;
-                app.session.provider_session_id = None;
-                app.upstream_provider = None;
-                app.invalidate_model_picker_cache();
-                let active_model = app.provider.model();
-                app.update_context_limit_for_model(&active_model);
-                app.session.provider_key =
-                    crate::provider::MultiProvider::session_provider_key_after_model_switch(
-                        model_name,
-                        app.provider.name(),
-                        app.session.provider_key.as_deref(),
-                    );
-                app.session.model = Some(active_model.clone());
-                let _ = app.session.save();
+                let active_model = app.finalize_model_switch(model_name);
                 let auth_suffix = app
                     .provider
                     .active_auth_method_label()
@@ -1018,9 +1103,10 @@ pub(super) fn handle_model_command(app: &mut App, trimmed: &str) -> bool {
                 })
                 .collect();
             app.push_display_message(DisplayMessage::system(format!(
-                "Reasoning effort: {}\nAvailable: {}\nUse /effort <level> or Alt+Left / Alt+Right to change.",
+                "Reasoning effort: {}\nAvailable: {}\nUse /effort <level> or {} to change.",
                 current_label,
-                list.join(" · ")
+                list.join(" · "),
+                crate::tui::keybind::effort_switch_keys_label()
             )));
         }
         return true;

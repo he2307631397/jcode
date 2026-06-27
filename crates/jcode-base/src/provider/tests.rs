@@ -53,9 +53,15 @@ fn with_clean_provider_test_env<T>(f: impl FnOnce() -> T) -> T {
     crate::subscription_catalog::clear_runtime_env();
     crate::auth::claude::set_active_account_override(None);
     crate::auth::codex::set_active_account_override(None);
+    // The in-memory model catalog services are process-global; earlier tests
+    // may have hydrated scopes (fixture models) that would corrupt this test's
+    // known_*_model_ids() validation, and vice versa. Reset on entry and exit
+    // so neither direction leaks.
+    crate::provider::models::reset_model_catalog_services_for_tests();
 
     let result = f();
 
+    crate::provider::models::reset_model_catalog_services_for_tests();
     crate::auth::claude::set_active_account_override(None);
     crate::auth::codex::set_active_account_override(None);
     if let Some(prev_home) = prev_home {
@@ -188,6 +194,8 @@ fn test_multi_provider_with_openai() -> MultiProvider {
         cursor: RwLock::new(None),
         bedrock: RwLock::new(None),
         openrouter: RwLock::new(None),
+        openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+        active_openai_compatible_profile: RwLock::new(None),
         active: RwLock::new(ActiveProvider::OpenAI),
         use_claude_cli: false,
         startup_notices: RwLock::new(Vec::new()),
@@ -338,6 +346,51 @@ fn openai_model_route_roundtrip_preserves_auth_method_for_model_switches() {
                 "{request}"
             );
         }
+    });
+}
+
+#[test]
+fn active_explicit_credential_reflects_openai_switch_immediately_and_none_for_auto() {
+    use jcode_provider_core::{Provider, ResolvedCredential};
+    with_clean_provider_test_env(|| {
+        let rt = enter_test_runtime();
+        let _runtime_guard = rt.enter();
+        let provider = test_multi_provider_with_openai();
+        let model = known_openai_model_ids()
+            .first()
+            .expect("at least one OpenAI model")
+            .clone();
+
+        // Fresh provider with both credentials present defaults to auto, which
+        // has no explicit pin: the info widget must fall back to its cached
+        // heuristic instead of asserting an OAuth-vs-API choice the user never
+        // made.
+        assert_eq!(
+            provider.active_explicit_credential(),
+            None,
+            "auto mode must not report an explicit pin"
+        );
+
+        // Switching to the API-key route pins the credential in memory, so the
+        // widget must report API key on the very next read with no cache delay.
+        provider
+            .set_model(&format!("openai-api:{model}"))
+            .expect("switch to OpenAI API key");
+        assert_eq!(
+            provider.active_explicit_credential(),
+            Some(ResolvedCredential::ApiKey),
+            "explicit API-key switch must be visible immediately"
+        );
+
+        // Switching back to OAuth flips it back just as immediately.
+        provider
+            .set_model(&format!("openai-oauth:{model}"))
+            .expect("switch to OpenAI OAuth");
+        assert_eq!(
+            provider.active_explicit_credential(),
+            Some(ResolvedCredential::Oauth),
+            "explicit OAuth switch must be visible immediately"
+        );
     });
 }
 
@@ -519,6 +572,91 @@ fn configured_openai_compatible_profile_routes_use_live_cache_when_not_active_pr
     });
 }
 
+#[test]
+fn standard_openrouter_catalog_refresh_is_noop_when_cache_fresh() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        runtime.block_on(async {
+            crate::provider_catalog::save_env_value_to_env_file(
+                "OPENROUTER_API_KEY",
+                "openrouter.env",
+                Some("sk-test-openrouter"),
+            )
+            .expect("save openrouter key");
+            // A fresh, non-empty standard OpenRouter cache should suppress the
+            // background refresh entirely so we never fire a needless network
+            // request on every picker render.
+            save_test_openrouter_model_cache(
+                "openrouter",
+                "https://openrouter.ai/api/v1",
+                &["openrouter/owl-alpha"],
+            );
+
+            assert!(
+                !openrouter::maybe_schedule_standard_openrouter_catalog_refresh(
+                    "unit test fresh cache"
+                ),
+                "a fresh non-empty standard OpenRouter cache must not trigger a refresh"
+            );
+        });
+    });
+}
+
+#[test]
+fn standard_openrouter_catalog_refresh_skips_without_key() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        runtime.block_on(async {
+            // No OPENROUTER_API_KEY configured: the refresh must not be
+            // scheduled regardless of cache state.
+            assert!(
+                !openrouter::maybe_schedule_standard_openrouter_catalog_refresh(
+                    "unit test missing key"
+                ),
+                "standard OpenRouter refresh must be skipped when no key is configured"
+            );
+        });
+    });
+}
+
+#[test]
+fn standard_openrouter_catalog_refresh_fires_when_named_profile_owns_slot() {
+    with_clean_provider_test_env(|| {
+        let runtime = enter_test_runtime();
+        runtime.block_on(async {
+            crate::provider_catalog::save_env_value_to_env_file(
+                "OPENROUTER_API_KEY",
+                "openrouter.env",
+                Some("sk-test-openrouter"),
+            )
+            .expect("save openrouter key");
+            // Simulate an active named profile (e.g. NVIDIA NIM) occupying the
+            // shared OpenRouter/OpenAI-compatible slot: it sets the runtime env
+            // vars to point at a non-openrouter.ai endpoint. The standard
+            // OpenRouter catalog refresh must STILL fire so `/model` can list
+            // openrouter.ai models (issue #292). Cache is missing -> not fresh.
+            crate::env::set_var(
+                "JCODE_OPENROUTER_API_BASE",
+                "https://integrate.api.nvidia.com/v1",
+            );
+            crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", "mynvidia");
+
+            // Other tests in this process may already have attempted (or be
+            // running) an `openrouter` catalog refresh; clear the process-wide
+            // backoff/in-flight tracker or this assertion is flaky under
+            // parallel test execution.
+            openrouter::reset_profile_catalog_refresh_tracker_for_tests();
+
+            assert!(
+                openrouter::maybe_schedule_standard_openrouter_catalog_refresh(
+                    "unit test named profile owns slot"
+                ),
+                "standard OpenRouter refresh must fire even when a named profile sets JCODE_OPENROUTER_* env"
+            );
+        });
+    });
+}
+
 fn test_multi_provider_with_cursor() -> MultiProvider {
     MultiProvider {
         claude: RwLock::new(None),
@@ -530,6 +668,8 @@ fn test_multi_provider_with_cursor() -> MultiProvider {
         cursor: RwLock::new(Some(Arc::new(cursor::CursorCliProvider::new()))),
         bedrock: RwLock::new(None),
         openrouter: RwLock::new(None),
+        openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+        active_openai_compatible_profile: RwLock::new(None),
         active: RwLock::new(ActiveProvider::Cursor),
         use_claude_cli: false,
         startup_notices: RwLock::new(Vec::new()),

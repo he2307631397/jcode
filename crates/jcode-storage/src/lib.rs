@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 
 mod active_pids;
 pub use active_pids::{
-    active_pids_dir, active_session_ids, find_active_session_id_by_pid, register_active_pid,
-    unregister_active_pid,
+    SessionCounts, SessionPresence, StreamingGuard, active_pids_dir, active_session_ids,
+    find_active_session_id_by_pid, mark_streaming, register_active_pid, session_counts,
+    session_presence, streaming_pids_dir, unmark_streaming, unregister_active_pid,
 };
 
 /// Platform-aware runtime directory for sockets and ephemeral state.
@@ -280,7 +281,26 @@ fn write_bytes_inner(path: &Path, bytes: &[u8], durable: bool) -> Result<()> {
 
         if path.exists() {
             let bak_path = path.with_extension("bak");
-            let _ = std::fs::rename(path, &bak_path);
+            // Preserve the previous version as .bak without ever leaving the
+            // primary path missing. On Unix, rename(tmp, path) atomically
+            // replaces the destination, so the backup can be a hard link to
+            // the old inode: concurrent readers always see either the old or
+            // the new content, never ENOENT. (The old rename-away approach
+            // opened a window where the primary did not exist, which made
+            // concurrent load-all style readers silently drop entries, e.g.
+            // self-dev build requests "disappearing" from the queue.)
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(&bak_path);
+                let _ = std::fs::hard_link(path, &bak_path);
+            }
+            // On Windows, rename fails when the destination exists, so the
+            // primary must be moved away first; the brief missing window is
+            // unavoidable without platform-specific replace APIs.
+            #[cfg(not(unix))]
+            {
+                let _ = std::fs::rename(path, &bak_path);
+            }
         }
 
         std::fs::rename(&tmp_path, path)?;

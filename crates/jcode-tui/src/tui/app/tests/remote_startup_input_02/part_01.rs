@@ -243,7 +243,86 @@ fn test_remote_current_fpt_live_model_uses_fpt_route_not_copilot_without_cache()
 }
 
 #[test]
-fn test_model_picker_ctrl_d_bedrock_selection_saves_bedrock_default() {
+fn test_remote_fallback_claude_model_gets_api_key_route_without_oauth() {
+    // A newly released Claude model can reach the picker via the names-only
+    // catalog fallback (oversized route frames are downgraded to model names).
+    // With only ANTHROPIC_API_KEY configured, the fallback must synthesize a
+    // claude-api route; previously it only ever emitted claude-oauth routes.
+    with_temp_jcode_home(|| {
+        crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key");
+        crate::auth::AuthStatus::invalidate_cache();
+
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.remote_available_entries = vec!["claude-fable-5".to_string()];
+        app.remote_model_options.clear();
+
+        let routes = app.build_remote_model_routes_fallback();
+
+        assert!(
+            routes.iter().any(|route| {
+                route.model == "claude-fable-5"
+                    && route.provider == "Anthropic"
+                    && route.api_method == "claude-api"
+                    && route.available
+            }),
+            "claude model with only an API key should get a claude-api fallback route, got {routes:?}"
+        );
+
+        crate::env::remove_var("ANTHROPIC_API_KEY");
+        crate::auth::AuthStatus::invalidate_cache();
+    });
+}
+
+#[test]
+fn test_remote_cached_oauth_only_claude_route_gains_api_key_route_in_picker() {
+    // A stale persisted catalog can carry an OAuth-only route for a newly
+    // released Claude model. When an Anthropic API key is configured, opening
+    // the picker must add the claude-api route instead of trusting the stale
+    // single-route cache forever.
+    with_temp_jcode_home(|| {
+        crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-key");
+        crate::auth::AuthStatus::invalidate_cache();
+
+        let mut app = create_test_app();
+        app.is_remote = true;
+        app.remote_available_entries = vec!["claude-fable-5".to_string()];
+        app.remote_model_options = vec![crate::provider::ModelRoute {
+            model: "claude-fable-5".to_string(),
+            provider: "Anthropic".to_string(),
+            api_method: "claude-oauth".to_string(),
+            available: true,
+            detail: String::new(),
+            cheapness: None,
+        }];
+
+        app.open_model_picker();
+
+        let picker = app
+            .inline_interactive_state
+            .as_ref()
+            .expect("model picker should be open");
+        let entry = picker
+            .entries
+            .iter()
+            .find(|entry| entry.name == "claude-fable-5")
+            .expect("fable should be in the picker");
+        assert!(
+            entry
+                .options
+                .iter()
+                .any(|option| option.api_method == "claude-api" && option.available),
+            "stale oauth-only cached route should be augmented with claude-api, got {:?}",
+            entry.options
+        );
+
+        crate::env::remove_var("ANTHROPIC_API_KEY");
+        crate::auth::AuthStatus::invalidate_cache();
+    });
+}
+
+#[test]
+fn test_model_picker_ctrl_b_bedrock_selection_saves_bedrock_default() {
     with_temp_jcode_home(|| {
         let mut app = create_test_app();
         app.is_remote = true;
@@ -275,7 +354,7 @@ fn test_model_picker_ctrl_d_bedrock_selection_saves_bedrock_default() {
             .expect("Bedrock model should be in filtered list");
         app.inline_interactive_state.as_mut().unwrap().selected = filtered_pos;
 
-        app.handle_key(KeyCode::Char('d'), KeyModifiers::CONTROL)
+        app.handle_key(KeyCode::Char('b'), KeyModifiers::CONTROL)
             .unwrap();
 
         let cfg = crate::config::Config::load();
@@ -428,10 +507,48 @@ fn test_handle_key_super_left_right_move_to_edges() {
     let mut app = create_test_app();
     app.set_input_for_test("hello world");
 
-    app.handle_key(KeyCode::Left, KeyModifiers::SUPER).unwrap();
+    if cfg!(target_os = "macos") {
+        // On macOS, Cmd+Left/Right default to effort cycling, so the cursor
+        // must NOT move; Home/End still jump to the edges.
+        let before = app.cursor_pos();
+        app.handle_key(KeyCode::Left, KeyModifiers::SUPER).unwrap();
+        assert_eq!(app.cursor_pos(), before);
+
+        app.handle_key(KeyCode::Home, KeyModifiers::empty()).unwrap();
+        assert_eq!(app.cursor_pos(), 0);
+
+        app.handle_key(KeyCode::End, KeyModifiers::empty()).unwrap();
+        assert_eq!(app.cursor_pos(), "hello world".len());
+    } else {
+        app.handle_key(KeyCode::Left, KeyModifiers::SUPER).unwrap();
+        assert_eq!(app.cursor_pos(), 0);
+
+        app.handle_key(KeyCode::Right, KeyModifiers::SUPER).unwrap();
+        assert_eq!(app.cursor_pos(), "hello world".len());
+    }
+}
+
+#[test]
+fn test_handle_key_alt_left_right_move_by_word() {
+    // On non-macOS platforms Alt+Left/Right default to effort cycling, so the
+    // word-move behavior only applies where Cmd+Left/Right own effort cycling.
+    if !cfg!(target_os = "macos") {
+        return;
+    }
+    let mut app = create_test_app();
+    app.set_input_for_test("hello world");
+
+    app.handle_key(KeyCode::Left, KeyModifiers::ALT).unwrap();
+    assert_eq!(app.cursor_pos(), "hello ".len());
+
+    app.handle_key(KeyCode::Left, KeyModifiers::ALT).unwrap();
     assert_eq!(app.cursor_pos(), 0);
 
-    app.handle_key(KeyCode::Right, KeyModifiers::SUPER).unwrap();
+    // Forward lands at the start of the next word, matching Alt+F.
+    app.handle_key(KeyCode::Right, KeyModifiers::ALT).unwrap();
+    assert_eq!(app.cursor_pos(), "hello ".len());
+
+    app.handle_key(KeyCode::Right, KeyModifiers::ALT).unwrap();
     assert_eq!(app.cursor_pos(), "hello world".len());
 }
 
@@ -587,12 +704,15 @@ fn test_submit_input_commits_pending_streaming_assistant_text_before_user_messag
             id: "tool_read".to_string(),
             name: "read".to_string(),
             input: serde_json::json!({"file_path": "src/main.rs"}),
-            intent: None,
-        },
+            intent: None, thought_signature: None, },
     ));
     app.bump_display_messages_version();
-    app.streaming_text = "Here is the final paragraph".to_string();
-    assert_eq!(app.stream_buffer.push(" that was still buffered."), None);
+    app.streaming.streaming_text = "Here is the final paragraph".to_string();
+    // Mirror the real streaming caller: append any paced chunk the buffer reveals.
+    // The paced StreamBuffer may reveal part of the text immediately, so commit
+    // (below) must still flush the remainder.
+    let ops = app.stream_buffer.push_text(" that was still buffered.");
+    app.apply_stream_ops(ops);
 
     app.input = "follow up".to_string();
     app.cursor_pos = app.input.len();
@@ -732,6 +852,7 @@ fn test_create_transfer_session_from_parent_copies_todos_and_uses_compacted_cont
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Carry this forward".to_string(),
                 status: "pending".to_string(),
@@ -827,6 +948,34 @@ fn test_ctrl_enter_opposite_send_mode() {
 }
 
 #[test]
+fn test_cmd_enter_opposite_send_mode() {
+    let mut app = create_test_app();
+    app.is_processing = true;
+
+    // Default immediate mode: Cmd+Enter should queue, matching Ctrl+Enter
+    app.handle_key(KeyCode::Char('h'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('i'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::SUPER).unwrap();
+
+    assert_eq!(app.queued_count(), 1);
+    assert_eq!(app.interleave_message.as_deref(), None);
+    assert!(app.input().is_empty());
+
+    // Queue mode: Cmd+Enter should interleave (sets interleave_message, not queued)
+    app.queue_mode = true;
+    app.handle_key(KeyCode::Char('y'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Char('o'), KeyModifiers::empty())
+        .unwrap();
+    app.handle_key(KeyCode::Enter, KeyModifiers::SUPER).unwrap();
+
+    assert_eq!(app.queued_count(), 1); // Still just "hi" in queue
+    assert_eq!(app.interleave_message.as_deref(), Some("yo")); // "yo" is for interleave
+}
+
+#[test]
 fn test_typing_during_processing() {
     let mut app = create_test_app();
     app.is_processing = true;
@@ -867,6 +1016,7 @@ fn test_escape_interrupt_disables_auto_poke_while_processing() {
     app.queued_messages
         .push(super::commands::build_poke_message(&[
             crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "keep going".to_string(),
                 status: "pending".to_string(),
@@ -988,6 +1138,37 @@ fn test_retrieve_pending_message_edits_queued_message() {
     assert_eq!(app.queued_count(), 0);
     assert_eq!(app.input(), "hello");
     assert_eq!(app.cursor_pos(), 5); // Cursor at end
+}
+
+#[test]
+fn test_retrieve_pending_message_with_alt_and_super_up() {
+    // Ctrl+Up, Alt(Option)+Up and Cmd(Super)+Up must all recall a queued message
+    // so the gesture works regardless of which modifier the terminal forwards.
+    for modifier in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+    ] {
+        let mut app = create_test_app();
+        app.queue_mode = true;
+        app.is_processing = true;
+
+        for c in "hello".chars() {
+            app.handle_key(KeyCode::Char(c), KeyModifiers::empty())
+                .unwrap();
+        }
+        app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+            .unwrap();
+
+        assert_eq!(app.queued_count(), 1, "modifier {modifier:?}");
+        assert!(app.input().is_empty(), "modifier {modifier:?}");
+
+        app.handle_key(KeyCode::Up, modifier).unwrap();
+
+        assert_eq!(app.queued_count(), 0, "modifier {modifier:?}");
+        assert_eq!(app.input(), "hello", "modifier {modifier:?}");
+        assert_eq!(app.cursor_pos(), 5, "modifier {modifier:?}");
+    }
 }
 
 #[test]

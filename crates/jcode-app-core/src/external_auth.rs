@@ -63,6 +63,9 @@ enum ExternalAuthReviewAction {
     SharedExternal(auth::external::ExternalAuthSource),
     CodexLegacy,
     ClaudeCode,
+    /// Claude Code's native credentials (macOS Keychain item or
+    /// `CLAUDE_CODE_OAUTH_TOKEN` env var), which have no stable on-disk path.
+    ClaudeCodeNative,
     GeminiCli,
     Copilot(auth::copilot::ExternalCopilotAuthSource),
     Cursor(auth::cursor::ExternalCursorAuthSource),
@@ -101,10 +104,60 @@ impl ExternalAuthReviewCandidate {
     }
 }
 
+impl ExternalAuthReviewCandidate {
+    /// Coarse telemetry `(provider, method)` labels for the providers this
+    /// candidate activates on a successful import. Used by the onboarding flow
+    /// to record `auth_success` so auto-imported logins show up in the
+    /// activation funnel (they previously did not, because auto-import never
+    /// flows through the manual `pending_login` telemetry path).
+    ///
+    /// The method is reported as `"import"` so import-driven activation can be
+    /// distinguished from manual login in the funnel.
+    pub fn telemetry_auth_labels(&self) -> Vec<(&'static str, &'static str)> {
+        const METHOD: &str = "import";
+        match &self.action {
+            ExternalAuthReviewAction::CodexLegacy => vec![("openai", METHOD)],
+            ExternalAuthReviewAction::ClaudeCode => vec![("claude", METHOD)],
+            ExternalAuthReviewAction::ClaudeCodeNative => vec![("claude", METHOD)],
+            ExternalAuthReviewAction::GeminiCli => vec![("gemini", METHOD)],
+            ExternalAuthReviewAction::Copilot(_) => vec![("copilot", METHOD)],
+            ExternalAuthReviewAction::Cursor(_) => vec![("cursor", METHOD)],
+            ExternalAuthReviewAction::SharedExternal(source) => {
+                auth::external::source_provider_labels(*source)
+                    .into_iter()
+                    .filter_map(|label| {
+                        telemetry_provider_id_for_label(label).map(|id| (id, METHOD))
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// Map a human-facing provider label (as produced by
+/// [`auth::external::source_provider_labels`]) to the canonical telemetry
+/// provider id used by the activation funnel.
+fn telemetry_provider_id_for_label(label: &str) -> Option<&'static str> {
+    match label {
+        "OpenAI/Codex" => Some("openai"),
+        "Claude" => Some("claude"),
+        "Gemini" => Some("gemini"),
+        "Antigravity" => Some("antigravity"),
+        "GitHub Copilot" => Some("copilot"),
+        "OpenRouter/API-key providers" => Some("openrouter"),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalAuthAutoImportOutcome {
     pub imported: usize,
     pub messages: Vec<String>,
+    /// Coarse `(provider, method)` telemetry labels for each provider that was
+    /// successfully imported, so callers can record `auth_success` for the
+    /// activation funnel. May contain more entries than `imported` when a
+    /// single source carries multiple providers.
+    pub imported_auth_labels: Vec<(&'static str, &'static str)>,
 }
 
 impl ExternalAuthAutoImportOutcome {
@@ -190,6 +243,24 @@ pub fn pending_external_auth_review_candidates() -> Result<Vec<ExternalAuthRevie
             source_name: source.display_name().to_string(),
             path: source.path()?,
             action: ExternalAuthReviewAction::ClaudeCode,
+        });
+    }
+
+    // Claude Code's native credentials live in the macOS Keychain (or the
+    // CLAUDE_CODE_OAUTH_TOKEN env var), not in the JSON file. Offer them when
+    // the JSON file was not already detected above, so macOS users (where the
+    // file usually does not exist) can still import their Claude login.
+    if !auth::claude::native_source_allowed()
+        && !candidates
+            .iter()
+            .any(|candidate| matches!(candidate.action, ExternalAuthReviewAction::ClaudeCode))
+        && auth::claude::native_credentials_present()
+    {
+        candidates.push(ExternalAuthReviewCandidate {
+            provider_summary: "Claude".to_string(),
+            source_name: auth::claude::native_source_display_name().to_string(),
+            path: auth::claude::native_source_path_hint(),
+            action: ExternalAuthReviewAction::ClaudeCodeNative,
         });
     }
 
@@ -308,6 +379,18 @@ fn approve_external_auth_review_candidate(candidate: &ExternalAuthReviewCandidat
         ExternalAuthReviewAction::ClaudeCode => auth::claude::trust_external_auth_source(
             auth::claude::ExternalClaudeAuthSource::ClaudeCode,
         )?,
+        ExternalAuthReviewAction::ClaudeCodeNative => {
+            // Trust, then snapshot the Keychain/env credentials into jcode's own
+            // auth.json so future loads and refreshes do not depend on the
+            // (possibly prompting) Keychain. A successful trust with a failed
+            // copy still leaves the env-token path usable.
+            auth::claude::trust_native_source()?;
+            if let Err(err) = auth::claude::import_native_credentials_into_account() {
+                crate::logging::warn(&format!(
+                    "Trusted Claude Code native credentials but could not snapshot them into jcode: {err}"
+                ));
+            }
+        }
         ExternalAuthReviewAction::GeminiCli => auth::gemini::trust_cli_auth_for_future_use()?,
         ExternalAuthReviewAction::Copilot(source) => {
             auth::copilot::trust_external_auth_source(source)?
@@ -337,6 +420,11 @@ fn revoke_external_auth_review_candidate(candidate: &ExternalAuthReviewCandidate
             crate::config::Config::revoke_external_auth_source_for_path(
                 auth::claude::CLAUDE_CODE_AUTH_SOURCE_ID,
                 &candidate.path,
+            )?
+        }
+        ExternalAuthReviewAction::ClaudeCodeNative => {
+            crate::config::Config::revoke_external_auth_source(
+                auth::claude::CLAUDE_CODE_NATIVE_AUTH_SOURCE_ID,
             )?
         }
         ExternalAuthReviewAction::GeminiCli => {
@@ -402,7 +490,10 @@ async fn validate_openai_import() -> Result<String> {
     }
     Ok(format!(
         "Loaded OpenAI OAuth credentials.{}",
-        creds.expires_at.map(token_freshness_note).unwrap_or_default()
+        creds
+            .expires_at
+            .map(token_freshness_note)
+            .unwrap_or_default()
     ))
 }
 
@@ -482,6 +573,7 @@ async fn validate_external_auth_review_candidate(
         }
         ExternalAuthReviewAction::CodexLegacy => validate_openai_import().await,
         ExternalAuthReviewAction::ClaudeCode => validate_claude_import().await,
+        ExternalAuthReviewAction::ClaudeCodeNative => validate_claude_import().await,
         ExternalAuthReviewAction::GeminiCli => validate_gemini_import().await,
         ExternalAuthReviewAction::Copilot(_) => validate_copilot_import().await,
         ExternalAuthReviewAction::Cursor(_) => validate_cursor_import().await,
@@ -532,6 +624,7 @@ pub async fn run_external_auth_auto_import_candidates(
     let mut outcome = ExternalAuthAutoImportOutcome {
         imported: 0,
         messages: Vec::new(),
+        imported_auth_labels: Vec::new(),
     };
 
     for &index in selected {
@@ -542,6 +635,9 @@ pub async fn run_external_auth_auto_import_candidates(
         match validate_external_auth_review_candidate(candidate).await {
             Ok(detail) => {
                 outcome.imported += 1;
+                outcome
+                    .imported_auth_labels
+                    .extend(candidate.telemetry_auth_labels());
                 outcome.messages.push(format!(
                     "✓ {} (from {}): {}",
                     candidate.provider_summary, candidate.source_name, detail
@@ -570,6 +666,7 @@ mod render_markdown_tests {
         let outcome = ExternalAuthAutoImportOutcome {
             imported: 0,
             messages: Vec::new(),
+            imported_auth_labels: Vec::new(),
         };
         assert_eq!(
             outcome.render_markdown(),
@@ -582,10 +679,12 @@ mod render_markdown_tests {
         let outcome = ExternalAuthAutoImportOutcome {
             imported: 2,
             messages: vec![
-                "✓ OpenAI/Codex (from Codex auth.json): Loaded OpenAI OAuth credentials.".to_string(),
+                "✓ OpenAI/Codex (from Codex auth.json): Loaded OpenAI OAuth credentials."
+                    .to_string(),
                 "✓ Claude (from Claude Code): Loaded Claude credentials.".to_string(),
                 "✕ Cursor (from Cursor native): no usable auth token.".to_string(),
             ],
+            imported_auth_labels: vec![("openai", "import"), ("claude", "import")],
         };
         let md = outcome.render_markdown();
         assert!(md.starts_with("**Logins imported**"), "got: {md}");
@@ -609,8 +708,20 @@ mod render_markdown_tests {
         let outcome = ExternalAuthAutoImportOutcome {
             imported: 1,
             messages: vec!["✓ Gemini (from Gemini CLI): Loaded Gemini credentials.".to_string()],
+            imported_auth_labels: vec![("gemini", "import")],
         };
         let md = outcome.render_markdown();
         assert!(md.contains("Reusing 1 existing login:"), "got: {md}");
+    }
+
+    #[test]
+    fn fixture_candidate_reports_import_auth_labels() {
+        use super::ExternalAuthReviewCandidate;
+        // The fixture points at the legacy Codex action -> OpenAI provider.
+        let candidate = ExternalAuthReviewCandidate::fixture("OpenAI/Codex", "Codex auth.json");
+        assert_eq!(
+            candidate.telemetry_auth_labels(),
+            vec![("openai", "import")]
+        );
     }
 }

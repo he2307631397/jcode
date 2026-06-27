@@ -12,16 +12,13 @@ mod streaming;
 mod tools;
 mod turn_execution;
 mod turn_loops;
-mod turn_streaming_broadcast;
 mod turn_streaming_mpsc;
 mod utils;
 
-use self::streaming::{
-    send_stream_keepalive_broadcast, send_stream_keepalive_mpsc, stream_keepalive_ticker,
-};
+use self::streaming::{send_stream_keepalive_mpsc, stream_keepalive_ticker};
 use self::tools::{
     cap_sdk_tool_content_for_history, cap_tool_output_for_history, print_tool_summary,
-    tool_output_to_content_blocks,
+    tool_output_side_pane_images, tool_output_to_content_blocks,
 };
 use self::utils::trace_enabled;
 use crate::build;
@@ -46,7 +43,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use interrupts::{NoToolCallOutcome, PostToolInterruptOutcome};
 pub use jcode_agent_runtime::{
@@ -217,6 +214,17 @@ pub struct Agent {
     /// to avoid cache invalidation when MCP tools arrive asynchronously.
     /// Cleared on compaction/reset.
     locked_tools: Option<Vec<ToolDefinition>>,
+    /// One-shot guard for the async MCP-registration race (#206).
+    ///
+    /// MCP servers connect on a background task and register `mcp__*` tools
+    /// seconds after the session starts (we deliberately do NOT block the first
+    /// turn on MCP connection, so the user can talk to the agent immediately).
+    /// The first turn therefore locks a snapshot without MCP tools. We allow
+    /// exactly one rebuild to pick them up — an intentional, one-time provider
+    /// prompt-cache miss. Once that rebuild happens (or we confirm there are no
+    /// MCP tools to wait for), this is set so the per-turn registry scan stops.
+    /// Reset whenever the tool list is intentionally unlocked.
+    mcp_late_register_resolved: bool,
     /// Override system prompt (used by ambient mode to inject a custom prompt)
     system_prompt_override: Option<String>,
     /// Whether memory features are enabled for this session
@@ -227,6 +235,10 @@ pub struct Agent {
     stdin_request_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::tool::StdinInputRequest>>,
     /// Canonical reducer-backed view of runtime provider/model selection.
     provider_runtime_state: ProviderRuntimeState,
+    /// When true, this session is an inline swarm worker: stream a throttled
+    /// output tail to the global bus so the coordinator's inline gallery can
+    /// render a live viewport. Off for normal sessions to avoid bus traffic.
+    inline_output_tap: bool,
 }
 
 impl Agent {
@@ -272,11 +284,13 @@ impl Agent {
             cache_tracker: CacheTracker::new(),
             last_usage: TokenUsage::default(),
             locked_tools: None,
+            mcp_late_register_resolved: false,
             system_prompt_override: None,
             memory_enabled: crate::config::config().features.memory,
             rewind_undo_snapshot: None,
             stdin_request_tx: None,
             provider_runtime_state: ProviderRuntimeState::observed(initial_provider_model),
+            inline_output_tap: false,
         };
         crate::tool::set_session_tool_policy(
             &agent.session.id,
@@ -318,6 +332,7 @@ impl Agent {
         agent.session.ensure_initial_session_context_message();
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("create");
+        agent.fire_session_lifecycle_hook("session_start", "create");
         crate::telemetry::begin_session_with_parent(
             agent.provider.name(),
             &agent.provider.model(),
@@ -355,9 +370,10 @@ impl Agent {
         }
         if let Some(model) = agent.session.model.clone() {
             let model_request =
-                crate::provider::MultiProvider::model_switch_request_for_session_model(
+                crate::provider::MultiProvider::model_switch_request_for_session_route(
                     &model,
                     agent.session.provider_key.as_deref(),
+                    agent.session.route_api_method.as_deref(),
                 );
             if let Err(e) = crate::provider::set_model_with_auth_refresh(
                 agent.provider.as_ref(),
@@ -376,6 +392,7 @@ impl Agent {
         agent.sync_memory_dedup_state_from_session();
         agent.seed_compaction_from_session();
         agent.log_env_snapshot("attach");
+        agent.fire_session_lifecycle_hook("session_start", "attach");
         crate::telemetry::begin_session_with_parent(
             agent.provider.name(),
             &agent.provider.model(),
@@ -511,6 +528,7 @@ impl Agent {
         self.cache_tracker.reset();
         self.last_usage = TokenUsage::default();
         self.locked_tools = None;
+        self.mcp_late_register_resolved = false;
         self.rewind_undo_snapshot = None;
     }
 
@@ -570,6 +588,7 @@ impl Agent {
 
         self.cache_tracker.reset();
         self.locked_tools = None;
+        self.mcp_late_register_resolved = false;
         self.provider_session_id = None;
         self.session.provider_session_id = None;
         self.session.save()?;
@@ -790,6 +809,7 @@ impl Agent {
             self.persist_session_best_effort("missing tool-output repair");
             self.cache_tracker.reset();
             self.locked_tools = None;
+            self.mcp_late_register_resolved = false;
         }
 
         repaired
@@ -824,6 +844,23 @@ impl Agent {
         if !self.session.messages.is_empty() {
             self.persist_session_best_effort("session close state");
         }
+        self.fire_session_lifecycle_hook("session_end", "close");
+    }
+
+    /// Fire a session lifecycle observer hook (`session_start`/`session_end`).
+    /// No-op when the hook is not configured.
+    pub(crate) fn fire_session_lifecycle_hook(&self, event_name: &'static str, source: &str) {
+        if !crate::hooks::hook_configured(event_name) {
+            return;
+        }
+        let mut event = crate::hooks::HookEvent::new(event_name)
+            .session_id(self.session.id.clone())
+            .field("SOURCE", source)
+            .field("MODEL", self.provider_model());
+        if let Some(cwd) = self.working_dir() {
+            event = event.cwd(cwd);
+        }
+        crate::hooks::dispatch_observer(event);
     }
 
     pub fn mark_crashed(&mut self, message: Option<String>) {
@@ -864,6 +901,9 @@ impl Agent {
                         md.push_str("\n\n");
                     }
                     ContentBlock::Reasoning { text } => {
+                        md.push_str(&format!("*Thinking:* {}\n\n", text));
+                    }
+                    ContentBlock::ReasoningTrace { text } => {
                         md.push_str(&format!("*Thinking:* {}\n\n", text));
                     }
                     ContentBlock::AnthropicThinking { thinking, .. } => {

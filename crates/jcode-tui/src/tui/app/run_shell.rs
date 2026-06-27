@@ -56,9 +56,15 @@ fn status_spinner_delay_until_next_frame(elapsed: f32) -> Duration {
 
 pub(super) fn status_spinner_only_symbol(app: &App) -> Option<&'static str> {
     let policy = crate::perf::tui_policy();
-    if !policy.enable_decorative_animations
-        || !app.is_processing
-        || !app.streaming_text.is_empty()
+    // The single-cell spinner fast path is intentionally available even when
+    // decorative animations are disabled (Minimal tier, SSH, WSL, etc.). It
+    // patches exactly one status cell between full redraws, so it stays very
+    // cheap while keeping the "thinking/connecting/streaming" spinner feeling
+    // responsive instead of choppy at the ~1 Hz passive-liveness redraw rate.
+    // When decorative animations are off it advances at the smooth liveness
+    // rate; otherwise it uses the full-rate spinner clock.
+    if !app.is_processing
+        || !app.streaming.streaming_text.is_empty()
         || app.centered_mode()
         || app.has_pending_mouse_scroll_animation()
         || app.remote_startup_phase_active()
@@ -70,7 +76,7 @@ pub(super) fn status_spinner_only_symbol(app: &App) -> Option<&'static str> {
         Some(jcode_tui_style::theme::activity_indicator(
             status_spinner_elapsed(app),
             STATUS_SPINNER_FPS,
-            true,
+            policy.enable_decorative_animations,
         ))
     } else {
         None
@@ -141,8 +147,8 @@ impl StatusSpinnerRenderer {
             });
         let total_cells = Some(completed.buffer.content.len());
         let completed_buffer = completed.buffer.clone();
-        // `completed` borrows the terminal; drop it before touching the backend again.
-        drop(completed);
+        // `completed` borrows the terminal; it is unused past this point, so the
+        // borrow ends here (NLL) before we touch the backend again below.
         if sync {
             let _ = crossterm::execute!(terminal.backend_mut(), EndSynchronizedUpdate);
         }
@@ -243,6 +249,7 @@ impl App {
         }
 
         loop {
+            self.sync_sleep_guard();
             let desired_redraw = crate::tui::redraw_interval(&self);
             if desired_redraw != redraw_period {
                 redraw_period = desired_redraw;
@@ -335,6 +342,12 @@ impl App {
         let mut status_spinner_interval = status_spinner_interval();
         let mut status_spinner_renderer = StatusSpinnerRenderer::default();
         let mut needs_redraw = true;
+        // While unfocused and idle, redraws are throttled to this interval so a
+        // backgrounded session does not repaint at full rate on shared-server bus
+        // chatter. `None` means "no throttled frame drawn yet since losing focus".
+        const UNFOCUSED_IDLE_REDRAW_MIN_INTERVAL: std::time::Duration =
+            std::time::Duration::from_millis(1000);
+        let mut last_unfocused_draw: Option<std::time::Instant> = None;
         let mut handterm_native_scroll =
             super::handterm_native_scroll::HandtermNativeScrollClient::connect_from_env();
         let mut remote_state = remote::RemoteRunState::default();
@@ -349,6 +362,19 @@ impl App {
             }
             if needs_redraw {
                 status_spinner_renderer.draw_full(&mut self, &mut terminal)?;
+                // Close the startup-profile gap: `pre_run_remote` is the last
+                // pre-loop mark, so the first completed paint here is the real
+                // process-to-first-frame point. Logged once via a static guard so
+                // the end-to-end launch cost (including the ~5ms first draw) is
+                // visible in the startup profile without re-marking every frame.
+                {
+                    use std::sync::atomic::{AtomicBool, Ordering};
+                    static FIRST_FRAME_MARKED: AtomicBool = AtomicBool::new(false);
+                    if !FIRST_FRAME_MARKED.swap(true, Ordering::Relaxed) {
+                        crate::startup_profile::mark("first_frame");
+                        crate::startup_profile::report_to_log();
+                    }
+                }
                 reset_status_spinner_interval(&mut status_spinner_interval, &self);
                 needs_redraw = false;
             }
@@ -393,6 +419,7 @@ impl App {
 
             // Main event loop
             loop {
+                self.sync_sleep_guard();
                 let desired_redraw = crate::tui::redraw_interval(&self);
                 if desired_redraw != redraw_period {
                     redraw_period = desired_redraw;
@@ -400,12 +427,32 @@ impl App {
                 }
 
                 if needs_redraw {
-                    status_spinner_renderer.draw_full(&mut self, &mut terminal)?;
-                    reset_status_spinner_interval(&mut status_spinner_interval, &self);
-                    if let Some(native) = handterm_native_scroll.as_mut() {
-                        native.sync_from_app(&self);
+                    // Throttle idle full-frame renders while the terminal is
+                    // backgrounded (FocusLost). An unfocused, idle session has
+                    // nothing changing worth a 60fps repaint, so it should not
+                    // repaint at full rate just because other sessions on the
+                    // shared server broadcast bus updates -- that is what made a
+                    // swarm of background windows saturate the CPU. We keep full-
+                    // rate redraws while streaming/processing so visible-but-
+                    // unfocused windows in a tiling WM still show live progress,
+                    // and set_client_focused(true) forces a full repaint on refocus.
+                    let allow_redraw = self.client_focused()
+                        || self.unfocused_redraw_warranted()
+                        || last_unfocused_draw
+                            .map(|t| t.elapsed() >= UNFOCUSED_IDLE_REDRAW_MIN_INTERVAL)
+                            .unwrap_or(true);
+                    if allow_redraw {
+                        status_spinner_renderer.draw_full(&mut self, &mut terminal)?;
+                        reset_status_spinner_interval(&mut status_spinner_interval, &self);
+                        if let Some(native) = handterm_native_scroll.as_mut() {
+                            native.sync_from_app(&self);
+                        }
+                        last_unfocused_draw =
+                            (!self.client_focused()).then(std::time::Instant::now);
+                        needs_redraw = false;
                     }
-                    needs_redraw = false;
+                    // When unfocused and throttled, leave needs_redraw set so the
+                    // pending update is coalesced into the next allowed frame.
                 }
 
                 if self.should_quit {

@@ -145,21 +145,31 @@ pub(super) fn is_non_retryable_auto_poke_error(error: &str) -> bool {
         "401 unauthorized",
         "403 forbidden",
         "insufficient_quota",
+        "402 payment required",
+        "payment required",
+        "requires more credits",
+        "add more credits",
+        "more credits",
         "billing",
         "credit balance",
+        "out of credits",
     ];
 
     deterministic_markers
         .iter()
         .any(|marker| lower.contains(marker))
-        || is_auto_poke_connectivity_error(error)
 }
 
+/// Whether `error` is a transient connectivity failure (DNS, name resolution,
+/// routing, unreachable host) that the agent itself cannot repair by resending
+/// immediately. These are NOT non-retryable: they resolve once the network
+/// environment recovers, so callers route them to a network-wait/resume path
+/// rather than stopping auto-poke. Kept separate from
+/// [`is_non_retryable_auto_poke_error`] precisely so a transient disconnect is
+/// never treated as a permanent failure.
 pub(super) fn is_auto_poke_connectivity_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
 
-    // Auto-poke cannot repair local/network/provider DNS or routing failures. Re-sending the same
-    // poke just creates noise until the user or network environment changes.
     let connectivity_markers = [
         "failed to send openai-compatible chat request",
         "dns error",
@@ -296,19 +306,19 @@ pub(super) fn activate_auto_poke_local(app: &mut App) {
             app.thinking_buffer.clear();
             app.streaming_tool_calls.clear();
             app.batch_progress = None;
-            app.streaming_input_tokens = 0;
-            app.streaming_output_tokens = 0;
-            app.streaming_cache_read_tokens = None;
-            app.streaming_cache_creation_tokens = None;
-            app.current_api_usage_recorded = false;
+            app.streaming.streaming_input_tokens = 0;
+            app.streaming.streaming_output_tokens = 0;
+            app.streaming.streaming_cache_read_tokens = None;
+            app.streaming.streaming_cache_creation_tokens = None;
+            app.kv_cache.current_api_usage_recorded = false;
             app.upstream_provider = None;
             app.status_detail = None;
-            app.streaming_tps_start = None;
-            app.streaming_tps_elapsed = std::time::Duration::ZERO;
-            app.streaming_tps_collect_output = false;
-            app.streaming_total_output_tokens = 0;
-            app.streaming_tps_observed_output_tokens = 0;
-            app.streaming_tps_observed_elapsed = std::time::Duration::ZERO;
+            app.streaming.streaming_tps_start = None;
+            app.streaming.streaming_tps_elapsed = std::time::Duration::ZERO;
+            app.streaming.streaming_tps_collect_output = false;
+            app.streaming.streaming_total_output_tokens = 0;
+            app.streaming.streaming_tps_observed_output_tokens = 0;
+            app.streaming.streaming_tps_observed_elapsed = std::time::Duration::ZERO;
             app.processing_started = Some(Instant::now());
             app.visible_turn_started = Some(Instant::now());
             app.pending_turn = true;
@@ -638,6 +648,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
             "command": "/subagent",
         }),
         intent: None,
+        thought_signature: None,
     };
 
     app.push_display_message(DisplayMessage {
@@ -653,6 +664,7 @@ fn launch_manual_subagent(app: &mut App, spec: ManualSubagentSpec) {
         id: tool_call.id.clone(),
         name: tool_call.name.clone(),
         input: tool_call.input.clone(),
+        thought_signature: None,
     }];
     app.add_provider_message(Message {
         role: Role::Assistant,
@@ -833,6 +845,38 @@ pub(super) fn handle_help_command(app: &mut App, trimmed: &str) -> bool {
     false
 }
 
+/// `/keys` shows the keymap diagnostics: detected terminal, discovered terminal
+/// and macOS shortcuts, and any conflicts with jcode's own keybindings.
+/// `/keys refresh` forces a fresh scan of the machine (otherwise a cached
+/// snapshot up to a day old is reused).
+pub(super) fn handle_keys_command(app: &mut App, trimmed: &str) -> bool {
+    let Some(rest) = slash_command_rest(trimmed, "/keys")
+        .or_else(|| slash_command_rest(trimmed, "/keybindings"))
+    else {
+        return false;
+    };
+
+    let force_refresh = matches!(rest.trim(), "refresh" | "rescan" | "reload");
+    let snapshot = if force_refresh {
+        crate::setup_hints::keymap::refresh_and_save()
+    } else {
+        crate::setup_hints::keymap::snapshot_cached_or_refresh()
+    };
+
+    let cfg = crate::config::config();
+    let report = crate::setup_hints::keymap::render_report(&cfg.keybindings, &snapshot);
+    app.push_display_message(DisplayMessage::system(report));
+
+    if let Some(status) =
+        crate::setup_hints::keymap::render_status_line(&cfg.keybindings, &snapshot)
+    {
+        app.set_status_notice(status);
+    } else {
+        app.set_status_notice("No keybinding conflicts detected");
+    }
+    true
+}
+
 pub(super) fn handle_model_status_command(app: &mut App, trimmed: &str) -> bool {
     let Some(rest) = slash_command_rest(trimmed, "/provider-test-coverage")
         .or_else(|| slash_command_rest(trimmed, "/model-status"))
@@ -884,7 +928,7 @@ fn apply_diff_mode(app: &mut App, mode: crate::config::DiffDisplayMode) {
     if !app.diff_pane_visible() {
         app.diff_pane_focus = false;
     }
-    app.set_status_notice(&format!("Diffs: {}", app.diff_mode.label()));
+    app.set_status_notice(format!("Diffs: {}", app.diff_mode.label()));
 }
 
 pub(super) fn handle_diff_command(app: &mut App, trimmed: &str) -> bool {
@@ -972,7 +1016,8 @@ fn build_provider_test_coverage_summary() -> String {
                 &coverage,
                 path.display().to_string(),
             );
-            crate::live_tests::format_strict_live_provider_model_coverage_summary(&summary, 50)
+            // 0 = no per-pair cap: the overlay scrolls, so show every pair.
+            crate::live_tests::format_strict_live_provider_model_coverage_summary(&summary, 0)
         }
         Err(err) => {
             let mut out = String::new();
@@ -1562,7 +1607,7 @@ fn handle_transcript_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    match open::that_detached(&path) {
+    match super::helpers::open_path_or_url_detached(&path) {
         Ok(()) => {
             app.push_display_message(DisplayMessage::system(transcript_opened_message(&path)));
             app.set_status_notice("Transcript opened");
@@ -1617,8 +1662,14 @@ pub(super) fn handle_session_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
+    if trimmed == "/commit-push" || trimmed == "/commit-and-push" {
+        handle_commit_push_command_local(app);
+        return true;
+    }
+
     if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
         app.open_session_picker();
+        app.hint_resume_shortcut();
         return true;
     }
 
@@ -2020,11 +2071,28 @@ pub(super) fn build_commit_prompt() -> String {
     "Make interactive, logical commits for the current uncommitted work. Inspect the git state first, including unstaged and staged changes. Group related changes into small coherent commits, staging only the files or hunks that belong together. Preserve unrelated user or agent work, do not discard changes, and do not amend existing commits unless clearly necessary. For each commit, use a concise conventional-style message when possible. Validate as appropriate for the changed files before committing, and report the commits created plus any remaining uncommitted changes.".to_string()
 }
 
+pub(super) fn build_commit_push_prompt() -> String {
+    let mut prompt = build_commit_prompt();
+    prompt.push(' ');
+    prompt.push_str(
+        "After creating the commits, push them to the remote tracking branch with git push (set the upstream with git push -u if the branch has no upstream yet). If the push fails, report the error instead of force-pushing, and never force-push or rewrite already-pushed history. Finally, report the commits created and the push result.",
+    );
+    prompt
+}
+
 pub(super) fn commit_launch_notice(interrupted: bool) -> String {
     if interrupted {
         "👉 Interrupting and starting logical commits...".to_string()
     } else {
         "🚀 Starting logical commits...".to_string()
+    }
+}
+
+pub(super) fn commit_push_launch_notice(interrupted: bool) -> String {
+    if interrupted {
+        "👉 Interrupting and starting logical commits + push...".to_string()
+    } else {
+        "🚀 Starting logical commits + push...".to_string()
     }
 }
 
@@ -2039,6 +2107,21 @@ fn handle_commit_command_local(app: &mut App) {
         );
     } else {
         app.push_display_message(DisplayMessage::system(commit_launch_notice(false)));
+        super::commands_improve::start_synthetic_user_turn(app, prompt);
+    }
+}
+
+fn handle_commit_push_command_local(app: &mut App) {
+    let prompt = build_commit_push_prompt();
+    if app.is_processing {
+        super::commands_improve::interrupt_and_queue_synthetic_message(
+            app,
+            prompt,
+            "Interrupting for /commit-push...",
+            commit_push_launch_notice(true),
+        );
+    } else {
+        app.push_display_message(DisplayMessage::system(commit_push_launch_notice(false)));
         super::commands_improve::start_synthetic_user_turn(app, prompt);
     }
 }
@@ -2480,15 +2563,15 @@ pub(super) fn build_todo_confidence_summary_message(todos: &[crate::todo::TodoIt
     }
 
     if summary.needs_more_work {
-        lines.push(
-            "- Auto-poke instruction: confidence is below the threshold or incomplete. Keep working: validate, test, fix gaps, and update completion_confidence when the evidence changes."
-                .to_string(),
-        );
+        lines.push(format!(
+            "- {}",
+            crate::prompt::TODO_CONFIDENCE_NEEDS_VALIDATION_PROMPT.trim()
+        ));
     } else {
-        lines.push(
-            "- Suggested action: use this confidence summary when deciding whether any further validation would materially improve certainty before finalizing."
-                .to_string(),
-        );
+        lines.push(format!(
+            "- {}",
+            crate::prompt::TODO_CONFIDENCE_READY_PROMPT.trim()
+        ));
     }
 
     lines.join("\n")
@@ -2582,6 +2665,59 @@ fn parse_alignment_value(raw: &str) -> Option<bool> {
     }
 }
 
+fn parse_on_off_value(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "on" | "compact" | "true" | "1" | "yes" | "enable" | "enabled" => Some(true),
+        "off" | "full" | "false" | "0" | "no" | "disable" | "disabled" => Some(false),
+        _ => None,
+    }
+}
+
+fn handle_compact_notifications_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/compact-notifications" && !trimmed.starts_with("/compact-notifications ") {
+        return false;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/compact-notifications")
+        .unwrap_or_default()
+        .trim();
+
+    if rest.is_empty() || matches!(rest, "show" | "status") {
+        let current = crate::config::config().display.compact_notifications;
+        app.push_display_message(DisplayMessage::system(format!(
+            "Compact notifications are currently {}.\n\nWhen on, swarm/file-activity notifications collapse to a single line (path · summary) instead of the full multi-line card with diff preview.\n\nUse /compact-notifications on or /compact-notifications off to change it.",
+            if current { "on" } else { "off" }
+        )));
+        return true;
+    }
+
+    let Some(enabled) = parse_on_off_value(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /compact-notifications (show), /compact-notifications on, or /compact-notifications off".to_string(),
+        ));
+        return true;
+    };
+
+    app.set_status_notice(format!(
+        "Compact notifications: {}",
+        if enabled { "on" } else { "off" }
+    ));
+    match crate::config::Config::set_compact_notifications(enabled) {
+        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
+            "Saved compact notifications: {}. Applied to this session immediately.",
+            if enabled { "on" } else { "off" }
+        ))),
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Applied compact notifications {} for this session, but failed to save it as the default: {}",
+            if enabled { "on" } else { "off" },
+            error
+        ))),
+    }
+
+    true
+}
+
 fn parse_agents_target(raw: &str) -> Option<crate::tui::AgentModelTarget> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "swarm" | "agent" | "agents" | "subagent" | "subagents" => {
@@ -2666,8 +2802,69 @@ fn handle_alignment_command(app: &mut App, trimmed: &str) -> bool {
     true
 }
 
+fn handle_reasoning_display_command(app: &mut App, trimmed: &str) -> bool {
+    if trimmed != "/reasoning"
+        && !trimmed.starts_with("/reasoning ")
+        && trimmed != "/thinking"
+        && !trimmed.starts_with("/thinking ")
+    {
+        return false;
+    }
+
+    let rest = trimmed
+        .strip_prefix("/reasoning")
+        .or_else(|| trimmed.strip_prefix("/thinking"))
+        .unwrap_or_default()
+        .trim();
+
+    if rest.is_empty() || matches!(rest, "show" | "status") {
+        let current = crate::config::config().display.reasoning_display();
+        app.push_display_message(DisplayMessage::system(format!(
+            "Reasoning display is currently {}.\n\n\
+             Modes:\n\
+             • off - never show reasoning\n\
+             • full - keep every reasoning trace in the transcript\n\
+             • current - show only the live reasoning, then collapse it once a tool runs or the answer commits\n\n\
+             Use /reasoning <off|full|current> to change it.",
+            current.label()
+        )));
+        return true;
+    }
+
+    let Some(mode) = crate::config::ReasoningDisplayMode::parse(rest) else {
+        app.push_display_message(DisplayMessage::error(
+            "Usage: /reasoning (show), /reasoning off, /reasoning full, or /reasoning current"
+                .to_string(),
+        ));
+        return true;
+    };
+
+    app.set_status_notice(format!("Reasoning display: {}", mode.label()));
+    match crate::config::Config::set_reasoning_display(mode) {
+        Ok(()) => app.push_display_message(DisplayMessage::system(format!(
+            "Saved reasoning display: {}. Applied to this session immediately.",
+            mode.label()
+        ))),
+        Err(error) => app.push_display_message(DisplayMessage::error(format!(
+            "Applied reasoning display {} for this session, but failed to save it as the default: {}",
+            mode.label(),
+            error
+        ))),
+    }
+
+    true
+}
+
 pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
     if handle_alignment_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_reasoning_display_command(app, trimmed) {
+        return true;
+    }
+
+    if handle_compact_notifications_command(app, trimmed) {
         return true;
     }
 

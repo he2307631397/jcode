@@ -16,6 +16,7 @@ fn test_finish_turn_does_not_duplicate_existing_poke_followup() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Keep going".to_string(),
                 status: "pending".to_string(),
@@ -62,7 +63,10 @@ fn test_review_prefers_openai_oauth_gpt_5_4_when_available() {
 
         assert_eq!(
             super::commands::preferred_one_shot_review_override(),
-            Some(("gpt-5.4".to_string(), "openai".to_string()))
+            Some((
+                super::commands::REVIEW_PREFERRED_MODEL.to_string(),
+                "openai".to_string()
+            ))
         );
     });
 }
@@ -203,8 +207,7 @@ fn test_prepare_review_spawned_session_uses_visible_transcript_for_judge_session
                     ContentBlock::ToolUse {
                         id: tool_id.clone(),
                         name: "bash".to_string(),
-                        input: serde_json::json!({"command": "git diff --stat"}),
-                    },
+                        input: serde_json::json!({"command": "git diff --stat"}), thought_signature: None, },
                 ],
             );
             parent.add_message(

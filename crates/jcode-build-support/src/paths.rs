@@ -1,5 +1,6 @@
 use super::{
     SelfDevBuildCommand, SelfDevBuildTarget, canary_binary_path, current_binary_path,
+    read_current_version, read_shared_server_version, read_stable_version,
     shared_server_binary_path, stable_binary_path,
 };
 use anyhow::Result;
@@ -11,6 +12,13 @@ use std::time::SystemTime;
 
 /// Get the jcode repository directory
 pub fn get_repo_dir() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("JCODE_REPO_DIR") {
+        let path = PathBuf::from(path);
+        if is_jcode_repo(&path) {
+            return Some(path);
+        }
+    }
+
     // First try: compile-time directory
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let path = PathBuf::from(manifest_dir);
@@ -66,6 +74,61 @@ pub fn binary_name() -> &'static str {
 }
 
 pub const SELFDEV_CARGO_PROFILE: &str = "selfdev";
+
+/// Resolve a channel/launcher binary path to the file that actually runs.
+///
+/// Release archives install a tiny `jcode` wrapper script alongside the real
+/// `jcode-<platform>.bin` payload (the wrapper sets `LD_LIBRARY_PATH` and execs
+/// the payload). Channel symlinks point at the wrapper and reload/exec must
+/// keep using the wrapper, but the *running process* (`current_exe()`) is the
+/// payload. Any "is the candidate the same/newer binary than the running one?"
+/// comparison must therefore compare payloads. Comparing the wrapper against
+/// the payload compares two different files with unrelated mtimes, which made
+/// `server_has_newer_binary()` report a phantom update forever and locked
+/// post-`/update` sessions into an infinite reload loop.
+///
+/// Returns the canonicalized payload path when `path` resolves to a wrapper
+/// script with a unique sibling `<stem>-*.bin` payload; otherwise returns the
+/// canonicalized input path.
+pub fn resolve_binary_payload(path: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    wrapper_payload_sibling(&canonical).unwrap_or(canonical)
+}
+
+fn wrapper_payload_sibling(path: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(path).ok()?;
+    // Wrapper scripts are a few hundred bytes; real binaries are tens of MB.
+    // The size gate keeps us from reading a large binary just to check "#!".
+    if !meta.is_file() || meta.len() > 4096 {
+        return None;
+    }
+    let mut prefix = [0u8; 2];
+    {
+        use std::io::Read;
+        let mut file = std::fs::File::open(path).ok()?;
+        file.read_exact(&mut prefix).ok()?;
+    }
+    if &prefix != b"#!" {
+        return None;
+    }
+    let dir = path.parent()?;
+    let stem = path.file_stem()?.to_str()?;
+    let payload_prefix = format!("{stem}-");
+    let mut payload: Option<PathBuf> = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let name = entry.file_name();
+        let name = name.to_str()?;
+        if name.starts_with(&payload_prefix) && name.ends_with(".bin") {
+            if payload.is_some() {
+                // Ambiguous: more than one payload candidate. Refuse to guess.
+                return None;
+            }
+            payload = Some(entry.path());
+        }
+    }
+    payload.filter(|p| p.is_file())
+}
 
 fn profile_binary_path(repo_dir: &Path, profile: &str) -> PathBuf {
     repo_dir.join("target").join(profile).join(binary_name())
@@ -371,10 +434,15 @@ pub fn client_update_candidate(is_selfdev_session: bool) -> Option<(PathBuf, &'s
 /// shared server should only run binaries that were explicitly promoted onto the
 /// shared-server channel (or stable as fallback), so local dirty self-dev builds
 /// stop taking out every client by accident.
-pub fn shared_server_update_candidate(
-    _is_selfdev_session: bool,
-) -> Option<(PathBuf, &'static str)> {
-    if let Some(shared_server) = existing_binary(shared_server_binary_path(), "shared-server") {
+pub fn shared_server_update_candidate(is_selfdev_session: bool) -> Option<(PathBuf, &'static str)> {
+    let shared_server = existing_binary(shared_server_binary_path(), "shared-server");
+    if is_selfdev_session {
+        if let Some(shared_server) = shared_server {
+            return Some(shared_server);
+        }
+    } else if let Some(shared_server) = shared_server
+        && shared_server_channel_is_current_enough()
+    {
         return Some(shared_server);
     }
 
@@ -383,6 +451,71 @@ pub fn shared_server_update_candidate(
     }
 
     std::env::current_exe().ok().map(|exe| (exe, "current"))
+}
+
+fn shared_server_channel_is_current_enough() -> bool {
+    let shared = read_shared_server_version().ok().flatten();
+    let Some(shared) = shared
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+
+    let stable = read_stable_version().ok().flatten();
+    if stable
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|stable| stable == shared)
+    {
+        return true;
+    }
+
+    let current = read_current_version().ok().flatten();
+    current
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_some_and(|current| current == shared)
+}
+
+fn normalize_version_marker(value: &str) -> String {
+    let value = value.trim();
+    let value = value.strip_prefix('v').unwrap_or(value);
+    value
+        .split([' ', '(', ')'])
+        .next()
+        .unwrap_or(value)
+        .trim()
+        .to_string()
+}
+
+pub fn version_matches_installed_channel(version: &str, git_hash: &str) -> bool {
+    let version = normalize_version_marker(version);
+    let git_hash = git_hash.trim();
+    let mut saw_marker = false;
+    for marker in [read_stable_version(), read_current_version()] {
+        let Some(marker) = marker.ok().flatten() else {
+            continue;
+        };
+        let marker_trimmed = marker.trim();
+        if marker_trimmed.is_empty() {
+            continue;
+        }
+        saw_marker = true;
+        if normalize_version_marker(marker_trimmed) == version {
+            return true;
+        }
+        if !git_hash.is_empty()
+            && git_hash != "unknown"
+            && (marker_trimmed == git_hash || marker_trimmed.starts_with(git_hash))
+        {
+            return true;
+        }
+    }
+    !saw_marker
 }
 
 /// Resolve the best binary to use for `/reload`.
@@ -405,12 +538,18 @@ pub fn preferred_reload_candidate(is_selfdev_session: bool) -> Option<(PathBuf, 
         }
     });
 
-    let repo_is_newer =
-        |repo: &Path, current: &Path| match (binary_mtime(repo), binary_mtime(current)) {
+    let repo_is_newer = |repo: &Path, current: &Path| {
+        // `current` may be a channel symlink to a release wrapper script;
+        // compare the payload that actually runs, not the wrapper.
+        match (
+            binary_mtime(repo),
+            binary_mtime(&resolve_binary_payload(current)),
+        ) {
             (Some(repo), Some(current)) => repo > current,
             (Some(_), None) => true,
             _ => false,
-        };
+        }
+    };
 
     match (repo_binary, candidate) {
         (Some((repo, label)), Some((current, _))) if repo_is_newer(&repo, &current) => {
@@ -481,5 +620,80 @@ mod tests {
     fn is_jcode_repo_accepts_git_file_for_worktree() {
         let repo = repo_fixture(true);
         assert!(is_jcode_repo(repo.path()));
+    }
+
+    /// Build a release-style install dir: `jcode` wrapper script + payload.
+    fn release_install_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let temp = tempfile::TempDir::new().expect("temp install");
+        let wrapper = temp.path().join("jcode");
+        let payload = temp.path().join("jcode-linux-x86_64.bin");
+        std::fs::write(
+            &wrapper,
+            "#!/usr/bin/env sh\nexec ./jcode-linux-x86_64.bin \"$@\"\n",
+        )
+        .expect("wrapper");
+        std::fs::write(&payload, vec![0x7fu8; 64]).expect("payload");
+        (temp, wrapper, payload)
+    }
+
+    #[test]
+    fn resolve_binary_payload_maps_wrapper_to_payload() {
+        let (_temp, wrapper, payload) = release_install_fixture();
+        assert_eq!(
+            resolve_binary_payload(&wrapper),
+            std::fs::canonicalize(&payload).expect("canonical payload")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_payload_follows_channel_symlink_to_wrapper() {
+        // The real layout: builds/<channel>/jcode -> versions/<v>/jcode (wrapper).
+        let (temp, wrapper, payload) = release_install_fixture();
+        let channel_dir = temp.path().join("channel");
+        std::fs::create_dir_all(&channel_dir).expect("channel dir");
+        let link = channel_dir.join("jcode");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&wrapper, &link).expect("symlink");
+        #[cfg(not(unix))]
+        std::fs::copy(&wrapper, &link).map(|_| ()).expect("copy");
+        assert_eq!(
+            resolve_binary_payload(&link),
+            std::fs::canonicalize(&payload).expect("canonical payload")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_payload_keeps_real_binary() {
+        // A normal (non-wrapper) binary resolves to itself even with a sibling
+        // `.bin` file present: it is too large / not a script.
+        let temp = tempfile::TempDir::new().expect("temp install");
+        let binary = temp.path().join("jcode");
+        std::fs::write(&binary, vec![0x7fu8; 8192]).expect("binary");
+        std::fs::write(temp.path().join("jcode-linux-x86_64.bin"), [0u8; 8]).expect("bin");
+        assert_eq!(
+            resolve_binary_payload(&binary),
+            std::fs::canonicalize(&binary).expect("canonical binary")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_payload_keeps_small_script_without_payload() {
+        let temp = tempfile::TempDir::new().expect("temp install");
+        let script = temp.path().join("jcode");
+        std::fs::write(&script, "#!/usr/bin/env sh\nexec true\n").expect("script");
+        assert_eq!(
+            resolve_binary_payload(&script),
+            std::fs::canonicalize(&script).expect("canonical script")
+        );
+    }
+
+    #[test]
+    fn resolve_binary_payload_refuses_ambiguous_payloads() {
+        let (temp, wrapper, _payload) = release_install_fixture();
+        std::fs::write(temp.path().join("jcode-macos-aarch64.bin"), [0u8; 8]).expect("second bin");
+        assert_eq!(
+            resolve_binary_payload(&wrapper),
+            std::fs::canonicalize(&wrapper).expect("canonical wrapper")
+        );
     }
 }

@@ -130,6 +130,7 @@ fn test_debug_memory_profile_reports_messages_and_provider_cache() {
                 id: "tool_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "echo hi"}),
+                thought_signature: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id: "tool_1".to_string(),
@@ -433,6 +434,7 @@ fn load_startup_stub_preserves_metadata_but_skips_heavy_vectors() -> Result<()> 
     session.model = Some("gpt-5.4".to_string());
     session.reasoning_effort = Some("high".to_string());
     session.provider_key = Some("openai".to_string());
+    session.route_api_method = Some("openai-api".to_string());
     session.set_canary("self-dev");
     session.append_stored_message(StoredMessage {
         id: "msg_1".to_string(),
@@ -482,6 +484,7 @@ fn load_startup_stub_preserves_metadata_but_skips_heavy_vectors() -> Result<()> 
     assert_eq!(stub.model.as_deref(), Some("gpt-5.4"));
     assert_eq!(stub.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(stub.provider_key.as_deref(), Some("openai"));
+    assert_eq!(stub.route_api_method.as_deref(), Some("openai-api"));
     assert!(stub.is_canary);
     assert!(stub.messages.is_empty());
     assert!(stub.env_snapshots.is_empty());
@@ -691,6 +694,7 @@ fn test_save_persists_full_session_content() -> Result<()> {
             input: serde_json::json!({
                 "command": "echo ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
             }),
+            thought_signature: None,
         }],
     );
 
@@ -912,6 +916,7 @@ fn test_redacted_for_export_redacts_tool_result_and_tool_input() -> Result<()> {
             input: serde_json::json!({
                 "command": "echo ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123"
             }),
+            thought_signature: None,
         }],
     );
 
@@ -956,6 +961,7 @@ fn test_redacted_for_export_redacts_replay_events() -> Result<()> {
         is_headless: None,
         live_attachments: None,
         status_age_secs: None,
+        output_tail: None,
     }]);
     session.record_swarm_plan_event(
         "swarm_test".to_string(),
@@ -1027,6 +1033,7 @@ fn test_summarize_tool_calls_includes_tool_only_assistant_messages() {
             input: serde_json::json!({
                 "command": "pwd"
             }),
+            thought_signature: None,
         }],
     );
 
@@ -1057,6 +1064,218 @@ fn test_render_messages_honors_system_display_role_override() {
     assert_eq!(rendered.len(), 1);
     assert_eq!(rendered[0].role, "system");
     assert!(rendered[0].content.contains("Background Task Completed"));
+}
+
+#[test]
+fn test_render_messages_renders_reasoning_before_answer_in_stored_order() {
+    // Regression: providers persist the assistant turn as `[Text, ReasoningTrace,
+    // ToolUse]` (see agent/turn_loops.rs push order). On resume/re-render the
+    // reasoning must still appear *before* the answer text to match the live
+    // streaming order, even though the Text block is stored first.
+    use jcode_render_core::REASONING_SENTINEL;
+
+    let _env_lock = lock_env();
+    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
+    crate::config::invalidate_config_cache();
+
+    let mut session = Session::create_with_id(
+        "session_render_reasoning_order_test".to_string(),
+        None,
+        Some("render reasoning order test".to_string()),
+    );
+
+    session.add_message(
+        Role::Assistant,
+        vec![
+            ContentBlock::Text {
+                text: "Here is the answer.".to_string(),
+                cache_control: None,
+            },
+            ContentBlock::ReasoningTrace {
+                text: "step one\nstep two".to_string(),
+            },
+        ],
+    );
+
+    let rendered = render_messages(&session);
+    assert_eq!(rendered.len(), 1);
+    let content = &rendered[0].content;
+    assert!(
+        content.contains(&format!("*{0}step one{0}*", REASONING_SENTINEL)),
+        "expected reasoning markup, got: {content:?}"
+    );
+    assert!(content.contains("Here is the answer."));
+    let reasoning_pos = content.find("step two").unwrap();
+    let answer_pos = content.find("Here is the answer.").unwrap();
+    assert!(
+        reasoning_pos < answer_pos,
+        "reasoning should precede the answer text even when stored after it: {content:?}"
+    );
+}
+
+#[test]
+fn test_render_messages_renders_persisted_reasoning() {
+    use jcode_render_core::REASONING_SENTINEL;
+
+    let _env_lock = lock_env();
+    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
+    crate::config::invalidate_config_cache();
+
+    let mut session = Session::create_with_id(
+        "session_render_reasoning_test".to_string(),
+        None,
+        Some("render reasoning test".to_string()),
+    );
+
+    session.add_message(
+        Role::Assistant,
+        vec![
+            ContentBlock::ReasoningTrace {
+                text: "step one\nstep two".to_string(),
+            },
+            ContentBlock::Text {
+                text: "Here is the answer.".to_string(),
+                cache_control: None,
+            },
+        ],
+    );
+
+    let rendered = render_messages(&session);
+    assert_eq!(rendered.len(), 1);
+    let content = &rendered[0].content;
+    // Reasoning lines are rendered as dim/italic markup with the sentinel.
+    assert!(
+        content.contains(&format!("*{0}step one{0}*", REASONING_SENTINEL)),
+        "expected reasoning markup, got: {content:?}"
+    );
+    assert!(
+        content.contains(&format!("*{0}step two{0}*", REASONING_SENTINEL)),
+        "expected reasoning markup, got: {content:?}"
+    );
+    // Answer text follows the reasoning block.
+    assert!(content.contains("Here is the answer."));
+    let reasoning_end = content.find("step two").unwrap();
+    let answer_start = content.find("Here is the answer.").unwrap();
+    assert!(
+        reasoning_end < answer_start,
+        "reasoning should precede the answer text: {content:?}"
+    );
+}
+
+#[test]
+fn test_render_messages_renders_legacy_reasoning_variant() {
+    use jcode_render_core::REASONING_SENTINEL;
+
+    let _env_lock = lock_env();
+    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "full");
+    crate::config::invalidate_config_cache();
+
+    let mut session = Session::create_with_id(
+        "session_render_legacy_reasoning_test".to_string(),
+        None,
+        Some("render legacy reasoning test".to_string()),
+    );
+
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::Reasoning {
+            text: "legacy thought".to_string(),
+        }],
+    );
+
+    let rendered = render_messages(&session);
+    assert_eq!(rendered.len(), 1);
+    assert!(
+        rendered[0]
+            .content
+            .contains(&format!("*{0}legacy thought{0}*", REASONING_SENTINEL)),
+        "expected legacy reasoning markup, got: {:?}",
+        rendered[0].content
+    );
+}
+
+#[test]
+fn test_render_messages_hides_persisted_reasoning_in_current_mode() {
+    use jcode_render_core::REASONING_SENTINEL;
+
+    let _env_lock = lock_env();
+    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "current");
+    crate::config::invalidate_config_cache();
+
+    let mut session = Session::create_with_id(
+        "session_render_reasoning_current_test".to_string(),
+        None,
+        Some("render reasoning current test".to_string()),
+    );
+
+    session.add_message(
+        Role::Assistant,
+        vec![
+            ContentBlock::ReasoningTrace {
+                text: "step one\nstep two\nstep three".to_string(),
+            },
+            ContentBlock::Text {
+                text: "Here is the answer.".to_string(),
+                cache_control: None,
+            },
+        ],
+    );
+
+    let rendered = render_messages(&session);
+    assert_eq!(rendered.len(), 1);
+    let content = &rendered[0].content;
+    // In `current` mode only the *live* reasoning block is ever shown; it streams
+    // then is discarded once the model answers. Re-rendered history therefore
+    // shows no past reasoning at all (no trace line, no lines, no sentinel).
+    assert!(
+        !content.contains(REASONING_SENTINEL),
+        "no reasoning markup expected in current mode on reload: {content:?}"
+    );
+    assert!(
+        !content.contains("step one")
+            && !content.contains("step two")
+            && !content.contains("thought"),
+        "individual reasoning lines/trace must not be replayed in current mode: {content:?}"
+    );
+    // The answer text is preserved.
+    assert!(content.contains("Here is the answer."));
+}
+
+#[test]
+fn test_render_messages_hides_persisted_reasoning_in_off_mode() {
+    use jcode_render_core::REASONING_SENTINEL;
+
+    let _env_lock = lock_env();
+    let _mode = EnvVarGuard::set("JCODE_REASONING_DISPLAY", "off");
+    crate::config::invalidate_config_cache();
+
+    let mut session = Session::create_with_id(
+        "session_render_reasoning_off_test".to_string(),
+        None,
+        Some("render reasoning off test".to_string()),
+    );
+
+    session.add_message(
+        Role::Assistant,
+        vec![
+            ContentBlock::ReasoningTrace {
+                text: "secret thought".to_string(),
+            },
+            ContentBlock::Text {
+                text: "Here is the answer.".to_string(),
+                cache_control: None,
+            },
+        ],
+    );
+
+    let rendered = render_messages(&session);
+    assert_eq!(rendered.len(), 1);
+    let content = &rendered[0].content;
+    assert!(
+        !content.contains(REASONING_SENTINEL) && !content.contains("secret thought"),
+        "reasoning must be hidden entirely in off mode: {content:?}"
+    );
+    assert!(content.contains("Here is the answer."));
 }
 
 #[test]
@@ -1434,6 +1653,7 @@ fn test_render_messages_and_images_share_tool_resolution_and_labels() {
                 id: "tool_img_1".to_string(),
                 name: "view_image".to_string(),
                 input: serde_json::json!({"file_path": "/tmp/screenshot.png"}),
+                thought_signature: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id: "tool_img_1".to_string(),
@@ -1472,5 +1692,268 @@ fn test_render_messages_and_images_share_tool_resolution_and_labels() {
         RenderedImageSource::ToolResult {
             tool_name: "view_image".to_string(),
         }
+    );
+}
+
+#[test]
+fn reasoning_trace_survives_session_save_and_load() -> Result<()> {
+    let _env_lock = lock_env();
+    let temp_home = tempfile::Builder::new()
+        .prefix("jcode-reasoning-persist-test-")
+        .tempdir()
+        .map_err(|e| anyhow!(e))?;
+    let _home = EnvVarGuard::set("JCODE_HOME", temp_home.path().as_os_str());
+
+    let session_id = "session_reasoning_trace_roundtrip";
+    let mut session = Session::create_with_id(session_id.to_string(), None, None);
+    session.append_stored_message(StoredMessage {
+        id: "msg_assistant".to_string(),
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::ReasoningTrace {
+                text: "step 1: consider the run loop ordering".to_string(),
+            },
+            ContentBlock::Text {
+                text: "Here is my answer.".to_string(),
+                cache_control: None,
+            },
+        ],
+        display_role: None,
+        timestamp: Some(Utc::now()),
+        tool_duration_ms: None,
+        token_usage: None,
+    });
+    session.save()?;
+
+    // The reasoning must be persisted to the on-disk transcript, not just held
+    // in memory, so it can be recalled/debugged after a restart.
+    let raw = std::fs::read_to_string(session_path(session_id)?)?;
+    assert!(
+        raw.contains("reasoning_trace"),
+        "transcript should serialize reasoning_trace block"
+    );
+    assert!(raw.contains("step 1: consider the run loop ordering"));
+
+    let loaded = Session::load(session_id)?;
+    let assistant = loaded
+        .messages
+        .iter()
+        .find(|m| m.role == Role::Assistant)
+        .ok_or_else(|| anyhow!("assistant message missing after reload"))?;
+    let has_trace = assistant.content.iter().any(|b| {
+        matches!(
+            b,
+            ContentBlock::ReasoningTrace { text }
+                if text == "step 1: consider the run loop ordering"
+        )
+    });
+    assert!(has_trace, "ReasoningTrace must survive save/load roundtrip");
+    Ok(())
+}
+
+#[test]
+fn test_render_images_anchors_tool_and_user_images() {
+    let mut session = Session::create_with_id(
+        "session_render_image_anchor_test".to_string(),
+        None,
+        Some("image anchor test".to_string()),
+    );
+
+    // Prompt 0 with a pasted image.
+    session.add_message(
+        Role::User,
+        vec![
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "user-image-data".to_string(),
+            },
+            ContentBlock::Text {
+                text: "look at this".to_string(),
+                cache_control: None,
+            },
+        ],
+    );
+    // Assistant calls a tool.
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse {
+            id: "tool-call-1".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"file_path": "shot.png"}),
+            thought_signature: None,
+        }],
+    );
+    // Tool result with an attached image.
+    session.add_message(
+        Role::User,
+        vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-call-1".to_string(),
+                content: "read image".to_string(),
+                is_error: None,
+            },
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "tool-image-data".to_string(),
+            },
+        ],
+    );
+
+    let (_, images) = render_messages_and_images(&session);
+    assert_eq!(images.len(), 2);
+    assert_eq!(
+        images[0].anchor,
+        Some(RenderedImageAnchor::UserPrompt { ordinal: 0 }),
+        "pasted user image should anchor to its prompt"
+    );
+    assert_eq!(
+        images[1].anchor,
+        Some(RenderedImageAnchor::ToolCall {
+            id: "tool-call-1".to_string()
+        }),
+        "tool image should anchor to its tool call"
+    );
+}
+
+#[test]
+fn test_render_images_attached_label_message_does_not_shift_prompt_ordinals() {
+    let mut session = Session::create_with_id(
+        "session_render_image_label_ordinal_test".to_string(),
+        None,
+        Some("image label ordinal test".to_string()),
+    );
+
+    // Tool flow that produces a labeled image: the synthetic label text message
+    // must not count as a user prompt for anchoring.
+    session.add_message(
+        Role::Assistant,
+        vec![ContentBlock::ToolUse {
+            id: "tool-call-2".to_string(),
+            name: "read".to_string(),
+            input: serde_json::json!({"file_path": "shot.png"}),
+            thought_signature: None,
+        }],
+    );
+    session.add_message(
+        Role::User,
+        vec![
+            ContentBlock::ToolResult {
+                tool_use_id: "tool-call-2".to_string(),
+                content: "read image".to_string(),
+                is_error: None,
+            },
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "tool-image-data".to_string(),
+            },
+            ContentBlock::Text {
+                text: "[Attached image associated with the preceding tool result: shot.png]"
+                    .to_string(),
+                cache_control: None,
+            },
+        ],
+    );
+    // A real follow-up prompt with an image: must be ordinal 0 (first prompt).
+    session.add_message(
+        Role::User,
+        vec![
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "second-user-image".to_string(),
+            },
+            ContentBlock::Text {
+                text: "and this one".to_string(),
+                cache_control: None,
+            },
+        ],
+    );
+
+    let (_, images) = render_messages_and_images(&session);
+    assert_eq!(images.len(), 2);
+    assert_eq!(images[0].label.as_deref(), Some("shot.png"));
+    assert_eq!(
+        images[1].anchor,
+        Some(RenderedImageAnchor::UserPrompt { ordinal: 0 }),
+        "label-only messages must not consume prompt ordinals"
+    );
+}
+
+#[test]
+fn fork_notice_is_model_visible_but_hidden_from_transcript() {
+    let mut session = Session::create(None, None);
+    session.add_message(
+        Role::User,
+        vec![ContentBlock::Text {
+            text: "original request".to_string(),
+            cache_control: None,
+        }],
+    );
+
+    session.append_fork_notice("session_parent_abc", "otter");
+
+    let notice = session.messages.last().expect("fork notice appended");
+    assert_eq!(notice.role, Role::User);
+    assert_eq!(notice.display_role, Some(StoredDisplayRole::System));
+    let text = notice.content_preview();
+    assert!(text.contains("<system-reminder>"));
+    assert!(text.contains("forked"));
+    assert!(text.contains("session_parent_abc"));
+    assert!(text.contains("otter"));
+
+    // Model-visible: included in the provider message list.
+    let provider_messages = session.messages_for_provider_uncached();
+    assert!(
+        provider_messages.iter().any(|message| {
+            message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    ContentBlock::Text { text, .. } if text.contains("forked")
+                )
+            })
+        }),
+        "fork notice must reach the model"
+    );
+
+    // Transcript-hidden: not rendered as a visible user message.
+    let (rendered, _) = render_messages_and_images(&session);
+    assert!(
+        !rendered
+            .iter()
+            .any(|message| message.role == "user" && message.content.contains("forked")),
+        "fork notice must not render as a visible user message"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn streaming_guard_creates_visible_macos_sleep_assertion() {
+    let _lock = lock_env();
+    let temp = tempfile::tempdir().expect("tempdir");
+    let _home = EnvVarGuard::set("JCODE_HOME", temp.path());
+
+    let reason = "Jcode streaming model response";
+    {
+        let _streaming = StreamingGuard::new("session_power");
+
+        let output = std::process::Command::new("pmset")
+            .args(["-g", "assertions"])
+            .output()
+            .expect("pmset -g assertions should run on macOS");
+        assert!(output.status.success(), "pmset should succeed");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(reason),
+            "pmset output should show the streaming assertion; output was:\n{stdout}"
+        );
+    }
+
+    let output = std::process::Command::new("pmset")
+        .args(["-g", "assertions"])
+        .output()
+        .expect("pmset -g assertions should run on macOS");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains(reason),
+        "streaming assertion should be released after guard drop; output was:\n{stdout}"
     );
 }

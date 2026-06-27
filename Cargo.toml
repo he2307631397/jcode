@@ -1,6 +1,6 @@
 [package]
 name = "jcode"
-version = "0.17.0"
+version = "0.31.2"
 description = "Possibly the greatest coding agent ever built — blazing-fast TUI, multi-model, swarm coordination, 30+ tools"
 edition = "2024"
 autobins = false
@@ -30,16 +30,23 @@ members = [
     "crates/jcode-message-types",
     "crates/jcode-overnight-core",
     "crates/jcode-plan",
+    "crates/jcode-productivity-core",
     "crates/jcode-swarm-core",
     "crates/jcode-protocol",
     "crates/jcode-selfdev-types",
     "crates/jcode-session-types",
+    "crates/jcode-setup-hints",
     "crates/jcode-storage",
     "crates/jcode-side-panel-types",
     "crates/jcode-azure-auth",
     "crates/jcode-notify-email",
     "crates/jcode-provider-metadata",
+    "crates/jcode-provider-env",
     "crates/jcode-provider-core",
+    "crates/jcode-provider-bedrock",
+    "crates/jcode-provider-anthropic",
+    "crates/jcode-provider-antigravity",
+    "crates/jcode-provider-copilot",
     "crates/jcode-provider-openrouter",
     "crates/jcode-provider-openai",
     "crates/jcode-provider-gemini",
@@ -52,18 +59,21 @@ members = [
     "crates/jcode-tool-core",
     "crates/jcode-tool-types",
     "crates/jcode-tui-account-picker",
+    "crates/jcode-tui-anim",
     "crates/jcode-tui-render",
+    "crates/jcode-tui-visual-debug",
     "crates/jcode-tui-session-picker",
     "crates/jcode-tui-style",
+    "crates/jcode-tui-permissions",
     "crates/jcode-tui-tool-display",
     "crates/jcode-tui-usage-overlay",
     "crates/jcode-update-core",
     "crates/jcode-terminal-launch",
     "crates/jcode-terminal-image",
+    "crates/jcode-telemetry-core",
     "crates/jcode-tui-workspace",
-    "crates/jcode-mobile-core",
-    "crates/jcode-mobile-sim",
     "crates/jcode-desktop",
+    "crates/jcode-render-core",
 ]
 
 [lib]
@@ -88,6 +98,11 @@ path = "src/bin/session_memory_bench.rs"
 required-features = ["dev-bins"]
 
 [[bin]]
+name = "memory_recall_bench"
+path = "src/bin/memory_recall_bench.rs"
+required-features = ["dev-bins"]
+
+[[bin]]
 name = "mermaid_side_panel_probe"
 path = "src/bin/mermaid_side_panel_probe.rs"
 required-features = ["dev-bins"]
@@ -109,7 +124,7 @@ futures = "0.3"
 async-trait = "0.1"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json", "stream", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "charset", "http2", "system-proxy", "rustls-tls", "rustls-tls-native-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 
@@ -215,6 +230,7 @@ jcode-swarm-core = { path = "crates/jcode-swarm-core" }
 jcode-protocol = { path = "crates/jcode-protocol" }
 jcode-selfdev-types = { path = "crates/jcode-selfdev-types" }
 jcode-session-types = { path = "crates/jcode-session-types" }
+jcode-setup-hints = { path = "crates/jcode-setup-hints" }
 jcode-storage = { path = "crates/jcode-storage" }
 jcode-task-types = { path = "crates/jcode-task-types" }
 jcode-tool-core = { path = "crates/jcode-tool-core" }
@@ -225,7 +241,7 @@ jcode-side-panel-types = { path = "crates/jcode-side-panel-types" }
 flate2 = "1"
 tar = "0.4"
 tempfile = "3"
-agentgrep = { git = "https://github.com/1jehuang/agentgrep.git", tag = "v0.1.2" }
+agentgrep = { git = "https://github.com/1jehuang/agentgrep.git", tag = "v0.1.3" }
 qrcode = { version = "0.14.1", default-features = false }
 aws-config = "1.8.16"
 aws-credential-types = "1.2.14"
@@ -265,6 +281,39 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_
 
 [target.'cfg(target_os = "macos")'.dependencies]
 global-hotkey = "0.7"
+objc2 = "0.6"
+block2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSThread",
+    "NSRunLoop",
+    "NSDate",
+    "NSTimer",
+    "NSUserDefaults",
+    "NSValue",
+    "NSAttributedString",
+    "NSDictionary",
+    "block2",
+] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSAppearance",
+    "NSApplication",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSButton",
+    "NSCell",
+    "NSColor",
+    "NSControl",
+    "NSFont",
+    "NSFontDescriptor",
+    "NSImage",
+    "NSAttributedString",
+    "NSMenu",
+    "NSMenuItem",
+    "NSRunningApplication",
+] }
 
 [profile.release]
 opt-level = 1
@@ -289,6 +338,123 @@ incremental = true
 
 [profile.dev.package."*"]
 opt-level = 0
+
+# Keep the idle-animation math kernels fully optimized even in debug-style
+# builds. This crate is pure, dependency-free numeric code (the trig-heavy 3D
+# samplers that otherwise dominate idle CPU). Pinning it to opt-level = 3 here
+# means the optimized object is compiled once and reused across iterative
+# dev/selfdev rebuilds, since it only recompiles when the animation code itself
+# changes. The "*" glob above sets the default for dependencies; these explicit
+# package entries take precedence for this one crate in each profile.
+[profile.dev.package."jcode-tui-anim"]
+opt-level = 3
+
+[profile.selfdev.package."jcode-tui-anim"]
+opt-level = 3
+
+[profile.test.package."jcode-tui-anim"]
+opt-level = 3
+
+# Keep the text-shaping stack optimized even in dev/selfdev/test builds.
+#
+# cosmic-text + rustybuzz + ttf-parser + swash + yazi do all of the desktop
+# transcript glyph shaping. At opt-level = 0 they are 15-40x slower, which made
+# scrolling real (emoji/markdown-heavy) transcripts janky in dev/selfdev builds
+# even though the production release build was smooth. These are stable
+# third-party crates that almost never recompile, so pinning them to opt-level =
+# 3 costs a one-time compile and is then reused across every iterative jcode
+# rebuild (same rationale as jcode-tui-anim above). It does NOT slow down
+# recompiles of jcode's own crates.
+[profile.dev.package.cosmic-text]
+opt-level = 3
+[profile.selfdev.package.cosmic-text]
+opt-level = 3
+[profile.test.package.cosmic-text]
+opt-level = 3
+
+[profile.dev.package.rustybuzz]
+opt-level = 3
+[profile.selfdev.package.rustybuzz]
+opt-level = 3
+[profile.test.package.rustybuzz]
+opt-level = 3
+
+[profile.dev.package.ttf-parser]
+opt-level = 3
+[profile.selfdev.package.ttf-parser]
+opt-level = 3
+[profile.test.package.ttf-parser]
+opt-level = 3
+
+[profile.dev.package.swash]
+opt-level = 3
+[profile.selfdev.package.swash]
+opt-level = 3
+[profile.test.package.swash]
+opt-level = 3
+
+[profile.dev.package.yazi]
+opt-level = 3
+[profile.selfdev.package.yazi]
+opt-level = 3
+[profile.test.package.yazi]
+opt-level = 3
+
+[profile.dev.package.fontdb]
+opt-level = 3
+[profile.selfdev.package.fontdb]
+opt-level = 3
+[profile.test.package.fontdb]
+opt-level = 3
+
+# Keep the raster image pipeline optimized in dev/selfdev/test builds.
+#
+# Inline transcript images decode (png/zune-jpeg/fdeflate/miniz_oxide), resize
+# (image), and base64-encode (kitty transmit) at draw time; at opt-level 0 a
+# single screenshot costs 100-200ms per decode/resize, which reads as input
+# lag. These are pure pixel crates with no jcode logic, so optimizing them
+# does not hurt rebuild times for our own code.
+[profile.dev.package.image]
+opt-level = 3
+[profile.selfdev.package.image]
+opt-level = 3
+[profile.test.package.image]
+opt-level = 3
+
+[profile.dev.package.png]
+opt-level = 3
+[profile.selfdev.package.png]
+opt-level = 3
+[profile.test.package.png]
+opt-level = 3
+
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.selfdev.package.zune-jpeg]
+opt-level = 3
+[profile.test.package.zune-jpeg]
+opt-level = 3
+
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.selfdev.package.fdeflate]
+opt-level = 3
+[profile.test.package.fdeflate]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.selfdev.package.miniz_oxide]
+opt-level = 3
+[profile.test.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.base64]
+opt-level = 3
+[profile.selfdev.package.base64]
+opt-level = 3
+[profile.test.package.base64]
+opt-level = 3
 
 [profile.test]
 debug = 0

@@ -7,7 +7,7 @@ pub(super) fn render_memory_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Li
     if inner.width == 0 || inner.height == 0 {
         return Vec::new();
     }
-    if info.total_count == 0 && info.activity.is_none() && info.sidecar_model.is_none() {
+    if info.total_count == 0 && info.activity.is_none() {
         return Vec::new();
     }
 
@@ -28,12 +28,6 @@ pub(super) fn render_memory_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Li
             lines.push(render_memory_status_line(activity, max_width));
         }
 
-        if lines.len() < inner.height as usize
-            && let Some(model_line) = render_memory_model_line(info, max_width)
-        {
-            lines.push(model_line);
-        }
-
         if memory_should_render_pipeline(activity) {
             for line in render_memory_pipeline_display_lines(activity, max_width) {
                 if lines.len() >= inner.height as usize {
@@ -48,10 +42,6 @@ pub(super) fn render_memory_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Li
         {
             lines.push(trace_line);
         }
-    } else if lines.len() < inner.height as usize
-        && let Some(model_line) = render_memory_model_line(info, max_width)
-    {
-        lines.push(model_line);
     }
 
     lines.truncate(inner.height as usize);
@@ -59,12 +49,16 @@ pub(super) fn render_memory_widget(data: &InfoWidgetData, inner: Rect) -> Vec<Li
 }
 
 fn render_memory_header_line(
-    _info: &MemoryInfo,
+    info: &MemoryInfo,
     activity: Option<&MemoryActivity>,
     max_width: usize,
 ) -> Line<'static> {
     let title = "Memory".to_string();
-    let (badge, badge_color) = memory_status_badge(activity);
+    let (badge, badge_color) = if info.disabled {
+        ("DISABLED".to_string(), rgb(150, 120, 120))
+    } else {
+        memory_status_badge(activity)
+    };
     let badge_text = format!(" {} ", badge);
     let title_width = UnicodeWidthStr::width(title.as_str());
     let badge_width = UnicodeWidthStr::width(badge_text.as_str());
@@ -130,6 +124,9 @@ fn memory_should_render_pipeline(activity: &MemoryActivity) -> bool {
 }
 
 fn memory_compact_summary(info: &MemoryInfo) -> String {
+    if info.disabled {
+        return "disabled".to_string();
+    }
     if let Some(activity) = info.activity.as_ref() {
         if activity.is_processing() {
             return memory_active_summary(&activity.state)
@@ -150,14 +147,7 @@ fn memory_compact_summary(info: &MemoryInfo) -> String {
         return "idle".to_string();
     }
 
-    if info.total_count > 0 {
-        "idle".to_string()
-    } else {
-        info.sidecar_model
-            .as_deref()
-            .map(compact_memory_model_label)
-            .unwrap_or_else(|| "idle".to_string())
-    }
+    "idle".to_string()
 }
 
 fn memory_status_badge(activity: Option<&MemoryActivity>) -> (String, Color) {
@@ -204,22 +194,6 @@ fn memory_status_badge(activity: Option<&MemoryActivity>) -> (String, Color) {
         MemoryState::Maintaining { .. } => ("UPDATE".to_string(), rgb(120, 220, 180)),
         MemoryState::ToolAction { .. } => ("TOOL".to_string(), rgb(140, 200, 255)),
     }
-}
-
-fn render_memory_model_line(info: &MemoryInfo, max_width: usize) -> Option<Line<'static>> {
-    let model = info.sidecar_model.as_deref()?.trim();
-    if model.is_empty() {
-        return None;
-    }
-
-    let available = max_width.saturating_sub(7);
-    Some(Line::from(vec![
-        Span::styled("Model: ", Style::default().fg(rgb(120, 120, 130))),
-        Span::styled(
-            truncate_with_ellipsis(model, available),
-            Style::default().fg(rgb(140, 200, 255)).bold(),
-        ),
-    ]))
 }
 
 fn render_memory_status_line(activity: &MemoryActivity, max_width: usize) -> Line<'static> {
@@ -602,7 +576,9 @@ pub(super) fn render_memory_compact(info: &MemoryInfo, inner_width: u16) -> Vec<
 
     let title_width = UnicodeWidthStr::width(title.as_str());
     let summary_width = max_width.saturating_sub(title_width + 5);
-    let accent = if let Some(activity) = info.activity.as_ref() {
+    let accent = if info.disabled {
+        rgb(150, 120, 120)
+    } else if let Some(activity) = info.activity.as_ref() {
         memory_status_badge(Some(activity)).1
     } else if info.total_count > 0 {
         rgb(160, 160, 170)
@@ -635,9 +611,6 @@ pub(super) fn render_memory_expanded(info: &MemoryInfo, inner: Rect) -> Vec<Line
     }
     if let Some(activity) = &info.activity {
         lines.push(render_memory_status_line(activity, max_width));
-    }
-    if let Some(model_line) = render_memory_model_line(info, max_width) {
-        lines.push(model_line);
     }
 
     if let Some(activity) = &info.activity {

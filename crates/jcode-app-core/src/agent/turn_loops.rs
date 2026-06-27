@@ -9,6 +9,10 @@ impl Agent {
 
     pub(super) async fn run_turn(&mut self, print_output: bool) -> Result<String> {
         self.set_log_context();
+        crate::session_metrics::record_turn(&self.session.id);
+        // Mark this session as actively streaming for presence UIs (e.g. the
+        // macOS menu bar indicator). Cleared automatically on every exit path.
+        let _streaming_guard = crate::session::StreamingGuard::new(self.session.id.clone());
         let mut final_text = String::new();
         let trace = trace_enabled();
         let mut context_limit_retries = 0u32;
@@ -218,9 +222,9 @@ impl Agent {
                         if print_output && crate::config::config().display.show_thinking {
                             println!("💭 {}", thinking_text);
                         }
-                        if store_reasoning_content {
-                            reasoning_content.push_str(&thinking_text);
-                        }
+                        // Always capture reasoning text so it can be persisted as a
+                        // history-only trace, regardless of provider replay support.
+                        reasoning_content.push_str(&thinking_text);
                     }
                     StreamEvent::ThinkingSignatureDelta(signature) => {
                         if store_reasoning_content {
@@ -257,6 +261,7 @@ impl Agent {
                             name,
                             input: serde_json::Value::Null,
                             intent: None,
+                            thought_signature: None,
                         });
                         current_tool_input.clear();
                     }
@@ -293,6 +298,15 @@ impl Agent {
 
                             tool_calls.push(tool);
                             current_tool_input.clear();
+                        }
+                    }
+                    StreamEvent::ToolUseSignature(signature) => {
+                        // Attach Gemini 3 thought signature to the most recent
+                        // tool call so it can be persisted and replayed.
+                        if let Some(tool) = tool_calls.last_mut()
+                            && !signature.is_empty()
+                        {
+                            tool.thought_signature = Some(signature);
                         }
                     }
                     StreamEvent::ToolResult {
@@ -410,6 +424,36 @@ impl Agent {
                             eprintln!("[trace] status_detail={}", detail);
                         }
                         self.last_status_detail = Some(detail);
+                    }
+                    StreamEvent::RetryRollback { attempt, max } => {
+                        // Transient transport fault mid-stream; the provider is
+                        // replaying the request. Discard this attempt's partial
+                        // output so the replay doesn't duplicate it in history.
+                        logging::warn(&format!(
+                            "Mid-stream retry rollback (attempt {}/{}): discarding partial output ({} text chars, {} tool calls)",
+                            attempt,
+                            max,
+                            text_content.len(),
+                            tool_calls.len(),
+                        ));
+                        if print_output && !text_content.is_empty() {
+                            // Already-printed text can't be unprinted on a plain
+                            // stdout stream; mark the discontinuity instead.
+                            println!("\n[connection interrupted, retrying response from the top]");
+                            io::stdout().flush()?;
+                        }
+                        text_content.clear();
+                        tool_calls.clear();
+                        current_tool = None;
+                        current_tool_input.clear();
+                        sdk_tool_results.clear();
+                        generated_image_contexts.clear();
+                        reasoning_content.clear();
+                        reasoning_signature.clear();
+                        openai_reasoning_items.clear();
+                        openai_native_compaction = None;
+                        saw_message_end = false;
+                        stop_reason = None;
                     }
                     StreamEvent::MessageEnd {
                         stop_reason: reason,
@@ -660,13 +704,14 @@ impl Agent {
                     cache_control: None,
                 });
             }
+            crate::message::push_reasoning_blocks(
+                &mut content_blocks,
+                &provider_name,
+                &reasoning_content,
+                Some(&reasoning_signature),
+                store_reasoning_content,
+            );
             if store_reasoning_content {
-                crate::message::push_reasoning_content_block(
-                    &mut content_blocks,
-                    &provider_name,
-                    &reasoning_content,
-                    Some(&reasoning_signature),
-                );
                 content_blocks.extend(openai_reasoning_items.iter().cloned());
             }
             for tc in &tool_calls {
@@ -674,6 +719,7 @@ impl Agent {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
                     input: tc.input.clone(),
+                    thought_signature: tc.thought_signature.clone(),
                 });
             }
 

@@ -1,6 +1,7 @@
 use super::{
     AmbientConfig, Config, DiffDisplayMode, DisplayConfig, ProviderConfig,
     SessionPickerResumeAction, SwarmSpawnMode, ToolConfig, config_env_fingerprint,
+    populate_context_limits_from_config_ref,
 };
 use std::ffi::OsString;
 use std::path::Path;
@@ -61,6 +62,174 @@ fn swarm_spawn_mode_parses_supported_values() {
 fn swarm_spawn_mode_rejects_invalid_values() {
     let result = toml::from_str::<Config>("[agents]\nswarm_spawn_mode = \"background\"\n");
     assert!(result.is_err());
+}
+
+#[test]
+fn swarm_spawn_mode_as_str_round_trips() {
+    for mode in [
+        SwarmSpawnMode::Visible,
+        SwarmSpawnMode::Headless,
+        SwarmSpawnMode::Auto,
+    ] {
+        assert_eq!(SwarmSpawnMode::parse(mode.as_str()), Some(mode));
+    }
+}
+
+#[test]
+fn test_env_override_swarm_spawn_mode() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_SWARM_SPAWN_MODE");
+    crate::env::set_var("JCODE_SWARM_SPAWN_MODE", "headless");
+
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+
+    assert_eq!(cfg.agents.swarm_spawn_mode, SwarmSpawnMode::Headless);
+
+    restore_env_var("JCODE_SWARM_SPAWN_MODE", prev);
+}
+
+#[test]
+fn test_env_override_swarm_model() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_SWARM_MODEL");
+    crate::env::set_var("JCODE_SWARM_MODEL", "claude-opus-4-6");
+
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+
+    assert_eq!(cfg.agents.swarm_model.as_deref(), Some("claude-opus-4-6"));
+
+    // Empty value clears the override back to "inherit".
+    crate::env::set_var("JCODE_SWARM_MODEL", "  ");
+    let mut cfg = Config::default();
+    cfg.agents.swarm_model = Some("preset".to_string());
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.agents.swarm_model, None);
+
+    restore_env_var("JCODE_SWARM_MODEL", prev);
+}
+
+#[test]
+fn spawn_hook_defaults_to_none_and_parses_from_toml() {
+    assert_eq!(Config::default().terminal.spawn_hook, None);
+
+    let cfg: Config = toml::from_str("[terminal]\nspawn_hook = \"tmux new-window\"\n")
+        .expect("spawn_hook should parse");
+    assert_eq!(cfg.terminal.spawn_hook.as_deref(), Some("tmux new-window"));
+}
+
+#[test]
+fn hooks_config_defaults_and_parses_from_toml() {
+    let defaults = Config::default().hooks;
+    assert_eq!(defaults.turn_end, None);
+    assert_eq!(defaults.session_start, None);
+    assert_eq!(defaults.session_end, None);
+    assert_eq!(defaults.pre_tool, None);
+    assert_eq!(defaults.post_tool, None);
+    assert_eq!(defaults.pre_tool_timeout_ms, 5000);
+
+    let cfg: Config = toml::from_str(
+        "[hooks]\nturn_end = \"notify-turn\"\npre_tool = \"~/bin/policy\"\npre_tool_timeout_ms = 1500\n",
+    )
+    .expect("hooks config should parse");
+    assert_eq!(cfg.hooks.turn_end.as_deref(), Some("notify-turn"));
+    assert_eq!(cfg.hooks.pre_tool.as_deref(), Some("~/bin/policy"));
+    assert_eq!(cfg.hooks.pre_tool_timeout_ms, 1500);
+}
+
+#[test]
+fn test_env_override_lifecycle_hooks() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_turn_end = std::env::var_os("JCODE_HOOK_TURN_END");
+    let prev_timeout = std::env::var_os("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS");
+
+    crate::env::set_var("JCODE_HOOK_TURN_END", "my-notifier --fast");
+    crate::env::set_var("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS", "250");
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.hooks.turn_end.as_deref(), Some("my-notifier --fast"));
+    assert_eq!(cfg.hooks.pre_tool_timeout_ms, 250);
+
+    // Empty env value disables a config-file hook.
+    crate::env::set_var("JCODE_HOOK_TURN_END", " ");
+    let mut cfg = Config::default();
+    cfg.hooks.turn_end = Some("from-config".to_string());
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.hooks.turn_end, None);
+
+    restore_env_var("JCODE_HOOK_TURN_END", prev_turn_end);
+    restore_env_var("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS", prev_timeout);
+}
+
+#[test]
+fn test_env_override_spawn_hook() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_SPAWN_HOOK");
+    crate::env::set_var("JCODE_SPAWN_HOOK", "kitty @ launch --type=tab --");
+
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert_eq!(
+        cfg.terminal.spawn_hook.as_deref(),
+        Some("kitty @ launch --type=tab --")
+    );
+
+    // Empty env value disables a config-file hook.
+    crate::env::set_var("JCODE_SPAWN_HOOK", "  ");
+    let mut cfg = Config::default();
+    cfg.terminal.spawn_hook = Some("tmux new-window".to_string());
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.terminal.spawn_hook, None);
+
+    restore_env_var("JCODE_SPAWN_HOOK", prev);
+}
+
+#[test]
+fn test_env_override_focus_hook() {
+    let _guard = crate::storage::lock_test_env();
+    let prev = std::env::var_os("JCODE_FOCUS_HOOK");
+    crate::env::set_var("JCODE_FOCUS_HOOK", "niri-focus-jcode");
+
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.terminal.focus_hook.as_deref(), Some("niri-focus-jcode"));
+
+    // Empty env value disables a config-file hook.
+    crate::env::set_var("JCODE_FOCUS_HOOK", "");
+    let mut cfg = Config::default();
+    cfg.terminal.focus_hook = Some("wmctrl -a".to_string());
+    cfg.apply_env_overrides();
+    assert_eq!(cfg.terminal.focus_hook, None);
+
+    restore_env_var("JCODE_FOCUS_HOOK", prev);
+}
+
+#[test]
+fn test_memory_sidecar_enabled_defaults_true() {
+    // The LLM precision-judge path is the only reliably productive memory mode,
+    // so memory uses it by default. Users opt into the no-LLM hybrid path
+    // explicitly by setting this false.
+    let cfg = Config::default();
+    assert!(cfg.agents.memory_sidecar_enabled);
+}
+
+#[test]
+fn test_env_override_memory_sidecar() {
+    let _guard = crate::storage::lock_test_env();
+    let prev_model = std::env::var_os("JCODE_MEMORY_MODEL");
+    let prev_enabled = std::env::var_os("JCODE_MEMORY_SIDECAR_ENABLED");
+    crate::env::set_var("JCODE_MEMORY_MODEL", "claude-haiku-4");
+    crate::env::set_var("JCODE_MEMORY_SIDECAR_ENABLED", "true");
+
+    let mut cfg = Config::default();
+    cfg.apply_env_overrides();
+
+    assert_eq!(cfg.agents.memory_model.as_deref(), Some("claude-haiku-4"));
+    assert!(cfg.agents.memory_sidecar_enabled);
+
+    restore_env_var("JCODE_MEMORY_MODEL", prev_model);
+    restore_env_var("JCODE_MEMORY_SIDECAR_ENABLED", prev_enabled);
 }
 
 #[test]
@@ -238,6 +407,31 @@ fn test_generated_default_config_uses_low_openai_reasoning_effort() {
         content.contains("[acp]") && content.contains("tool_profile = \"acp\""),
         "generated default config should document ACP profile settings"
     );
+    assert!(
+        content.contains("[agents]") && content.contains("swarm_spawn_mode = \"visible\""),
+        "generated default config should document agent spawn defaults"
+    );
+
+    // Effort keys come from the per-platform keybinding registry; the template
+    // placeholders must always be substituted.
+    assert!(
+        !content.contains("@EFFORT_INCREASE@") && !content.contains("@EFFORT_DECREASE@"),
+        "generated default config should substitute effort key placeholders"
+    );
+    let expected_increase = if cfg!(target_os = "macos") {
+        "effort_increase = \"cmd+right\""
+    } else {
+        "effort_increase = \"alt+right\""
+    };
+    assert!(
+        content.contains(expected_increase),
+        "generated default config should use the platform effort_increase default"
+    );
+
+    // The generated file must always be valid TOML for the current Config schema.
+    let parsed: Config =
+        toml::from_str(&content).expect("generated default config should parse as Config");
+    assert_eq!(parsed.agents.swarm_spawn_mode, SwarmSpawnMode::Visible);
 
     if let Some(prev) = prev_home {
         crate::env::set_var("JCODE_HOME", prev);
@@ -567,6 +761,54 @@ fn test_external_auth_source_allowed_for_path_ignores_broad_legacy_entry() {
     assert!(!cfg.external_auth_source_allowed_for_path_config("test_source", &path));
 }
 
+/// Regression test for issue #349: a removed/unknown `update_channel` value
+/// (older configs could contain `"manual"`) must not fail the whole config
+/// parse. A hard parse failure during the reload handoff left the reload
+/// marker stuck in `starting` and clients re-requested the reload forever.
+#[test]
+fn unknown_update_channel_value_falls_back_to_stable_instead_of_failing_parse() {
+    let cfg: Config = toml::from_str("[features]\nupdate_channel = \"manual\"\n")
+        .expect("unknown update_channel must not fail config parse");
+    assert_eq!(
+        cfg.features.update_channel,
+        super::UpdateChannel::Stable,
+        "unknown channel should fall back to the default"
+    );
+
+    // Other settings in the same config must survive the fallback.
+    let cfg: Config = toml::from_str(
+        "[features]\nupdate_channel = \"manual\"\nmemory = false\n\n[display]\ncentered = true\n",
+    )
+    .expect("config with unknown update_channel should parse");
+    assert_eq!(cfg.features.update_channel, super::UpdateChannel::Stable);
+    assert!(!cfg.features.memory);
+    assert!(cfg.display.centered);
+}
+
+#[test]
+fn known_update_channel_values_still_parse() {
+    let cfg: Config = toml::from_str("[features]\nupdate_channel = \"main\"\n")
+        .expect("main update_channel should parse");
+    assert_eq!(cfg.features.update_channel, super::UpdateChannel::Main);
+
+    let cfg: Config = toml::from_str("[features]\nupdate_channel = \"stable\"\n")
+        .expect("stable update_channel should parse");
+    assert_eq!(cfg.features.update_channel, super::UpdateChannel::Stable);
+}
+
+#[test]
+fn update_channel_parse_accepts_known_aliases_and_rejects_unknown() {
+    use super::UpdateChannel;
+    assert_eq!(UpdateChannel::parse("stable"), Some(UpdateChannel::Stable));
+    assert_eq!(UpdateChannel::parse("release"), Some(UpdateChannel::Stable));
+    assert_eq!(UpdateChannel::parse("main"), Some(UpdateChannel::Main));
+    assert_eq!(UpdateChannel::parse("nightly"), Some(UpdateChannel::Main));
+    assert_eq!(UpdateChannel::parse("edge"), Some(UpdateChannel::Main));
+    assert_eq!(UpdateChannel::parse(" Main "), Some(UpdateChannel::Main));
+    assert_eq!(UpdateChannel::parse("manual"), None);
+    assert_eq!(UpdateChannel::parse(""), None);
+}
+
 impl Config {
     fn external_auth_source_allowed_for_path_config(&self, source_id: &str, path: &Path) -> bool {
         let Ok(entry) = Self::trusted_external_auth_path_entry(source_id, path) else {
@@ -577,4 +819,35 @@ impl Config {
             .iter()
             .any(|value| value.trim().eq_ignore_ascii_case(&entry))
     }
+}
+
+#[test]
+fn populate_context_limits_from_config_ref_seeds_global_cache() {
+    use super::{NamedProviderConfig, NamedProviderModelConfig};
+
+    // Regression test for issue #366: a named OpenAI-compatible provider with a
+    // per-model `context_window` must be honored by the global context-limit
+    // resolution path, not just the provider instance's own context_window().
+    let model_id = "issue366-custom-gateway-model";
+    let mut cfg = Config::default();
+    cfg.providers.insert(
+        "issue366-gateway".to_string(),
+        NamedProviderConfig {
+            base_url: "https://gateway.example.test/v1".to_string(),
+            models: vec![NamedProviderModelConfig {
+                id: model_id.to_string(),
+                context_window: Some(1_000_000),
+                input: Vec::new(),
+            }],
+            ..Default::default()
+        },
+    );
+
+    populate_context_limits_from_config_ref(&cfg);
+
+    assert_eq!(
+        crate::provider::context_limit_for_model(model_id),
+        Some(1_000_000),
+        "global context-limit resolution should respect named provider context_window"
+    );
 }

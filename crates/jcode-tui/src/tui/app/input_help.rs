@@ -58,6 +58,9 @@ impl App {
             "commit" => {
                 "/commit\nAsk the agent to inspect current uncommitted changes and create interactive, logical commits.\n\nThe agent should group related files or hunks, preserve unrelated work, validate as appropriate, and report the commits created plus anything left uncommitted."
             }
+            "commit-push" | "commit-and-push" => {
+                "/commit-push\nSame as /commit, then push the new commits to the remote tracking branch.\n\nThe agent groups related changes into logical commits, preserves unrelated work, then runs git push (using git push -u if the branch has no upstream). It will not force-push or rewrite already-pushed history, and reports the commits created plus the push result."
+            }
             "catchup" => {
                 "/catchup\nOpen the Catch Up picker for finished sessions that need attention.\n\n/catchup next\nTeleport to the next session needing attention and open a Catch Up brief in the side panel.\n\n/catchup list\nAlias for opening the picker."
             }
@@ -80,7 +83,7 @@ impl App {
                 "/judge\nLaunch a one-shot headed judge session immediately.\n\nThe judge will DM this session when done. If OpenAI ChatGPT OAuth is available, it prefers gpt-5.5."
             }
             "effort" => {
-                "/effort\nShow current reasoning effort.\n\n/effort <level>\nSet reasoning effort (none|low|medium|high|xhigh).\n\nAlso: Alt+Left / Alt+Right to cycle."
+                "/effort\nShow current reasoning effort.\n\n/effort <level>\nSet reasoning effort (none|low|medium|high|xhigh).\n\nAlso: {effort_keys} to cycle."
             }
             "fast" => {
                 "/fast\nShow whether fast mode is enabled, plus the saved default.\n\n/fast on\nEnable fast mode (service_tier = priority) for the current session.\n\n/fast off\nDisable fast mode for the current session.\n\n/fast status\nShow current fast-mode status.\n\n/fast default on\nSave fast mode as the default on startup.\n\n/fast default off\nSave fast mode as the default off on startup.\n\n/fast default status\nShow the saved fast-mode default."
@@ -137,7 +140,7 @@ impl App {
                 "/split\nSplit the current session into a new window. Clones the full conversation history so both sessions continue from the same point."
             }
             "resume" | "sessions" => {
-                "/resume\nOpen the interactive session picker. Browse and search all sessions, preview conversation history, and resume the highlighted session. By default, Enter resumes in the current terminal and Ctrl+Enter opens a new terminal; keybindings.session_picker_enter can swap those actions.\n\nPress Esc to return to your current session."
+                "/resume\nOpen the interactive session picker. Browse and search all sessions, preview conversation history, and resume the highlighted session. By default, Enter resumes in the current terminal and Ctrl+Enter opens a new terminal; keybindings.session_picker_enter can swap those actions.{resume_shortcut}\n\nPress Esc to return to your current session."
             }
             "info" => "/info\nShow session metadata and token usage.",
             "context" => {
@@ -158,6 +161,9 @@ impl App {
             "alignment" => {
                 "/alignment\nShow the current alignment and the saved default.\n\n/alignment centered\nSave centered alignment as the default and apply it immediately.\n\n/alignment left\nSave left-aligned mode as the default and apply it immediately.\n\nPress Alt+C anytime to toggle alignment just for the current session."
             }
+            "compact-notifications" => {
+                "/compact-notifications\nShow whether swarm/file-activity notifications are compact.\n\n/compact-notifications on\nCollapse file-activity notifications to a single line (path · summary), dropping the intent and diff preview.\n\n/compact-notifications off\nRestore the full multi-line notification cards."
+            }
             "auth" | "login" => {
                 "/auth\nShow authentication status for all providers.\n\n/login\nInteractive provider selection - pick a provider to log into.\n\n/login <provider>\nStart login flow directly for any provider shown by /login or the /login completions.\n\nUse /login jcode for curated jcode subscription access via your router, not OpenRouter BYOK."
             }
@@ -177,8 +183,20 @@ impl App {
             "server-reload" if self.is_remote => {
                 "/server-reload\nForce server binary reload in remote mode."
             }
+            "continue" | "resumeall" | "resume-all" if self.is_remote => {
+                "/continue\nContinue every interrupted live session that would auto-resume on a reload.\n\nThe server walks all currently-live sessions and, for each idle one that still owes the model a reply (a turn that errored or was interrupted mid-generation), injects the standard \"continue where you left off\" reminder so it picks back up. Sessions that are busy, fresh, or already complete are left untouched.\n\nAlias: /resumeall."
+            }
             _ => return None,
         };
-        Some(help.to_string())
+        let help = help.replace(
+            "{effort_keys}",
+            &crate::tui::keybind::effort_switch_keys_label(),
+        );
+        let resume_shortcut = match crate::tui::keybind::load_open_resume_key().label {
+            Some(label) => format!(" You can also press {label} to open it directly."),
+            None => String::new(),
+        };
+        let help = help.replace("{resume_shortcut}", &resume_shortcut);
+        Some(help)
     }
 }

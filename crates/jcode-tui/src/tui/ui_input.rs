@@ -11,7 +11,8 @@ use crate::tui::color_support::rgb;
 use crate::tui::detect_kv_cache_problem;
 use crate::tui::info_widget::occasional_status_tip;
 use crate::tui::layout_utils;
-use ratatui::{prelude::*, widgets::Paragraph};
+use crate::tui::session_facts;
+use ratatui::{prelude::*, style::Modifier, widgets::Paragraph};
 
 fn shell_mode_color() -> Color {
     rgb(110, 214, 151)
@@ -99,16 +100,21 @@ fn command_suggestion_lines(
     app: &dyn TuiState,
     suggestions: &[(String, &'static str)],
 ) -> Vec<Line<'static>> {
+    // Highlight the characters of each command that the typed query matched.
+    // We only highlight the command token itself (the part before the first
+    // space), matched against the corresponding leading token of the input.
+    let needle = command_suggestion_needle(app.input());
+    let highlight = |cmd: &str, base: Style| -> Vec<Span<'static>> {
+        highlight_command_spans(cmd, needle.as_deref(), base)
+    };
+
     let mut lines = Vec::new();
     if suggestions.len() == 1 {
         let (cmd, desc) = &suggestions[0];
-        lines.push(Line::from(vec![
-            Span::styled(cmd.to_string(), Style::default().fg(rgb(255, 213, 128))),
-            Span::styled(
-                format!("  {}", desc),
-                Style::default().fg(rgb(255, 213, 128)),
-            ),
-        ]));
+        let base = Style::default().fg(rgb(255, 213, 128));
+        let mut spans = highlight(cmd, base);
+        spans.push(Span::styled(format!("  {}", desc), base));
+        lines.push(Line::from(spans));
     } else if !suggestions.is_empty() {
         let selected = app
             .command_suggestion_selected()
@@ -135,8 +141,7 @@ fn command_suggestion_lines(
             } else {
                 Style::default().fg(rgb(128, 203, 196))
             };
-            let mut spans = Vec::new();
-            spans.push(Span::styled(cmd.to_string(), command_style));
+            let mut spans = highlight(cmd, command_style);
             spans.push(Span::styled(format!("  {}", desc), description_style));
             if i == 0 && window_start > 0 {
                 spans.push(Span::styled(
@@ -154,6 +159,79 @@ fn command_suggestion_lines(
         }
     }
     lines
+}
+
+/// Extract the slash-command portion of the typed input that should be matched
+/// against suggestion command tokens for highlighting purposes.
+fn command_suggestion_needle(input: &str) -> Option<String> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/') {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+/// Build spans for a suggestion command, recoloring the characters that the
+/// fuzzy matcher aligned with the typed query. Falls back to a single
+/// unhighlighted span when there is nothing (useful) to highlight.
+fn highlight_command_spans(cmd: &str, needle: Option<&str>, base: Style) -> Vec<Span<'static>> {
+    let positions: Vec<usize> = match needle {
+        Some(n) if !n.is_empty() && n != "/" => crate::tui::fuzzy::fuzzy_match_positions(n, cmd),
+        _ => Vec::new(),
+    };
+    if positions.is_empty() {
+        return vec![Span::styled(cmd.to_string(), base)];
+    }
+
+    // Recolor (rather than underline) the matched characters so they stay in
+    // the command palette's own hue: matched chars are a brighter version of
+    // the line's base color, while unmatched chars are dimmed so the match
+    // visually pops.
+    let highlight_style = base
+        .fg(brighten_command_color(base.fg))
+        .add_modifier(Modifier::BOLD);
+    let rest_style = base.fg(dim_command_color(base.fg));
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut run_start = 0usize;
+    let mut run_is_match = !chars.is_empty() && positions.contains(&0);
+    for i in 1..=chars.len() {
+        let cur_is_match = i < chars.len() && positions.contains(&i);
+        if cur_is_match != run_is_match || i == chars.len() {
+            let chunk: String = chars[run_start..i].iter().collect();
+            spans.push(Span::styled(
+                chunk,
+                if run_is_match {
+                    highlight_style
+                } else {
+                    rest_style
+                },
+            ));
+            run_start = i;
+            run_is_match = cur_is_match;
+        }
+    }
+    spans
+}
+
+/// Blend a palette color toward white to emphasize a matched character while
+/// keeping its original hue.
+fn brighten_command_color(color: Option<Color>) -> Color {
+    match color {
+        Some(Color::Rgb(r, g, b)) => {
+            let lift = |c: u8| -> u8 { c.saturating_add((255 - c) / 2) };
+            rgb(lift(r), lift(g), lift(b))
+        }
+        _ => rgb(255, 255, 255),
+    }
+}
+
+/// Blend a palette color toward black so unmatched characters recede.
+fn dim_command_color(color: Option<Color>) -> Color {
+    match color {
+        Some(Color::Rgb(r, g, b)) => rgb(r / 2, g / 2, b / 2),
+        other => other.unwrap_or_else(dim_color),
+    }
 }
 
 pub(super) fn input_hint_line_height(app: &dyn TuiState) -> u16 {
@@ -562,6 +640,9 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
         String::new()
     };
 
+    // Idle session facts (context bar + provider) are pinned to the right edge
+    // so they read like a status readout rather than left-flush body text.
+    let mut right_align_facts = false;
     let line = if let Some(build_progress) = crate::build::read_build_progress() {
         let spinner = super::activity_indicator(elapsed, 12.5);
         Line::from(vec![
@@ -608,12 +689,7 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                         Style::default().fg(dim_color()),
                     ),
                 ];
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
             ProcessingStatus::Connecting(ref phase) => {
@@ -637,27 +713,17 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                     Span::styled(spinner, Style::default().fg(ai_color())),
                     Span::styled(label, Style::default().fg(label_color)),
                 ];
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
             ProcessingStatus::Thinking(_start) => {
-                let mut label = format!(" thinking… {:.1}s", elapsed);
+                let mut label = format!(" thinking… {}", format_elapsed(elapsed));
                 append_transport_context(&mut label, app);
                 let mut spans = vec![
                     Span::styled(spinner, Style::default().fg(ai_color())),
                     Span::styled(label, Style::default().fg(dim_color())),
                 ];
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
             ProcessingStatus::Streaming => {
@@ -710,36 +776,34 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                         Style::default().fg(rgb(255, 193, 7)),
                     ),
                 ];
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
             ProcessingStatus::RunningTool(ref name) => {
                 let half_width = 3;
-                let (left_bar, right_bar) =
-                    if crate::perf::tui_policy().enable_decorative_animations {
-                        let progress = elapsed * 2.0 % 1.0;
-                        let filled_pos = ((progress * half_width as f32) as usize) % half_width;
-                        let left_bar: String = (0..half_width)
-                            .map(|i| if i == filled_pos { '●' } else { '·' })
-                            .collect();
-                        let right_bar: String = (0..half_width)
-                            .map(|i| {
-                                if i == (half_width - 1 - filled_pos) {
-                                    '●'
-                                } else {
-                                    '·'
-                                }
-                            })
-                            .collect();
-                        (left_bar, right_bar)
-                    } else {
-                        ("···".to_string(), "···".to_string())
-                    };
+                let decorative = crate::perf::tui_policy().enable_decorative_animations;
+                // When decorative animations are disabled we still nudge the bar
+                // forward at a slow "liveness" rate so a long-running tool (e.g.
+                // bash) reads as alive instead of frozen.
+                let bar_speed = if decorative {
+                    2.0
+                } else {
+                    jcode_tui_style::theme::LIVENESS_INDICATOR_FPS / half_width as f32
+                };
+                let progress = elapsed * bar_speed % 1.0;
+                let filled_pos = ((progress * half_width as f32) as usize) % half_width;
+                let left_bar: String = (0..half_width)
+                    .map(|i| if i == filled_pos { '●' } else { '·' })
+                    .collect();
+                let right_bar: String = (0..half_width)
+                    .map(|i| {
+                        if i == (half_width - 1 - filled_pos) {
+                            '●'
+                        } else {
+                            '·'
+                        }
+                    })
+                    .collect();
 
                 let anim_color = animated_tool_color(elapsed);
                 let batch_prog = app.batch_progress();
@@ -832,12 +896,7 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
                     Style::default().fg(rgb(100, 100, 100)),
                 ));
 
-                if !queued_suffix.is_empty() {
-                    spans.push(Span::styled(
-                        queued_suffix.clone(),
-                        Style::default().fg(queued_color()),
-                    ));
-                }
+                push_queued_suffix(&mut spans, &queued_suffix);
                 Line::from(spans)
             }
         }
@@ -869,6 +928,9 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
             occasional_status_tip(area.width as usize, app.animation_elapsed() as u64)
         {
             Line::from(vec![Span::styled(tip, Style::default().fg(dim_color()))])
+        } else if let Some(facts) = idle_status_facts(app) {
+            right_align_facts = true;
+            Line::from(facts)
         } else {
             Line::from("")
         }
@@ -877,6 +939,9 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
             occasional_status_tip(area.width as usize, app.animation_elapsed() as u64)
         {
             Line::from(vec![Span::styled(tip, Style::default().fg(dim_color()))])
+        } else if let Some(facts) = idle_status_facts(app) {
+            right_align_facts = true;
+            Line::from(facts)
         } else {
             Line::from("")
         }
@@ -886,10 +951,24 @@ pub(super) fn draw_status(frame: &mut Frame, app: &dyn TuiState, area: Rect, pen
 
     let aligned_line = if app.centered_mode() {
         line.alignment(Alignment::Center)
+    } else if right_align_facts {
+        line.alignment(Alignment::Right)
     } else {
         line
     };
     frame.render_widget(Paragraph::new(aligned_line), area);
+}
+
+/// Append the "+N queued" suffix span (in the queued accent color) when there
+/// are queued follow-up messages. Centralizes the repeated check/styling shared
+/// by every processing-status branch in `draw_status`.
+fn push_queued_suffix(spans: &mut Vec<Span<'static>>, queued_suffix: &str) {
+    if !queued_suffix.is_empty() {
+        spans.push(Span::styled(
+            queued_suffix.to_string(),
+            Style::default().fg(queued_color()),
+        ));
+    }
 }
 
 fn streaming_status_spans(
@@ -909,12 +988,7 @@ fn streaming_status_spans(
             dim_color()
         }),
     ));
-    if !queued_suffix.is_empty() {
-        spans.push(Span::styled(
-            queued_suffix.to_string(),
-            Style::default().fg(queued_color()),
-        ));
-    }
+    push_queued_suffix(&mut spans, queued_suffix);
     spans
 }
 
@@ -922,6 +996,34 @@ fn streaming_status_spans(
 mod tests {
     use super::*;
     use ratatui::style::Modifier;
+
+    #[test]
+    fn idle_input_hint_combines_dir_and_model() {
+        assert_eq!(
+            format_idle_input_hint(Some("opus-4.5".to_string()), Some("jcode".to_string())),
+            Some("opus-4.5 · jcode".to_string())
+        );
+        assert_eq!(
+            format_idle_input_hint(Some("opus-4.5".to_string()), None),
+            Some("opus-4.5".to_string())
+        );
+        assert_eq!(
+            format_idle_input_hint(None, Some("jcode".to_string())),
+            Some("jcode".to_string())
+        );
+        assert_eq!(format_idle_input_hint(None, None), None);
+    }
+
+    #[test]
+    fn overscroll_provider_display_is_credential_neutral() {
+        // The credential (OAuth vs API key) is reported by the adjacent auth
+        // chip from canonical resolution; the provider name must not bake in a
+        // credential or the two can contradict (e.g. "Claude OAuth · API key").
+        assert_eq!(overscroll_provider_display("claude"), "Claude");
+        assert_eq!(overscroll_provider_display("anthropic"), "Anthropic");
+        assert!(!overscroll_provider_display("claude").contains("OAuth"));
+        assert!(!overscroll_provider_display("anthropic").contains("API"));
+    }
 
     #[test]
     fn session_history_warning_is_clear_and_occasional() {
@@ -1065,6 +1167,7 @@ mod tests {
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "cargo test -p jcode"}),
                     intent: None,
+                    thought_signature: None,
                 }],
                 subcalls: Vec::new(),
             }),
@@ -1095,18 +1198,21 @@ mod tests {
                         name: "grep".to_string(),
                         input: serde_json::json!({"pattern": "foo", "path": "src"}),
                         intent: None,
+                        thought_signature: None,
                     },
                     crate::message::ToolCall {
                         id: "batch-1-bash".to_string(),
                         name: "bash".to_string(),
                         input: serde_json::json!({"command": "cargo build --release --workspace"}),
                         intent: None,
+                        thought_signature: None,
                     },
                     crate::message::ToolCall {
                         id: "batch-3-read".to_string(),
                         name: "read".to_string(),
                         input: serde_json::json!({"file_path": "README.md"}),
                         intent: None,
+                        thought_signature: None,
                     },
                 ],
                 subcalls: Vec::new(),
@@ -1168,6 +1274,18 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(spans[0].content.as_ref(), "⠋");
         assert_eq!(spans[1].content.as_ref(), " finalizing");
+    }
+
+    #[test]
+    fn push_queued_suffix_appends_only_when_present() {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        push_queued_suffix(&mut spans, "");
+        assert!(spans.is_empty(), "empty suffix should add no span");
+
+        push_queued_suffix(&mut spans, " · +2 queued");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), " · +2 queued");
+        assert_eq!(spans[0].style.fg, Some(queued_color()));
     }
 
     #[test]
@@ -1450,6 +1568,353 @@ pub(super) fn draw_notification(frame: &mut Frame, app: &dyn TuiState, area: Rec
     frame.render_widget(Paragraph::new(aligned_line), area);
 }
 
+/// Draw the elastic overscroll status line, revealed below the input when the
+/// user scrolls past the bottom of the transcript. Shows model, provider,
+/// access method, reasoning level, and context usage percentage, with a live
+/// `(overscroll x.x)` countdown pinned to the right so users can see the line
+/// is temporary and rebounds away on its own.
+pub(super) fn draw_overscroll_status(frame: &mut Frame, app: &dyn TuiState, area: Rect) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let data = app.info_widget_data();
+
+    let sep = || Span::styled(" · ", Style::default().fg(rgb(100, 100, 110)));
+
+    // The countdown is the priority affordance: it explains the line exists and
+    // is going away. Build it first so it always gets space on the right edge.
+    let countdown: Option<Span> = app.chat_overscroll_remaining().map(|secs| {
+        Span::styled(
+            format!("(overscroll {:.1})", secs.max(0.0)),
+            Style::default().fg(rgb(150, 150, 165)).italic(),
+        )
+    });
+
+    let mut spans: Vec<Span> = Vec::new();
+
+    // Model
+    let model = data
+        .model
+        .clone()
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| app.provider_model());
+    if !model.is_empty() && !overscroll_is_placeholder(&model) {
+        spans.push(Span::styled(
+            session_facts::pretty_model(&model),
+            Style::default().fg(rgb(255, 150, 200)).bold(),
+        ));
+        // Reasoning level shown inline next to the model, e.g. " high".
+        if let Some(effort) = data
+            .reasoning_effort
+            .as_deref()
+            .and_then(overscroll_short_reasoning)
+        {
+            spans.push(Span::styled(
+                format!(" {}", effort),
+                Style::default().fg(rgb(140, 140, 150)),
+            ));
+        }
+    }
+
+    // Provider
+    let provider = data
+        .provider_name
+        .clone()
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| app.provider_name());
+    if !provider.is_empty() && !overscroll_is_runtime_placeholder(&provider) {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(Span::styled(
+            overscroll_provider_display(&provider),
+            Style::default().fg(rgb(140, 180, 255)),
+        ));
+    }
+
+    // Access method (auth)
+    if let Some((label, color)) = overscroll_auth_label(data.auth_method) {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(Span::styled(label.to_string(), Style::default().fg(color)));
+    }
+
+    // Context usage as a rounded bar
+    if let Some((used, limit)) = overscroll_context_usage(&data) {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(Span::styled(
+            format!(
+                "{}/{} ",
+                overscroll_format_tokens(used),
+                overscroll_format_tokens(limit)
+            ),
+            Style::default().fg(rgb(140, 140, 150)),
+        ));
+        spans.extend(overscroll_context_bar(used, limit, 10));
+    }
+
+    // Working directory last, shown as a home-relative path.
+    if let Some(dir) = app.working_dir().and_then(|d| overscroll_dir_label(&d)) {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(Span::styled(" ", Style::default().fg(rgb(140, 180, 255))));
+        spans.push(Span::styled(dir, Style::default().fg(rgb(140, 140, 150))));
+    }
+
+    let total_width = area.width as usize;
+
+    // No countdown active: just render the info line (centered or not) as before.
+    let Some(countdown) = countdown else {
+        if spans.is_empty() {
+            return;
+        }
+        let line = Line::from(overscroll_truncate_spans(spans, total_width));
+        let aligned_line = if app.centered_mode() {
+            line.alignment(Alignment::Center)
+        } else {
+            line
+        };
+        frame.render_widget(Paragraph::new(aligned_line), area);
+        return;
+    };
+
+    let countdown_width = countdown.content.chars().count();
+
+    // Tight width: if there is not even room for the countdown plus a single
+    // space of breathing room, drop the info entirely and just show the
+    // countdown (truncated as a last resort). The affordance survives.
+    if total_width <= countdown_width + 1 {
+        let countdown_line = Line::from(overscroll_truncate_spans(vec![countdown], total_width))
+            .alignment(Alignment::Right);
+        frame.render_widget(Paragraph::new(countdown_line), area);
+        return;
+    }
+
+    // Reserve the countdown on the right; the info line gets the rest and is
+    // truncated to fit so the two never collide.
+    let gap = 1u16;
+    let right_w = countdown_width as u16;
+    let left_w = area.width.saturating_sub(right_w);
+    let left_area = Rect {
+        width: left_w.saturating_sub(gap),
+        ..area
+    };
+    let right_area = Rect {
+        x: area.x + left_w,
+        width: right_w,
+        ..area
+    };
+
+    if !spans.is_empty() {
+        let avail = left_area.width as usize;
+        let info_line = Line::from(overscroll_truncate_spans(spans, avail));
+        let info_line = if app.centered_mode() {
+            info_line.alignment(Alignment::Center)
+        } else {
+            info_line
+        };
+        frame.render_widget(Paragraph::new(info_line), left_area);
+    }
+
+    let countdown_line = Line::from(vec![countdown]).alignment(Alignment::Right);
+    frame.render_widget(Paragraph::new(countdown_line), right_area);
+}
+
+/// Truncate a list of spans to at most `max_width` display columns, appending a
+/// single-cell ellipsis when content is dropped. Preserves per-span styling.
+fn overscroll_truncate_spans(spans: Vec<Span<'static>>, max_width: usize) -> Vec<Span<'static>> {
+    use unicode_width::UnicodeWidthStr;
+    if max_width == 0 {
+        return Vec::new();
+    }
+    let total: usize = spans.iter().map(|s| s.content.width()).sum();
+    if total <= max_width {
+        return spans;
+    }
+    // Leave room for a trailing ellipsis.
+    let budget = max_width.saturating_sub(1);
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut used = 0usize;
+    for span in spans {
+        let w = span.content.width();
+        if used + w <= budget {
+            used += w;
+            out.push(span);
+            continue;
+        }
+        // Partial: take as many chars as fit within the remaining budget.
+        let remaining = budget - used;
+        if remaining > 0 {
+            let mut taken = String::new();
+            let mut tw = 0usize;
+            for ch in span.content.chars() {
+                let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+                if tw + cw > remaining {
+                    break;
+                }
+                tw += cw;
+                taken.push(ch);
+            }
+            if !taken.is_empty() {
+                out.push(Span::styled(taken, span.style));
+            }
+        }
+        break;
+    }
+    out.push(Span::styled("…", Style::default().fg(rgb(100, 100, 110))));
+    out
+}
+
+/// Format a working dir path home-relative (~/foo/bar), keeping the last 2 segments.
+fn overscroll_dir_label(path: &str) -> Option<String> {
+    session_facts::dir_label_short(path)
+}
+
+/// Placeholder header strings used during remote startup; not real model names.
+fn overscroll_is_placeholder(model: &str) -> bool {
+    let m = model.trim().to_ascii_lowercase();
+    m.starts_with("connecting")
+        || m.starts_with("loading")
+        || m == "connected"
+        || m.contains("connecting to server")
+}
+
+/// Inert runtime provider labels (remote/replay/test-harness) shown before the
+/// real provider name is known; not real provider names.
+fn overscroll_is_runtime_placeholder(provider: &str) -> bool {
+    matches!(
+        provider.trim().to_ascii_lowercase().as_str(),
+        "remote" | "replay" | "test-harness"
+    )
+}
+
+fn overscroll_provider_display(provider: &str) -> String {
+    match provider.to_ascii_lowercase().as_str() {
+        // Keep provider labels credential-neutral: the adjacent auth chip
+        // (`overscroll_auth_label`) reports OAuth vs API key from the canonical
+        // credential resolution. Baking a credential into the provider name
+        // used to produce contradictions like "Claude OAuth · API key" when
+        // the Anthropic route was pinned to the API key.
+        "claude" => "Claude".to_string(),
+        "anthropic" => "Anthropic".to_string(),
+        "openai" => "OpenAI".to_string(),
+        "openrouter" => "OpenRouter".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "gemini" => "Gemini".to_string(),
+        "copilot" => "GitHub Copilot".to_string(),
+        "cursor" => "Cursor".to_string(),
+        "bedrock" => "AWS Bedrock".to_string(),
+        "antigravity" => "Antigravity".to_string(),
+        _ => provider.to_string(),
+    }
+}
+
+fn overscroll_auth_label(
+    method: crate::tui::info_widget::AuthMethod,
+) -> Option<(&'static str, Color)> {
+    use crate::tui::info_widget::AuthMethod;
+    match method {
+        AuthMethod::Unknown => None,
+        AuthMethod::ApiKey | AuthMethod::AnthropicApiKey | AuthMethod::OpenAIApiKey => {
+            Some(("API key", rgb(180, 180, 190)))
+        }
+        AuthMethod::OpenRouterApiKey | AuthMethod::OpenCodeApiKey => {
+            Some(("API key", rgb(140, 180, 255)))
+        }
+        AuthMethod::AnthropicOAuth => Some(("OAuth", rgb(255, 160, 100))),
+        AuthMethod::OpenAIOAuth => Some(("OAuth", rgb(100, 200, 180))),
+        AuthMethod::CopilotOAuth => Some(("OAuth", rgb(110, 200, 140))),
+        AuthMethod::GeminiOAuth => Some(("OAuth", rgb(120, 190, 255))),
+    }
+}
+
+fn overscroll_short_reasoning(effort: &str) -> Option<&str> {
+    let effort = effort.trim();
+    if effort.is_empty() {
+        return None;
+    }
+    Some(match effort {
+        "xhigh" => "xhigh",
+        "high" => "high",
+        "medium" => "medium",
+        "low" => "low",
+        "none" => "none",
+        other => other,
+    })
+}
+
+fn overscroll_context_usage(
+    data: &crate::tui::info_widget::InfoWidgetData,
+) -> Option<(usize, usize)> {
+    let used_tokens = if let Some(observed) = data.observed_context_tokens {
+        observed as usize
+    } else {
+        let info = data.context_info.as_ref()?;
+        if info.total_chars == 0 {
+            return None;
+        }
+        info.estimated_tokens()
+    };
+    let limit = data
+        .context_limit
+        .unwrap_or(crate::provider::DEFAULT_CONTEXT_LIMIT)
+        .max(1);
+    Some((used_tokens, limit))
+}
+
+/// Format a token count compactly: 1234 -> "1.2k", 200000 -> "200k", 1_500_000 -> "1.5M".
+fn overscroll_format_tokens(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 10_000 {
+        format!("{}k", tokens / 1000)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+/// Render a compact rounded progress bar (◖████░░◗) plus a percentage label.
+fn overscroll_context_bar(used: usize, limit: usize, cells: usize) -> Vec<Span<'static>> {
+    let limit = limit.max(1);
+    let ratio = (used as f64 / limit as f64).clamp(0.0, 1.0);
+    let pct = (ratio * 100.0).round() as u16;
+    let filled = (ratio * cells as f64).round() as usize;
+    let filled = filled.min(cells);
+
+    // Match the info widget usage bar palette (based on remaining context).
+    let left_pct = 100u16.saturating_sub(pct);
+    let fill_color = if left_pct <= 20 {
+        rgb(255, 100, 100)
+    } else if left_pct <= 50 {
+        rgb(255, 200, 100)
+    } else {
+        rgb(100, 200, 100)
+    };
+    let track_color = rgb(50, 50, 60);
+
+    let mut spans = Vec::with_capacity(cells + 2);
+    // Slim segmented pill (▰ filled / ▱ empty) reads thinner than full blocks.
+    spans.push(Span::styled(
+        "▰".repeat(filled),
+        Style::default().fg(fill_color),
+    ));
+    spans.push(Span::styled(
+        "▱".repeat(cells.saturating_sub(filled)),
+        Style::default().fg(track_color),
+    ));
+    spans.push(Span::styled(
+        format!(" {}%", pct),
+        Style::default().fg(fill_color).bold(),
+    ));
+    spans
+}
+
 pub(super) fn draw_input(
     frame: &mut Frame,
     app: &dyn TuiState,
@@ -1510,9 +1975,9 @@ pub(super) fn draw_input(
     } else if app.is_processing() && !input_text.is_empty() {
         hint_shown = true;
         let hint = if app.queue_mode() {
-            "  Ctrl+Enter to send now"
+            "  Ctrl/Cmd+Enter to send now"
         } else {
-            "  Ctrl+Enter to queue"
+            "  Ctrl/Cmd+Enter to queue"
         };
         hint_line = Some(hint.trim().to_string());
         lines.push(Line::from(Span::styled(
@@ -1868,13 +2333,119 @@ fn send_mode_indicator(app: &dyn TuiState) -> (&'static str, Color) {
             ("󰖟", rgb(140, 180, 255))
         }
     } else {
-        ("⚡", asap_color())
+        // Idle: no glyph. The faint dir · model hint is drawn instead.
+        ("", asap_color())
     }
 }
 
+/// Faint right-aligned hint shown in the input line while it is empty and idle:
+/// the model name and working directory, but only the facts that are not
+/// already visible in the info-widget HUD (so we never duplicate them).
+fn idle_input_hint(app: &dyn TuiState) -> Option<String> {
+    // Only show when nothing meaningful is happening in the composer.
+    if !app.input().is_empty() {
+        return None;
+    }
+    let mode = composer_mode(app.input(), app.is_remote_mode());
+    if mode.is_shell()
+        || app.next_prompt_new_session_armed()
+        || app.queue_mode()
+        || app.connection_type().is_some()
+    {
+        return None;
+    }
+
+    // Consult the per-frame ledger: skip facts the HUD already shows.
+    let ledger = crate::tui::info_widget::widget_visible_facts(&app.info_widget_data());
+
+    let dir = if ledger.is_missing(session_facts::Fact::Dir) {
+        app.working_dir()
+            .as_deref()
+            .and_then(session_facts::dir_label_short)
+    } else {
+        None
+    };
+
+    let model = if ledger.is_missing(session_facts::Fact::Model) {
+        let m = app.provider_model();
+        let m = m.trim();
+        if m.is_empty() {
+            None
+        } else {
+            Some(session_facts::pretty_model(m))
+        }
+    } else {
+        None
+    };
+
+    format_idle_input_hint(model, dir)
+}
+
+/// Compose the faint idle hint text: pretty model name first, then the
+/// directory path, joined by a dot.
+fn format_idle_input_hint(model: Option<String>, dir: Option<String>) -> Option<String> {
+    match (model, dir) {
+        (Some(m), Some(d)) => Some(format!("{m} · {d}")),
+        (Some(m), None) => Some(m),
+        (None, Some(d)) => Some(d),
+        (None, None) => None,
+    }
+}
+
+/// Idle status-line facts: surface the session facts that are *not* already
+/// shown by the info-widget HUD nor by the idle input hint (which owns model
+/// and dir). The status line therefore fills in context usage and provider.
+///
+/// Returns styled spans (right-aligned by the caller) including a short glyph
+/// context bar that mirrors the overscroll bar but at a much shorter length.
+/// Returns `None` when everything important is already visible elsewhere, so
+/// the caller can fall back to the occasional tip / blank line.
+fn idle_status_facts(app: &dyn TuiState) -> Option<Vec<Span<'static>>> {
+    use session_facts::Fact;
+    let data = app.info_widget_data();
+    let ledger = crate::tui::info_widget::widget_visible_facts(&data);
+    // The idle input hint owns model + dir, so treat them as already shown.
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let sep = || Span::styled(" · ", Style::default().fg(rgb(100, 100, 110)));
+
+    if ledger.is_missing(Fact::Provider) {
+        let provider = data
+            .provider_name
+            .clone()
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| app.provider_name());
+        if !provider.is_empty() && !overscroll_is_runtime_placeholder(&provider) {
+            spans.push(Span::styled(
+                overscroll_provider_display(&provider),
+                Style::default().fg(dim_color()),
+            ));
+        }
+    }
+
+    if ledger.is_missing(Fact::Context)
+        && let Some((used, limit)) = overscroll_context_usage(&data)
+    {
+        if !spans.is_empty() {
+            spans.push(sep());
+        }
+        spans.push(Span::styled(
+            format!(
+                "{}/{} ",
+                overscroll_format_tokens(used),
+                overscroll_format_tokens(limit)
+            ),
+            Style::default().fg(dim_color()),
+        ));
+        // Short glyph bar: same style as the overscroll context bar but a much
+        // shorter total length so it reads as a compact right-aligned hint.
+        spans.extend(overscroll_context_bar(used, limit, 5));
+    }
+
+    if spans.is_empty() { None } else { Some(spans) }
+}
+
 fn draw_send_mode_indicator(frame: &mut Frame, app: &dyn TuiState, area: Rect) {
-    let (icon, color) = send_mode_indicator(app);
-    if icon.is_empty() || area.width == 0 || area.height == 0 {
+    if area.width == 0 || area.height == 0 {
         return;
     }
     let indicator_area = Rect {
@@ -1883,9 +2454,35 @@ fn draw_send_mode_indicator(frame: &mut Frame, app: &dyn TuiState, area: Rect) {
         width: area.width,
         height: 1,
     };
-    let line = Line::from(Span::styled(icon, Style::default().fg(color)));
-    let paragraph = Paragraph::new(line).alignment(Alignment::Right);
-    frame.render_widget(paragraph, indicator_area);
+
+    let (icon, color) = send_mode_indicator(app);
+    if !icon.is_empty() {
+        let line = Line::from(Span::styled(icon, Style::default().fg(color)));
+        let paragraph = Paragraph::new(line).alignment(Alignment::Right);
+        frame.render_widget(paragraph, indicator_area);
+        return;
+    }
+
+    if let Some(hint) = idle_input_hint(app) {
+        // Leave one character of breathing room at the far right edge.
+        let right_pad = 1u16;
+        let avail = indicator_area.width.saturating_sub(right_pad);
+        if avail == 0 {
+            return;
+        }
+        let hint_area = Rect {
+            width: avail,
+            ..indicator_area
+        };
+        // Truncate to the available width so we never overrun the line.
+        let hint = crate::util::truncate_str(&hint, avail as usize).to_string();
+        let line = Line::from(Span::styled(
+            hint,
+            Style::default().fg(dim_color()).add_modifier(Modifier::DIM),
+        ));
+        let paragraph = Paragraph::new(line).alignment(Alignment::Right);
+        frame.render_widget(paragraph, hint_area);
+    }
 }
 
 #[derive(Clone, Copy)]

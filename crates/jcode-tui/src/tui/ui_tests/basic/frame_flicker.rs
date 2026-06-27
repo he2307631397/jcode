@@ -19,6 +19,124 @@ fn test_redraw_interval_uses_low_frequency_during_remote_startup_phase() {
     assert_eq!(startup_interval, crate::tui::REDRAW_REMOTE_STARTUP);
 }
 
+#[test]
+fn test_active_overscroll_keeps_redrawing_at_deep_idle() {
+    // Regression: once a conversation has messages and is no longer processing,
+    // `time_since_activity()` reports deep-idle forever. The overscroll dwell
+    // line shows a live `(overscroll x.x)` countdown that must keep ticking, so
+    // `periodic_redraw_required` must not short-circuit to `false` via the
+    // deep-idle guard while the overscroll line is revealed.
+    let deep_idle = crate::tui::REDRAW_DEEP_IDLE_AFTER + Duration::from_secs(1);
+
+    let idle = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        ..Default::default()
+    };
+    assert!(
+        !crate::tui::periodic_redraw_required(&idle),
+        "a quiet deep-idle session should not require periodic redraws"
+    );
+
+    let overscrolling = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        chat_overscroll_active: true,
+        ..Default::default()
+    };
+    assert!(
+        crate::tui::periodic_redraw_required(&overscrolling),
+        "an active overscroll countdown must keep driving redraws even at deep idle"
+    );
+
+    // The redraw cadence should also be the smooth animation interval, not the
+    // coarse deep-idle one, so the countdown reads as continuous.
+    assert_eq!(
+        crate::tui::redraw_interval(&idle),
+        crate::tui::REDRAW_DEEP_IDLE
+    );
+    assert_ne!(
+        crate::tui::redraw_interval(&overscrolling),
+        crate::tui::REDRAW_DEEP_IDLE,
+        "overscroll should bump the redraw interval above the deep-idle cadence"
+    );
+}
+
+#[test]
+fn test_cold_cache_warning_keeps_redrawing_at_deep_idle() {
+    // Regression: the notification line renders a `🧊 cache cold` warning once
+    // the prompt cache TTL expires, but the cache only goes cold long after the
+    // 30s deep-idle cutoff. Without a dedicated wakeup the idle loop short-
+    // circuits to `false` and never repaints to reveal the warning before the
+    // user submits their next prompt.
+    let deep_idle = crate::tui::REDRAW_DEEP_IDLE_AFTER + Duration::from_secs(1);
+
+    let idle = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        ..Default::default()
+    };
+    assert!(
+        !crate::tui::periodic_redraw_required(&idle),
+        "a quiet deep-idle session should not require periodic redraws"
+    );
+
+    let cold = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        cache_ttl_status: Some(crate::tui::CacheTtlInfo {
+            remaining_secs: 0,
+            ttl_secs: 300,
+            is_cold: true,
+            cached_tokens: Some(4000),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        crate::tui::periodic_redraw_required(&cold),
+        "a cold prompt cache must keep driving redraws so the warning appears at deep idle"
+    );
+    assert_ne!(
+        crate::tui::redraw_interval(&cold),
+        crate::tui::REDRAW_DEEP_IDLE,
+        "a cold cache should bump the redraw interval above the deep-idle cadence"
+    );
+
+    // The same applies to the final-minute `⏳ cache Ns` countdown.
+    let warm_countdown = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        cache_ttl_status: Some(crate::tui::CacheTtlInfo {
+            remaining_secs: 30,
+            ttl_secs: 300,
+            is_cold: false,
+            cached_tokens: Some(4000),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        crate::tui::periodic_redraw_required(&warm_countdown),
+        "the last-minute cache countdown must keep driving redraws at deep idle"
+    );
+
+    // A comfortably warm cache should not defeat the deep-idle short-circuit.
+    let warm = TestState {
+        display_messages: vec![DisplayMessage::system("seed".to_string())],
+        time_since_activity: Some(deep_idle),
+        cache_ttl_status: Some(crate::tui::CacheTtlInfo {
+            remaining_secs: 200,
+            ttl_secs: 300,
+            is_cold: false,
+            cached_tokens: Some(4000),
+        }),
+        ..Default::default()
+    };
+    assert!(
+        !crate::tui::periodic_redraw_required(&warm),
+        "a warm cache far from expiry should stay deep-idle"
+    );
+}
+
 fn record_test_chat_snapshot(text: &str) {
     clear_copy_viewport_snapshot();
     let width = line_display_width(text);
@@ -57,6 +175,7 @@ fn make_prepared_messages_with_content_bytes(bytes: usize, marker: &str) -> Arc<
         image_regions: Vec::new(),
         edit_tool_ranges: Vec::new(),
         copy_targets: Vec::new(),
+        message_boundaries: Vec::new(),
     })
 }
 

@@ -1,5 +1,12 @@
 use super::*;
 
+/// Serde default for boolean fields that should default to `true` when absent,
+/// so older clients that omit the field keep their previous (unconditional)
+/// behavior.
+fn default_true() -> bool {
+    true
+}
+
 /// Client request to server
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
@@ -90,6 +97,11 @@ pub enum Request {
         client_has_local_history: bool,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         allow_session_takeover: bool,
+        /// Terminal-identifying env vars (tmux/zellij/kitty/DISPLAY/...) captured
+        /// from the connecting client so the server can route spawn/focus hooks
+        /// to the client's terminal instead of its own stale startup env (#405).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        terminal_env: Vec<(String, String)>,
     },
 
     /// Get full conversation history (for TUI sync on connect)
@@ -110,7 +122,16 @@ pub enum Request {
 
     /// Trigger server hot reload (build new version, restart)
     #[serde(rename = "reload")]
-    Reload { id: u64 },
+    Reload {
+        id: u64,
+        /// When `true` (the default for backward compatibility), the server
+        /// reloads unconditionally. When `false`, the server only reloads if it
+        /// detects a strictly-newer reload candidate binary, so callers like
+        /// `jcode server reload` can request a graceful upgrade without risking
+        /// a downgrade (e.g. a newer self-dev daemon next to an older release).
+        #[serde(default = "default_true")]
+        force: bool,
+    },
 
     /// Resume a specific session by ID
     #[serde(rename = "resume_session")]
@@ -124,6 +145,12 @@ pub enum Request {
         #[serde(default)]
         allow_session_takeover: bool,
     },
+
+    /// Resume/continue every live session that was interrupted and would
+    /// auto-continue on a reload (e.g. crashed/errored mid-turn). This is the
+    /// on-demand equivalent of the automatic post-reload recovery sweep.
+    #[serde(rename = "resume_all_sessions")]
+    ResumeAllSessions { id: u64 },
 
     /// Deliver a scheduled task to a currently live session.
     #[serde(rename = "notify_session")]
@@ -159,9 +186,25 @@ pub enum Request {
     #[serde(rename = "refresh_models")]
     RefreshModels { id: u64 },
 
-    /// Set the active model by name
+    /// Set the active model by name.
+    ///
+    /// A legacy/desktop compatibility shape (`{"type":"set_route","model":...}`)
+    /// is also accepted, but it is normalized into this variant inside
+    /// [`crate::decode_request`] rather than via a serde `alias`. A serde alias
+    /// would make this variant *also* answer to the `set_route` tag, and serde's
+    /// internally-tagged enums pick the first matching variant by tag (not by
+    /// fields), so it would shadow the structured [`Request::SetRoute`] variant
+    /// below and make every structured route switch fail with
+    /// `missing field \`model\``.
     #[serde(rename = "set_model")]
     SetModel { id: u64, model: String },
+
+    /// Set the active model by structured route identity.
+    #[serde(rename = "set_route")]
+    SetRoute {
+        id: u64,
+        selection: jcode_provider_core::RouteSelection,
+    },
 
     /// Set or clear the session-scoped subagent model preference.
     #[serde(rename = "set_subagent_model")]
@@ -568,6 +611,27 @@ pub enum ServerEvent {
     #[serde(rename = "text_delta")]
     TextDelta { text: String },
 
+    /// Streaming reasoning/thinking delta (raw, unformatted model text).
+    ///
+    /// Unlike [`ServerEvent::TextDelta`], this carries the model's reasoning as
+    /// raw text deltas so the client can render the in-progress line live
+    /// (token-by-token) rather than waiting for a whole line to complete. The
+    /// client is responsible for the dim+italic styling. Clients that predate
+    /// this event simply ignore it (reasoning is still persisted as a
+    /// history-only trace and shown when the message commits).
+    #[serde(rename = "reasoning_delta")]
+    ReasoningDelta { text: String },
+
+    /// Reasoning/thinking finished for the current step. Lets the client close
+    /// its live reasoning region (flush the partial line, add separators) before
+    /// normal output or a tool call begins.
+    #[serde(rename = "reasoning_done")]
+    ReasoningDone {
+        /// Wall-clock reasoning duration in seconds, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_secs: Option<f64>,
+    },
+
     /// Replace the current turn's streamed text content
     /// Used when text-wrapped tool calls are recovered: the garbled text
     /// shown during streaming is replaced with the clean prefix text.
@@ -594,6 +658,16 @@ pub enum ServerEvent {
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+
+    /// Rendered images produced by a tool result during the live turn (e.g. the
+    /// `read` tool reading an image file). Lets remote clients populate the
+    /// pinned-image side pane immediately, instead of waiting for the next full
+    /// History reload.
+    #[serde(rename = "side_pane_images")]
+    SidePaneImages {
+        session_id: String,
+        images: Vec<jcode_session_types::RenderedImage>,
     },
 
     /// Image generated by a provider-native image generation tool.
@@ -664,6 +738,14 @@ pub enum ServerEvent {
     /// finalizing bookkeeping such as session IDs or completion trailers.
     #[serde(rename = "message_end")]
     MessageEnd,
+
+    /// A transient transport fault interrupted the provider stream mid-response
+    /// and the provider is retrying the request from the top. The client must
+    /// discard all partial output from the current attempt (streamed text,
+    /// reasoning, in-progress tool calls) so the replayed response renders
+    /// cleanly instead of duplicating.
+    #[serde(rename = "retry_rollback")]
+    RetryRollback { attempt: u32, max: u32 },
 
     /// Upstream provider info (e.g., which provider OpenRouter routed to)
     #[serde(rename = "upstream_provider")]
@@ -902,6 +984,12 @@ pub enum ServerEvent {
         /// Upstream provider (e.g., which provider OpenRouter routed to, or calculated preference)
         #[serde(skip_serializing_if = "Option::is_none")]
         upstream_provider: Option<String>,
+        /// Server-resolved billing credential for this session: `Oauth`
+        /// (subscription) vs `ApiKey` (cost-based), or `None` when the active
+        /// provider has no OAuth-vs-API-key distinction. Lets remote clients
+        /// render usage/billing without re-deriving it from the provider name.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resolved_credential: Option<jcode_provider_core::ResolvedCredential>,
         /// Reasoning effort for providers that expose it
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
@@ -1164,6 +1252,21 @@ pub enum ServerEvent {
         message: String,
         /// Whether compaction was started successfully
         success: bool,
+    },
+
+    /// Response to resume_all_sessions — summary of which sessions were continued.
+    #[serde(rename = "resume_all_result")]
+    ResumeAllResult {
+        id: u64,
+        /// Number of live sessions that were continued by this request.
+        resumed: usize,
+        /// Number of live sessions inspected but skipped (idle/complete/busy).
+        skipped: usize,
+        /// Friendly names (or short ids) of the sessions that were continued.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        resumed_sessions: Vec<String>,
+        /// Human-readable summary suitable for direct display.
+        message: String,
     },
 
     /// A running command is waiting for stdin input from the user

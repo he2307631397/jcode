@@ -1,5 +1,10 @@
 use super::*;
 
+/// Total per-request timeout for model catalog fetches. The shared HTTP
+/// client only sets a connect timeout, so without this a hung catalog request
+/// keeps the scope's refresh marked in-flight and the picker stays stale.
+const CATALOG_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[derive(Debug, Clone, Default)]
 pub struct OpenAIModelCatalog {
     pub available_models: Vec<String>,
@@ -108,6 +113,7 @@ pub async fn fetch_openai_model_catalog(access_token: &str) -> Result<OpenAIMode
     let resp = client
         .get("https://chatgpt.com/backend-api/codex/models?client_version=1.0.0")
         .header("Authorization", format!("Bearer {}", access_token))
+        .timeout(CATALOG_REQUEST_TIMEOUT)
         .send()
         .await?;
 
@@ -178,7 +184,10 @@ where
     let mut after_id: Option<String> = None;
 
     loop {
-        let resp = build_request(&client, after_id.as_deref()).send().await?;
+        let resp = build_request(&client, after_id.as_deref())
+            .timeout(CATALOG_REQUEST_TIMEOUT)
+            .send()
+            .await?;
         if !resp.status().is_success() {
             anyhow::bail!("Failed to fetch Anthropic model catalog: {}", resp.status());
         }
@@ -226,9 +235,17 @@ pub async fn fetch_openai_api_key_model_catalog(api_key: &str) -> Result<OpenAIM
     note_openai_model_catalog_refresh_attempt();
 
     let client = shared_http_client();
+    // Honor the same API-base override as the Responses request path so a
+    // custom/proxied endpoint is probed for models instead of the real
+    // api.openai.com (issue #343).
+    let models_url = format!(
+        "{}/models",
+        crate::provider::openai::OpenAIProvider::resolve_api_base().trim_end_matches('/')
+    );
     let resp = client
-        .get("https://api.openai.com/v1/models")
+        .get(&models_url)
         .header("Authorization", format!("Bearer {}", api_key))
+        .timeout(CATALOG_REQUEST_TIMEOUT)
         .send()
         .await?;
 

@@ -1,4 +1,5 @@
 pub mod account_store;
+pub mod active_method;
 pub mod antigravity;
 pub mod azure;
 pub mod claude;
@@ -10,15 +11,20 @@ pub mod doctor;
 pub mod external;
 pub mod gemini;
 pub mod google;
+pub(crate) mod google_oauth;
 pub mod integration;
 pub mod lifecycle;
 #[cfg(any(test, feature = "test-support"))]
+// The driver's items are exercised by its internal #[cfg(test)] tests; under
+// a plain `--features test-support` lib build they are intentionally unused.
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
 pub(crate) mod lifecycle_driver;
 pub(crate) mod live_provider_probes;
 pub mod login_diagnostics;
 pub mod login_flows;
 pub mod oauth;
 pub mod provider_e2e;
+pub(crate) mod refresh_coordinator;
 pub mod refresh_state;
 mod status_types;
 #[cfg(any(test, feature = "test-support"))]
@@ -37,6 +43,8 @@ pub use status_types::{
     AuthStatus, AuthValidationMethod, ProviderAuth, ProviderAuthAssessment,
 };
 
+pub use active_method::{ActiveCredential, ResolvedProviderAuth, resolve_dual_credential_auth};
+
 use crate::provider_catalog::LoginProviderAuthStateKey;
 use crate::provider_catalog::LoginProviderDescriptor;
 use std::collections::HashMap;
@@ -44,10 +52,23 @@ use std::path::Path;
 use std::sync::{Mutex, RwLock};
 use std::time::Instant;
 
-static AUTH_STATUS_CACHE: std::sync::LazyLock<RwLock<Option<(AuthStatus, Instant)>>> =
+/// Cached auth status plus the `JCODE_HOME` it was computed under.
+///
+/// Auth probes read credential files relative to `JCODE_HOME`. Tests swap
+/// `JCODE_HOME` to per-test temp dirs, and a status computed under one home
+/// must never be served for another (issue #361: parallel provider tests
+/// intermittently observed another test's auth snapshot through this global
+/// cache). In production the home never changes, so the key check is free.
+type CachedAuthStatus = (AuthStatus, Instant, Option<std::ffi::OsString>);
+
+static AUTH_STATUS_CACHE: std::sync::LazyLock<RwLock<Option<CachedAuthStatus>>> =
     std::sync::LazyLock::new(|| RwLock::new(None));
-static AUTH_STATUS_FAST_CACHE: std::sync::LazyLock<RwLock<Option<(AuthStatus, Instant)>>> =
+static AUTH_STATUS_FAST_CACHE: std::sync::LazyLock<RwLock<Option<CachedAuthStatus>>> =
     std::sync::LazyLock::new(|| RwLock::new(None));
+
+fn auth_cache_home_key() -> Option<std::ffi::OsString> {
+    std::env::var_os("JCODE_HOME")
+}
 
 const AUTH_STATUS_CACHE_TTL_SECS: u64 = 30;
 const AUTH_STATUS_FAST_CACHE_TTL_SECS: u64 = 60;
@@ -65,7 +86,35 @@ enum AuthProbeMode {
 }
 
 pub fn browser_suppressed(cli_no_browser: bool) -> bool {
-    cli_no_browser || env_truthy("NO_BROWSER") || env_truthy("JCODE_NO_BROWSER")
+    cli_no_browser
+        || env_truthy("NO_BROWSER")
+        || env_truthy("JCODE_NO_BROWSER")
+        || running_in_test_harness()
+}
+
+/// True when the current process is a Rust test binary (`cargo test` /
+/// `cargo nextest`). Test binaries always run from `target/**/deps/`, a
+/// location no installed or self-dev jcode binary ever runs from.
+///
+/// Used to keep tests from opening real browser windows (OAuth login pages,
+/// files) on the developer's desktop: many login/onboarding flows are
+/// exercised by TUI tests, and without this guard each test run could pop
+/// multiple browser tabs. Set `JCODE_ALLOW_BROWSER_IN_TESTS=1` to opt out
+/// (e.g. for an intentionally interactive live test).
+pub fn running_in_test_harness() -> bool {
+    static IN_TEST_HARNESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *IN_TEST_HARNESS.get_or_init(|| {
+        if env_truthy("JCODE_ALLOW_BROWSER_IN_TESTS") {
+            return false;
+        }
+        std::env::current_exe()
+            .ok()
+            .map(|exe| {
+                let path = exe.to_string_lossy().replace('\\', "/");
+                path.contains("/target/") && path.contains("/deps/")
+            })
+            .unwrap_or(false)
+    })
 }
 
 fn env_truthy(key: &str) -> bool {
@@ -177,9 +226,11 @@ impl AuthStatus {
     /// Check all authentication sources and return their status.
     /// Results are cached for 30 seconds to avoid expensive PATH scanning on every frame.
     pub fn check() -> Self {
+        let home_key = auth_cache_home_key();
         if let Ok(cache) = AUTH_STATUS_CACHE.read()
-            && let Some((ref status, ref when)) = *cache
+            && let Some((ref status, ref when, ref cached_home)) = *cache
             && when.elapsed().as_secs() < AUTH_STATUS_CACHE_TTL_SECS
+            && *cached_home == home_key
         {
             return status.clone();
         }
@@ -187,10 +238,10 @@ impl AuthStatus {
         let status = Self::check_uncached();
 
         if let Ok(mut cache) = AUTH_STATUS_CACHE.write() {
-            *cache = Some((status.clone(), Instant::now()));
+            *cache = Some((status.clone(), Instant::now(), home_key.clone()));
         }
         if let Ok(mut cache) = AUTH_STATUS_FAST_CACHE.write() {
-            *cache = Some((status.clone(), Instant::now()));
+            *cache = Some((status.clone(), Instant::now(), home_key));
         }
 
         status
@@ -204,23 +255,26 @@ impl AuthStatus {
     /// forever: external credential files may be deleted or replaced while the
     /// process is running.
     pub fn check_fast() -> Self {
+        let home_key = auth_cache_home_key();
         if let Ok(cache) = AUTH_STATUS_CACHE.read()
-            && let Some((ref status, ref when)) = *cache
+            && let Some((ref status, ref when, ref cached_home)) = *cache
             && when.elapsed().as_secs() < AUTH_STATUS_CACHE_TTL_SECS
+            && *cached_home == home_key
         {
             return status.clone();
         }
 
         if let Ok(cache) = AUTH_STATUS_FAST_CACHE.read()
-            && let Some((ref status, ref when)) = *cache
+            && let Some((ref status, ref when, ref cached_home)) = *cache
             && when.elapsed().as_secs() < AUTH_STATUS_FAST_CACHE_TTL_SECS
+            && *cached_home == home_key
         {
             return status.clone();
         }
 
         let status = Self::check_uncached_fast();
         if let Ok(mut cache) = AUTH_STATUS_FAST_CACHE.write() {
-            *cache = Some((status.clone(), Instant::now()));
+            *cache = Some((status.clone(), Instant::now(), home_key));
         }
 
         status
@@ -238,6 +292,43 @@ impl AuthStatus {
             || self.antigravity == AuthState::Available
             || self.gemini == AuthState::Available
             || self.cursor == AuthState::Available
+    }
+
+    /// Emit a structured, non-secret snapshot of which providers currently have
+    /// credentials configured. This is the single best line to ask a user to
+    /// share when debugging "my model picker is empty / only OpenAI+Anthropic
+    /// show / login silently failed" reports: it records, per provider, whether
+    /// jcode believes credentials are available/expired/missing without leaking
+    /// any token or key material.
+    ///
+    /// `surface` describes where the snapshot was taken from (for example
+    /// `model_picker`, `auth_changed`, `catalog_refresh`) so logs can be
+    /// correlated with the user action that triggered them.
+    pub fn log_snapshot(&self, surface: &str) {
+        crate::logging::event_info(
+            "auth_status_snapshot",
+            vec![
+                ("surface", surface.to_string()),
+                ("any_available", self.has_any_available().to_string()),
+                ("jcode", self.jcode.label().to_string()),
+                ("anthropic", self.anthropic.state.label().to_string()),
+                ("anthropic_oauth", self.anthropic.has_oauth.to_string()),
+                ("anthropic_api", self.anthropic.has_api_key.to_string()),
+                ("openai", self.openai.label().to_string()),
+                ("openai_oauth", self.openai_has_oauth.to_string()),
+                ("openai_api", self.openai_has_api_key.to_string()),
+                ("openrouter", self.openrouter.label().to_string()),
+                ("azure", self.azure.label().to_string()),
+                ("azure_api", self.azure_has_api_key.to_string()),
+                ("azure_entra", self.azure_uses_entra.to_string()),
+                ("bedrock", self.bedrock.label().to_string()),
+                ("copilot", self.copilot.label().to_string()),
+                ("copilot_cred", self.copilot_has_api_token.to_string()),
+                ("antigravity", self.antigravity.label().to_string()),
+                ("gemini", self.gemini.label().to_string()),
+                ("cursor", self.cursor.label().to_string()),
+            ],
+        );
     }
 
     pub fn has_any_untrusted_external_auth() -> bool {
@@ -302,13 +393,29 @@ impl AuthStatus {
                     AuthState::NotConfigured
                 }
             }
-            crate::provider_catalog::LoginProviderTarget::Azure => {
-                if crate::auth::azure::has_configuration() {
+            // The `anthropic-api` login provider is the *API-key* path. It must
+            // report on the presence of an Anthropic API key alone, never borrow
+            // the OAuth/subscription credential's availability (that is the
+            // separate `claude` provider). Sharing `auth_state_key::Anthropic`
+            // previously made this provider claim "available / OAuth + API key"
+            // even with zero API key configured, which then failed at request
+            // time because API-key mode never falls back to OAuth.
+            crate::provider_catalog::LoginProviderTarget::ClaudeApiKey => {
+                if api_key_available("ANTHROPIC_API_KEY", "anthropic.env") {
                     AuthState::Available
                 } else {
                     AuthState::NotConfigured
                 }
             }
+            // The `claude` login provider is the *OAuth/subscription* path: the
+            // mirror image of the `anthropic-api` rule above. It must report on
+            // the OAuth credential alone, never borrow the API key's
+            // availability, so the two rows never blur into one ambiguous
+            // "OAuth + API key" answer.
+            crate::provider_catalog::LoginProviderTarget::Claude => self.anthropic.oauth_state,
+            // Same split for OpenAI: `openai` is the ChatGPT/Codex OAuth login,
+            // `openai-api` (handled above) is the API-key login.
+            crate::provider_catalog::LoginProviderTarget::OpenAi => self.openai_oauth_state,
             crate::provider_catalog::LoginProviderTarget::Bedrock => {
                 if crate::provider::bedrock::BedrockProvider::has_credentials() {
                     AuthState::Available
@@ -367,9 +474,9 @@ impl AuthStatus {
                     "not configured".to_string()
                 }
             }
-            crate::provider_catalog::LoginProviderTarget::Azure => {
+            crate::provider_catalog::LoginProviderTarget::ClaudeApiKey => {
                 if self.state_for_provider(provider) == AuthState::Available {
-                    crate::auth::azure::method_detail()
+                    "API key (`ANTHROPIC_API_KEY`)".to_string()
                 } else {
                     "not configured".to_string()
                 }
@@ -410,15 +517,16 @@ impl AuthStatus {
                 }
             }
             _ => match provider.auth_state_key {
+                // The `claude` login provider is the OAuth/subscription path;
+                // the API key reports through the separate `anthropic-api`
+                // provider (handled above via `LoginProviderTarget::ClaudeApiKey`).
+                // Describe the OAuth credential alone so the two rows never
+                // blur together as "OAuth + API key".
                 LoginProviderAuthStateKey::Anthropic => {
-                    let detail = if self.anthropic.has_oauth && self.anthropic.has_api_key {
-                        "OAuth + API key"
-                    } else if self.anthropic.has_oauth {
-                        "OAuth"
-                    } else if self.anthropic.has_api_key {
-                        "API key"
-                    } else {
-                        "not configured"
+                    let detail = match self.anthropic.oauth_state {
+                        AuthState::Available => "OAuth",
+                        AuthState::Expired => "OAuth (expired)",
+                        AuthState::NotConfigured => "not configured",
                     };
 
                     let accounts = crate::auth::claude::list_accounts().unwrap_or_default();
@@ -436,15 +544,13 @@ impl AuthStatus {
                         detail.to_string()
                     }
                 }
+                // Same split for OpenAI: this is the ChatGPT/Codex OAuth login;
+                // `openai-api` (handled above) owns the API-key answer.
                 LoginProviderAuthStateKey::OpenAi => {
-                    let detail = if self.openai_has_oauth && self.openai_has_api_key {
-                        "OAuth + API key"
-                    } else if self.openai_has_oauth {
-                        "OAuth"
-                    } else if self.openai_has_api_key {
-                        "API key"
-                    } else {
-                        "not configured"
+                    let detail = match self.openai_oauth_state {
+                        AuthState::Available => "OAuth",
+                        AuthState::Expired => "OAuth (expired)",
+                        AuthState::NotConfigured => "not configured",
                     };
 
                     let accounts = crate::auth::codex::list_accounts().unwrap_or_default();
@@ -547,6 +653,29 @@ impl AuthStatus {
                     AuthValidationMethod::PresenceCheck,
                 )
             }
+            crate::provider_catalog::LoginProviderTarget::ClaudeApiKey => {
+                // The Anthropic API key is most commonly stored in the app
+                // config file (`~/.config/jcode/anthropic.env`), *not* an env
+                // var and *not* `~/.jcode/auth.json` (which holds the separate
+                // OAuth accounts). List every place it can live so the real
+                // source is always discoverable instead of looking "absent".
+                let (source, detail) = summarize_sources(vec![
+                    env_source("ANTHROPIC_API_KEY"),
+                    config_source(
+                        "ANTHROPIC_API_KEY",
+                        "anthropic.env",
+                        "~/.config/jcode/anthropic.env",
+                    ),
+                    external_api_key_source("ANTHROPIC_API_KEY"),
+                ]);
+                (
+                    source,
+                    detail,
+                    AuthExpiryConfidence::NotApplicable,
+                    AuthRefreshSupport::NotApplicable,
+                    AuthValidationMethod::PresenceCheck,
+                )
+            }
             crate::provider_catalog::LoginProviderTarget::Azure => {
                 let (source, detail) = summarize_sources(vec![
                     azure_entra_source(),
@@ -590,16 +719,34 @@ impl AuthStatus {
                 )
             }
             crate::provider_catalog::LoginProviderTarget::OpenAiCompatible(profile) => {
-                let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
-                let (source, detail) = summarize_sources(vec![
-                    env_source(&resolved.api_key_env),
-                    config_source(
-                        &resolved.api_key_env,
-                        &resolved.env_file,
-                        format!("~/.config/jcode/{}", resolved.env_file),
-                    ),
-                    external_api_key_source(&resolved.api_key_env),
-                ]);
+                // Prefer the active named config profile's credential location
+                // (set via `--provider-profile`) over the built-in profile env
+                // so the reported source matches what runtime actually uses (#402).
+                let (source, detail) = if let Some((key_env, env_file)) =
+                    crate::provider_catalog::active_named_provider_profile_credential_source()
+                {
+                    summarize_sources(vec![
+                        env_source(&key_env),
+                        config_source(
+                            &key_env,
+                            &env_file,
+                            format!("~/.config/jcode/{}", env_file),
+                        ),
+                        external_api_key_source(&key_env),
+                    ])
+                } else {
+                    let resolved =
+                        crate::provider_catalog::resolve_openai_compatible_profile(profile);
+                    summarize_sources(vec![
+                        env_source(&resolved.api_key_env),
+                        config_source(
+                            &resolved.api_key_env,
+                            &resolved.env_file,
+                            format!("~/.config/jcode/{}", resolved.env_file),
+                        ),
+                        external_api_key_source(&resolved.api_key_env),
+                    ])
+                };
                 (
                     source,
                     detail,
@@ -689,7 +836,14 @@ fn build_auth_status_uncached(mode: AuthProbeMode) -> (AuthStatus, Vec<(&'static
             token_state(antigravity::load_tokens().map(|tokens| tokens.is_expired()))
     });
     record_auth_probe_step(&mut timings, "gemini", || {
-        status.gemini = token_state(gemini::load_tokens().map(|tokens| tokens.is_expired()))
+        // An official Gemini Developer API key is a static credential with no
+        // expiry handshake, so treat its presence as immediately Available and
+        // fall back to OAuth token state otherwise.
+        status.gemini = if gemini::has_api_key() {
+            AuthState::Available
+        } else {
+            token_state(gemini::load_tokens().map(|tokens| tokens.is_expired()))
+        }
     });
     record_auth_probe_step(&mut timings, "cursor", || {
         probe_cursor_status(&mut status, mode)
@@ -739,6 +893,9 @@ fn probe_anthropic_status(status: &mut AuthStatus) {
         } else {
             anthropic.state = AuthState::Expired;
         }
+        // Record the OAuth credential's own state before the API key below can
+        // mask an expired (or absent) OAuth login in the combined `state`.
+        anthropic.oauth_state = anthropic.state;
     }
 
     // API key overrides expired OAuth.
@@ -785,6 +942,9 @@ fn probe_openai_status(status: &mut AuthStatus) {
                 // No expiry info, assume available.
                 status.openai = AuthState::Available;
             }
+            // Record the OAuth credential's own state before the API key below
+            // can mask an expired (or absent) OAuth login in the combined state.
+            status.openai_oauth_state = status.openai;
         } else if !creds.access_token.is_empty() {
             status.openai_has_api_key = true;
             status.openai = AuthState::Available;
@@ -863,25 +1023,23 @@ fn assessment_for_key(
     AuthValidationMethod,
 ) {
     match key {
+        // The Claude/OpenAI rows that reach here are the OAuth/subscription
+        // login providers; their API-key counterparts (`anthropic-api`,
+        // `openai-api`) attribute sources separately via their
+        // `LoginProviderTarget` arms. Describe only the OAuth credential here so
+        // an API key never makes the OAuth row look configured (or vice versa).
         LoginProviderAuthStateKey::Anthropic => {
-            let (source, detail) = summarize_sources(vec![
-                anthropic_oauth_source(status),
-                env_source("ANTHROPIC_API_KEY"),
-            ]);
+            let (source, detail) = summarize_sources(vec![anthropic_oauth_source(status)]);
             (
                 source,
                 detail,
                 if status.anthropic.has_oauth {
                     AuthExpiryConfidence::Exact
-                } else if status.anthropic.has_api_key {
-                    AuthExpiryConfidence::NotApplicable
                 } else {
                     AuthExpiryConfidence::Unknown
                 },
                 if status.anthropic.has_oauth {
                     AuthRefreshSupport::Automatic
-                } else if status.anthropic.has_api_key {
-                    AuthRefreshSupport::NotApplicable
                 } else {
                     AuthRefreshSupport::Unknown
                 },
@@ -893,24 +1051,17 @@ fn assessment_for_key(
             )
         }
         LoginProviderAuthStateKey::OpenAi => {
-            let (source, detail) = summarize_sources(vec![
-                openai_oauth_source(status),
-                openai_api_key_source(status),
-            ]);
+            let (source, detail) = summarize_sources(vec![openai_oauth_source(status)]);
             (
                 source,
                 detail,
                 if status.openai_has_oauth {
                     AuthExpiryConfidence::Exact
-                } else if status.openai_has_api_key {
-                    AuthExpiryConfidence::NotApplicable
                 } else {
                     AuthExpiryConfidence::Unknown
                 },
                 if status.openai_has_oauth {
                     AuthRefreshSupport::Automatic
-                } else if status.openai_has_api_key {
-                    AuthRefreshSupport::NotApplicable
                 } else {
                     AuthRefreshSupport::Unknown
                 },
@@ -1133,22 +1284,6 @@ fn openai_oauth_source(status: &AuthStatus) -> Option<(AuthCredentialSource, Str
         ));
     }
     None
-}
-
-fn openai_api_key_source(status: &AuthStatus) -> Option<(AuthCredentialSource, String)> {
-    if !status.openai_has_api_key {
-        return None;
-    }
-    env_source("OPENAI_API_KEY").or_else(|| {
-        (crate::auth::codex::legacy_auth_allowed()
-            && crate::auth::codex::legacy_auth_source_exists())
-        .then(|| {
-            (
-                AuthCredentialSource::TrustedExternalFile,
-                "trusted legacy Codex API key".to_string(),
-            )
-        })
-    })
 }
 
 fn gemini_source() -> Option<(AuthCredentialSource, String)> {

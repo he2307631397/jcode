@@ -80,6 +80,9 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_INFO_WIDGET_TOGGLE_KEY") {
             self.keybindings.info_widget_toggle = v;
         }
+        if let Ok(v) = std::env::var("JCODE_NEW_TERMINAL_KEY") {
+            self.keybindings.new_terminal = v;
+        }
 
         // Dictation
         if let Ok(v) = std::env::var("JCODE_DICTATION_COMMAND") {
@@ -194,6 +197,11 @@ impl Config {
                 self.display.show_thinking = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_REASONING_DISPLAY") {
+            if let Some(mode) = crate::config::ReasoningDisplayMode::parse(&v) {
+                self.display.set_reasoning_display(mode);
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_MARKDOWN_SPACING") {
             match v.trim().to_lowercase().as_str() {
                 "compact" => self.display.markdown_spacing = MarkdownSpacingMode::Compact,
@@ -235,6 +243,11 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_COPY_BADGE_ALT_LABEL") {
             self.display.copy_badge_alt_label = v;
         }
+        if let Ok(v) = std::env::var("JCODE_COMPACT_NOTIFICATIONS") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.display.compact_notifications = parsed;
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_CHAT_NATIVE_SCROLLBAR") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.display.native_scrollbars.chat = parsed;
@@ -267,15 +280,111 @@ impl Config {
                 self.features.persist_memory_injections = parsed;
             }
         }
-        if let Ok(v) = std::env::var("JCODE_UPDATE_CHANNEL") {
-            match v.trim().to_lowercase().as_str() {
-                "main" | "nightly" | "edge" => {
-                    self.features.update_channel = UpdateChannel::Main;
-                }
-                "stable" | "release" => {
-                    self.features.update_channel = UpdateChannel::Stable;
-                }
-                _ => {}
+        if let Ok(v) = std::env::var("JCODE_KV_CACHE_MISS_NOTICES") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.features.kv_cache_miss_notices = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_UPDATE_CHANNEL")
+            && let Some(channel) = UpdateChannel::parse(&v)
+        {
+            self.features.update_channel = channel;
+        }
+
+        // Agents (spawned helper sessions)
+        if let Ok(v) = std::env::var("JCODE_SWARM_MODEL") {
+            let trimmed = v.trim();
+            self.agents.swarm_model = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Ok(v) = std::env::var("JCODE_SWARM_SPAWN_MODE") {
+            if let Some(parsed) = SwarmSpawnMode::parse(&v) {
+                self.agents.swarm_spawn_mode = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_MODEL") {
+            let trimmed = v.trim();
+            self.agents.memory_model = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_SIDECAR_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.agents.memory_sidecar_enabled = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_EMBEDDING_BACKEND") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.agents.memory_embedding_backend = trimmed.to_string();
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_EMBEDDING_MODEL") {
+            let trimmed = v.trim();
+            self.agents.memory_embedding_model = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_EMBEDDING_BASE_URL") {
+            let trimmed = v.trim();
+            self.agents.memory_embedding_base_url = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Ok(v) = std::env::var("JCODE_MEMORY_EMBEDDING_DIM") {
+            if let Ok(parsed) = v.trim().parse::<usize>() {
+                self.agents.memory_embedding_dim = Some(parsed);
+            }
+        }
+
+        // Terminal spawning
+        if let Ok(v) = std::env::var("JCODE_SPAWN_HOOK") {
+            let trimmed = v.trim();
+            // An explicitly empty env value disables a config-file hook.
+            self.terminal.spawn_hook = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+        if let Ok(v) = std::env::var("JCODE_FOCUS_HOOK") {
+            let trimmed = v.trim();
+            // An explicitly empty env value disables a config-file hook.
+            self.terminal.focus_hook = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            };
+        }
+
+        // Lifecycle hooks. Empty env values disable config-file hooks.
+        fn hook_env_override(slot: &mut Option<String>, key: &str) {
+            if let Ok(v) = std::env::var(key) {
+                let trimmed = v.trim();
+                *slot = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                };
+            }
+        }
+        hook_env_override(&mut self.hooks.turn_end, "JCODE_HOOK_TURN_END");
+        hook_env_override(&mut self.hooks.session_start, "JCODE_HOOK_SESSION_START");
+        hook_env_override(&mut self.hooks.session_end, "JCODE_HOOK_SESSION_END");
+        hook_env_override(&mut self.hooks.pre_tool, "JCODE_HOOK_PRE_TOOL");
+        hook_env_override(&mut self.hooks.post_tool, "JCODE_HOOK_POST_TOOL");
+        if let Ok(v) = std::env::var("JCODE_HOOK_PRE_TOOL_TIMEOUT_MS") {
+            if let Ok(parsed) = v.trim().parse::<u64>() {
+                self.hooks.pre_tool_timeout_ms = parsed;
             }
         }
 
@@ -308,6 +417,11 @@ impl Config {
             && !v.trim().is_empty()
         {
             self.websearch.bing_market = v;
+        }
+        if let Ok(v) = std::env::var("JCODE_SEARXNG_URL")
+            && !v.trim().is_empty()
+        {
+            self.websearch.searxng_url = Some(v);
         }
 
         if let Ok(v) = std::env::var("JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES") {
@@ -462,6 +576,17 @@ impl Config {
                 self.safety.jade_relay_reply_enabled = parsed;
             }
         }
+        if let Ok(v) = std::env::var("JCODE_JADE_RELAY_LAUNCH_ENABLED") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.safety.jade_relay_launch_enabled = parsed;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_JADE_RELAY_LAUNCH_WORKING_DIR") {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                self.safety.jade_relay_launch_working_dir = Some(trimmed.to_string());
+            }
+        }
         if let Ok(v) = std::env::var("JCODE_AMBIENT_VISIBLE") {
             if let Some(parsed) = parse_env_bool(&v) {
                 self.ambient.visible = parsed;
@@ -483,6 +608,13 @@ impl Config {
             let trimmed = v.trim();
             if !trimmed.is_empty() {
                 self.gateway.bind_addr = trimmed.to_string();
+            }
+        }
+
+        // Power management
+        if let Ok(v) = std::env::var("JCODE_PREVENT_SLEEP_WHILE_STREAMING") {
+            if let Some(parsed) = parse_env_bool(&v) {
+                self.power.prevent_sleep_while_streaming = parsed;
             }
         }
 
@@ -546,6 +678,13 @@ impl Config {
         if let Ok(v) = std::env::var("JCODE_SAME_PROVIDER_ACCOUNT_FAILOVER") {
             if let Some(enabled) = parse_env_bool(&v) {
                 self.provider.same_provider_account_failover = enabled;
+            }
+        }
+        if let Ok(v) = std::env::var("JCODE_STREAM_IDLE_TIMEOUT_SECS") {
+            if let Ok(parsed) = v.trim().parse::<u64>() {
+                if parsed > 0 {
+                    self.provider.stream_idle_timeout_secs = parsed;
+                }
             }
         }
 

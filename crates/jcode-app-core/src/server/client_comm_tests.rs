@@ -82,6 +82,7 @@ async fn comm_message_default_does_not_queue_soft_interrupt_for_connected_sessio
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
         (
@@ -102,6 +103,7 @@ async fn comm_message_default_does_not_queue_soft_interrupt_for_connected_sessio
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
     ])));
@@ -131,6 +133,7 @@ async fn comm_message_default_does_not_queue_soft_interrupt_for_connected_sessio
             last_seen: Instant::now(),
             is_processing: false,
             current_tool_name: None,
+            terminal_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         },
     )])));
@@ -234,6 +237,7 @@ async fn comm_message_with_wake_queues_soft_interrupt_for_busy_connected_session
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
         (
@@ -254,6 +258,7 @@ async fn comm_message_with_wake_queues_soft_interrupt_for_busy_connected_session
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
     ])));
@@ -277,6 +282,7 @@ async fn comm_message_with_wake_queues_soft_interrupt_for_busy_connected_session
             last_seen: Instant::now(),
             is_processing: false,
             current_tool_name: None,
+            terminal_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         },
     )])));
@@ -375,6 +381,7 @@ async fn comm_list_includes_member_status_and_detail() {
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
         (
@@ -395,6 +402,7 @@ async fn comm_list_includes_member_status_and_detail() {
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
     ])));
@@ -402,7 +410,12 @@ async fn comm_list_includes_member_status_and_detail() {
         swarm_id,
         HashSet::from([requester_id.clone(), peer_id.clone()]),
     )])));
-    let file_touches = Arc::new(RwLock::new(HashMap::new()));
+    let file_touch = crate::server::FileTouchService::new();
+    let sessions = Arc::new(RwLock::new(HashMap::from([
+        (requester_id.clone(), requester.clone()),
+        (peer_id.clone(), peer.clone()),
+    ])));
+    let client_connections = Arc::new(RwLock::new(HashMap::new()));
 
     handle_comm_list(
         1,
@@ -410,7 +423,9 @@ async fn comm_list_includes_member_status_and_detail() {
         &client_event_tx,
         &swarm_members,
         &swarms_by_id,
-        &file_touches,
+        &file_touch,
+        &sessions,
+        &client_connections,
     )
     .await;
 
@@ -466,6 +481,7 @@ async fn comm_message_accepts_friendly_name_dm_target() {
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
         (
@@ -486,6 +502,7 @@ async fn comm_message_accepts_friendly_name_dm_target() {
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
     ])));
@@ -590,6 +607,7 @@ async fn comm_message_rejects_ambiguous_friendly_name_dm_target() {
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
         (
@@ -610,6 +628,7 @@ async fn comm_message_rejects_ambiguous_friendly_name_dm_target() {
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
         (
@@ -630,6 +649,7 @@ async fn comm_message_rejects_ambiguous_friendly_name_dm_target() {
                 joined_at: Instant::now(),
                 last_status_change: Instant::now(),
                 is_headless: false,
+                output_tail: None,
             },
         ),
     ])));

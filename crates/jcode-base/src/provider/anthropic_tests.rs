@@ -69,7 +69,8 @@ async fn test_available_models() {
     let provider = AnthropicProvider::new();
     let models = provider.available_models();
     assert!(models.contains(&"claude-opus-4-8"));
-    assert!(models.contains(&"claude-opus-4-8[1m]"));
+    // Opus 4.8 is native-1M, so there is no redundant `[1m]` alias.
+    assert!(!models.contains(&"claude-opus-4-8[1m]"));
     assert!(models.contains(&"claude-opus-4-6"));
     assert!(models.contains(&"claude-opus-4-6[1m]"));
     assert!(models.contains(&"claude-sonnet-4-6"));
@@ -128,6 +129,130 @@ fn test_anthropic_reasoning_effort_request_parts() {
 }
 
 #[test]
+fn test_anthropic_show_thinking_enables_adaptive_thinking_without_effort() {
+    // With no explicit reasoning effort, an adaptive-thinking model should still
+    // request summarized thinking when the user has opted into the display.
+    // Crucially, `output_config` must stay None so we do not force a stronger
+    // (more expensive) reasoning level than the model's default.
+    //
+    // We use a non-Opus model here because Opus now carries an implicit `xhigh`
+    // default (see `test_anthropic_opus_defaults_to_xhigh_effort`); Sonnet keeps
+    // the model's own default so this invariant stays meaningful.
+    //
+    // `build_reasoning_request_parts_inner` takes the model directly, so we do
+    // not depend on `set_model` accepting a particular catalog entry. With no
+    // effort configured, `self.reasoning_effort()` resolves to None regardless
+    // of the default model.
+    let provider = AnthropicProvider::new();
+    // Make the test independent of the ambient config's anthropic_reasoning_effort
+    // by clearing the field directly; we only exercise the show_thinking path.
+    *provider.reasoning_effort.write().unwrap() = None;
+
+    // show_thinking = false: nothing requested.
+    let (thinking, output_config, _temp) =
+        provider.build_reasoning_request_parts_inner("claude-sonnet-4-6", true, false);
+    assert!(
+        thinking.is_none(),
+        "no thinking should be requested when both effort and show_thinking are off"
+    );
+    assert!(output_config.is_none());
+
+    // show_thinking = true: adaptive thinking requested, no output_config.
+    let (thinking, output_config, temperature) =
+        provider.build_reasoning_request_parts_inner("claude-sonnet-4-6", true, true);
+    match thinking.expect("show_thinking should enable adaptive thinking") {
+        ApiThinking::Adaptive { display } => assert_eq!(display, Some("summarized")),
+        ApiThinking::Enabled { .. } => panic!("Sonnet 4.6 should use adaptive thinking"),
+    }
+    assert!(
+        output_config.is_none(),
+        "show_thinking alone must not force an output reasoning effort"
+    );
+    assert_eq!(
+        temperature, None,
+        "thinking requests must omit OAuth temperature"
+    );
+}
+
+#[test]
+fn test_anthropic_opus_defaults_to_xhigh_effort() {
+    // Opus is a reasoning-heavy flagship, so when the user has *not* configured
+    // an explicit effort it should default to its strongest supported level
+    // (`xhigh` on Opus 4.7/4.8). This drives both the request `output_config`
+    // and the surfaced `reasoning_effort()` status.
+    let provider = AnthropicProvider::new();
+    // Clear any ambient config-provided effort so we exercise the model default.
+    *provider.reasoning_effort.write().unwrap() = None;
+
+    assert_eq!(
+        AnthropicProvider::default_reasoning_effort_for_model("claude-opus-4-8").as_deref(),
+        Some("xhigh"),
+    );
+    assert_eq!(
+        AnthropicProvider::default_reasoning_effort_for_model("claude-opus-4-7").as_deref(),
+        Some("xhigh"),
+    );
+    // Older Opus does not support xhigh, so it clamps to high.
+    assert_eq!(
+        AnthropicProvider::default_reasoning_effort_for_model("claude-opus-4-5").as_deref(),
+        Some("high"),
+    );
+    // Non-Opus models keep the model's own default (no forced effort).
+    assert_eq!(
+        AnthropicProvider::default_reasoning_effort_for_model("claude-sonnet-4-6"),
+        None,
+    );
+
+    // Even without show_thinking, Opus forces its strongest output effort.
+    let (thinking, output_config, _temp) =
+        provider.build_reasoning_request_parts_inner("claude-opus-4-8", true, false);
+    assert_eq!(
+        output_config
+            .expect("Opus should default to a forced output effort")
+            .effort,
+        "xhigh",
+    );
+    match thinking.expect("Opus default effort should enable adaptive thinking") {
+        ApiThinking::Adaptive { display } => assert_eq!(display, Some("summarized")),
+        ApiThinking::Enabled { .. } => panic!("Opus 4.8 should use adaptive thinking"),
+    }
+
+    // The surfaced status mirrors the effective default for the active model.
+    *provider
+        .model
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "claude-opus-4-8".to_string();
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("xhigh"));
+
+    // An explicit user override still wins over the Opus default.
+    provider.set_reasoning_effort("low").unwrap();
+    assert_eq!(provider.reasoning_effort().as_deref(), Some("low"));
+}
+
+#[test]
+fn test_anthropic_show_thinking_enables_manual_thinking_without_effort() {
+    // Manual-thinking models (e.g. Claude 3.7 Sonnet) need a concrete budget;
+    // with only the display toggle on we fall back to the minimal budget. We use
+    // a non-Opus model here because Opus now carries an implicit strongest-effort
+    // default (see `test_anthropic_opus_defaults_to_xhigh_effort`). The model is
+    // passed directly so this does not depend on `set_model` validation.
+    let provider = AnthropicProvider::new();
+    // Independent of ambient config: clear any configured effort.
+    *provider.reasoning_effort.write().unwrap() = None;
+
+    let (thinking, _output_config, _temp) =
+        provider.build_reasoning_request_parts_inner("claude-3-7-sonnet", false, false);
+    assert!(thinking.is_none());
+
+    let (thinking, _output_config, _temperature) =
+        provider.build_reasoning_request_parts_inner("claude-3-7-sonnet", false, true);
+    match thinking.expect("show_thinking should enable manual thinking") {
+        ApiThinking::Enabled { budget_tokens } => assert_eq!(budget_tokens, 1_024),
+        ApiThinking::Adaptive { .. } => panic!("Claude 3.7 Sonnet should use manual thinking"),
+    }
+}
+
+#[test]
 fn test_anthropic_max_alias_uses_strongest_real_effort() {
     assert_eq!(
         AnthropicProvider::actual_effort_for_model("claude-sonnet-4-6", "max"),
@@ -182,7 +307,9 @@ fn test_anthropic_fast_mode_is_limited_to_opus_48() {
     assert!(provider.set_service_tier("priority").is_err());
     assert_eq!(provider.service_tier(), None);
 
+    // A stale `[1m]` alias for a native-1M model is migrated to canonical form.
     provider.set_model("claude-opus-4-8[1m]").unwrap();
+    assert_eq!(provider.model(), "claude-opus-4-8");
     provider.set_service_tier("priority").unwrap();
     assert_eq!(provider.service_tier().as_deref(), Some("priority"));
 
@@ -193,7 +320,12 @@ fn test_anthropic_fast_mode_is_limited_to_opus_48() {
 #[test]
 fn test_anthropic_manual_thinking_budget_for_opus_45() {
     let provider = AnthropicProvider::new();
-    provider.set_model("claude-opus-4-5").unwrap();
+    // Keep this request-builder test independent of the live/persisted Anthropic
+    // model catalog, which may legitimately omit older Opus 4.5 models.
+    *provider
+        .model
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = "claude-opus-4-5".to_string();
     provider.set_reasoning_effort("high").unwrap();
 
     let (thinking, output_config, temperature) =
@@ -208,14 +340,60 @@ fn test_anthropic_manual_thinking_budget_for_opus_45() {
 }
 
 #[test]
-fn test_anthropic_thinking_sse_events() {
-    let mut current_tool_use = None;
-    let mut current_thinking_block = false;
-    let mut input_tokens = None;
-    let mut output_tokens = None;
-    let mut cache_read_input_tokens = None;
-    let mut cache_creation_input_tokens = None;
+fn message_start_warns_when_server_substitutes_a_different_model() {
+    // Anthropic can silently alias an unavailable model id to a different model
+    // (observed: claude-fable-5 -> claude-haiku-4-5). When the served model
+    // differs from the requested base id, we must surface a StatusDetail warning
+    // so the user is not misled about which model answered.
+    let mut state = SseStreamState {
+        requested_model_base: "claude-fable-5".to_string(),
+        ..SseStreamState::default()
+    };
+    let event = SseEvent {
+        event_type: "message_start".to_string(),
+        data: serde_json::json!({
+            "type": "message_start",
+            "message": {"model": "claude-haiku-4-5-20251001", "usage": {"input_tokens": 1}}
+        })
+        .to_string(),
+    };
+    let events = process_sse_event(&event, &mut state, true);
+    let warned = events.iter().any(|e| {
+        matches!(e, StreamEvent::StatusDetail { detail }
+            if detail.contains("claude-haiku-4-5") && detail.contains("claude-fable-5"))
+    });
+    assert!(
+        warned,
+        "expected a substitution StatusDetail, got {events:?}"
+    );
+    assert!(state.warned_model_substitution);
 
+    // A matching served model must NOT warn.
+    let mut state = SseStreamState {
+        requested_model_base: "claude-opus-4-8".to_string(),
+        ..SseStreamState::default()
+    };
+    let event = SseEvent {
+        event_type: "message_start".to_string(),
+        data: serde_json::json!({
+            "type": "message_start",
+            "message": {"model": "claude-opus-4-8", "usage": {"input_tokens": 1}}
+        })
+        .to_string(),
+    };
+    let events = process_sse_event(&event, &mut state, true);
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::StatusDetail { .. })),
+        "served model matched request; must not warn"
+    );
+    assert!(!state.warned_model_substitution);
+}
+
+#[test]
+fn test_anthropic_thinking_sse_events() {
+    let mut state = SseStreamState::default();
     let start = SseEvent {
         event_type: "content_block_start".to_string(),
         data: serde_json::json!({
@@ -225,18 +403,9 @@ fn test_anthropic_thinking_sse_events() {
         })
         .to_string(),
     };
-    let events = process_sse_event(
-        &start,
-        &mut current_tool_use,
-        &mut current_thinking_block,
-        &mut input_tokens,
-        &mut output_tokens,
-        &mut cache_read_input_tokens,
-        &mut cache_creation_input_tokens,
-        false,
-    );
+    let events = process_sse_event(&start, &mut state, false);
     assert!(matches!(events.as_slice(), [StreamEvent::ThinkingStart]));
-    assert!(current_thinking_block);
+    assert!(state.current_thinking_block);
 
     let delta = SseEvent {
         event_type: "content_block_delta".to_string(),
@@ -247,16 +416,7 @@ fn test_anthropic_thinking_sse_events() {
         })
         .to_string(),
     };
-    let events = process_sse_event(
-        &delta,
-        &mut current_tool_use,
-        &mut current_thinking_block,
-        &mut input_tokens,
-        &mut output_tokens,
-        &mut cache_read_input_tokens,
-        &mut cache_creation_input_tokens,
-        false,
-    );
+    let events = process_sse_event(&delta, &mut state, false);
     assert!(
         matches!(events.as_slice(), [StreamEvent::ThinkingDelta(text)] if text == "reasoning text")
     );
@@ -270,16 +430,7 @@ fn test_anthropic_thinking_sse_events() {
         })
         .to_string(),
     };
-    let events = process_sse_event(
-        &signature,
-        &mut current_tool_use,
-        &mut current_thinking_block,
-        &mut input_tokens,
-        &mut output_tokens,
-        &mut cache_read_input_tokens,
-        &mut cache_creation_input_tokens,
-        false,
-    );
+    let events = process_sse_event(&signature, &mut state, false);
     assert!(
         matches!(events.as_slice(), [StreamEvent::ThinkingSignatureDelta(sig)] if sig == "signed")
     );
@@ -288,18 +439,9 @@ fn test_anthropic_thinking_sse_events() {
         event_type: "content_block_stop".to_string(),
         data: serde_json::json!({"type": "content_block_stop", "index": 0}).to_string(),
     };
-    let events = process_sse_event(
-        &stop,
-        &mut current_tool_use,
-        &mut current_thinking_block,
-        &mut input_tokens,
-        &mut output_tokens,
-        &mut cache_read_input_tokens,
-        &mut cache_creation_input_tokens,
-        false,
-    );
+    let events = process_sse_event(&stop, &mut state, false);
     assert!(matches!(events.as_slice(), [StreamEvent::ThinkingEnd]));
-    assert!(!current_thinking_block);
+    assert!(!state.current_thinking_block);
 }
 
 #[test]
@@ -354,7 +496,14 @@ async fn live_anthropic_reasoning_smoke() -> Result<()> {
 
     let provider = AnthropicProvider::new();
     provider.set_model(&model)?;
-    provider.set_reasoning_effort(&effort)?;
+    // Some models (e.g. Fable 5) legitimately reject any reasoning effort. Treat
+    // that as "use the model default" so the live call still exercises the model
+    // rather than aborting the smoke test before any request is sent.
+    if let Err(err) = provider.set_reasoning_effort(&effort) {
+        eprintln!(
+            "model {model} does not support reasoning effort '{effort}' ({err}); using model default"
+        );
+    }
 
     let messages = vec![Message {
         role: Role::User,
@@ -412,11 +561,13 @@ async fn test_dangling_tool_use_repair() {
                     id: "tool_123".to_string(),
                     name: "bash".to_string(),
                     input: serde_json::json!({"command": "ls"}),
+                    thought_signature: None,
                 },
                 ContentBlock::ToolUse {
                     id: "tool_456".to_string(),
                     name: "read".to_string(),
                     input: serde_json::json!({"file_path": "/tmp/test"}),
+                    thought_signature: None,
                 },
             ],
             timestamp: None,
@@ -482,6 +633,7 @@ async fn test_no_repair_when_tool_results_present() {
                 id: "tool_123".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
+                thought_signature: None,
             }],
             timestamp: None,
             tool_duration_ms: None,
@@ -513,6 +665,124 @@ async fn test_no_repair_when_tool_results_present() {
     } else {
         panic!("Expected ToolResult block");
     }
+}
+
+#[tokio::test]
+async fn test_parallel_image_tool_results_stay_contiguous() {
+    // Regression for Anthropic 400: "`tool_use` ids were found without `tool_result`
+    // blocks immediately after". When the assistant issues several parallel `read`
+    // calls that return images, each tool result is stored as its own user message in
+    // the form [tool_result, image, "[Attached image ...]" text]. After merging the
+    // consecutive user messages, the sibling label text blocks were wedged between the
+    // tool_results, which Anthropic rejects. The label must be folded into the
+    // tool_result content so every tool_result stays contiguous.
+    let provider = AnthropicProvider::new();
+
+    let make_image_result = |id: &str, label: &str| Message {
+        role: Role::User,
+        content: vec![
+            ContentBlock::ToolResult {
+                tool_use_id: id.to_string(),
+                content: format!("Image: {label}"),
+                is_error: None,
+            },
+            ContentBlock::Image {
+                media_type: "image/png".to_string(),
+                data: "AAAA".to_string(),
+            },
+            ContentBlock::Text {
+                text: format!(
+                    "[Attached image associated with the preceding tool result: {label}]"
+                ),
+                cache_control: None,
+            },
+        ],
+        timestamp: None,
+        tool_duration_ms: None,
+    };
+
+    let messages = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::ToolUse {
+                    id: "tool_a".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"file_path": "a.png"}),
+                    thought_signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "tool_b".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"file_path": "b.png"}),
+                    thought_signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "tool_c".to_string(),
+                    name: "read".to_string(),
+                    input: serde_json::json!({"file_path": "c.png"}),
+                    thought_signature: None,
+                },
+            ],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        make_image_result("tool_a", "a.png"),
+        make_image_result("tool_b", "b.png"),
+        make_image_result("tool_c", "c.png"),
+    ];
+
+    let formatted = provider.format_messages(&messages, false);
+
+    // assistant message + merged user tool_result message
+    assert_eq!(formatted.len(), 2);
+    let user_msg = &formatted[1];
+    assert_eq!(user_msg.role, "user");
+
+    // Every block in the user message must be a tool_result (no sibling text blocks
+    // wedged between them), and all three tool_use ids must be present.
+    let mut seen = std::collections::HashSet::new();
+    for block in &user_msg.content {
+        match block {
+            ApiContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => {
+                seen.insert(tool_use_id.clone());
+                // Each image tool_result should carry its image and folded label text.
+                match content {
+                    ToolResultContent::Blocks(blocks) => {
+                        assert!(
+                            blocks
+                                .iter()
+                                .any(|b| matches!(b, ToolResultContentBlock::Image { .. })),
+                            "image tool_result should contain an image block"
+                        );
+                        assert!(
+                            blocks.iter().any(|b| matches!(
+                                b,
+                                ToolResultContentBlock::Text { text }
+                                    if text.contains("[Attached image associated")
+                            )),
+                            "label text should be folded into the tool_result content"
+                        );
+                    }
+                    ToolResultContent::Text(_) => {
+                        panic!("image tool_result should use block content")
+                    }
+                }
+            }
+            _ => panic!("expected only tool_result blocks in the user message"),
+        }
+    }
+    assert_eq!(
+        seen,
+        ["tool_a", "tool_b", "tool_c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<std::collections::HashSet<_>>()
+    );
 }
 
 #[test]
@@ -986,6 +1256,7 @@ async fn test_sanitize_tool_ids_with_dots() {
                 id: "chatcmpl-BF2xX.tool_call.0".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "ls"}),
+                thought_signature: None,
             }],
             timestamp: None,
             tool_duration_ms: None,
@@ -1040,6 +1311,7 @@ async fn test_sanitize_dangling_tool_ids_with_dots() {
                 id: "call.with.dots".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "crash"}),
+                thought_signature: None,
             }],
             timestamp: None,
             tool_duration_ms: None,
@@ -1092,4 +1364,183 @@ fn credential_mode_runtime_provider_identity_round_trips() {
         Some(value) => crate::env::set_var("JCODE_RUNTIME_PROVIDER", value),
         None => crate::env::remove_var("JCODE_RUNTIME_PROVIDER"),
     }
+}
+
+#[test]
+fn test_anthropic_fable_5_sends_no_reasoning_fields() {
+    // REGRESSION: `claude-fable-5` is listed with effort levels in
+    // `GET /v1/models`, but the live Messages API rejects BOTH an adaptive
+    // `thinking` block ("adaptive thinking is not supported on this model") and
+    // an `output_config` effort ("This model does not support the effort
+    // parameter."). It is effectively a non-reasoning model, so the request
+    // builder must send neither field, even with an explicit effort and the
+    // display toggle on.
+    let provider = AnthropicProvider::new();
+    *provider.reasoning_effort.write().unwrap() = Some("high".to_string());
+
+    // Explicit effort: no thinking, no output_config; OAuth temperature restored.
+    let (thinking, output_config, temperature) =
+        provider.build_reasoning_request_parts_inner("claude-fable-5", true, false);
+    assert!(
+        thinking.is_none(),
+        "Fable 5 must not send an adaptive thinking block (API rejects it with 400)"
+    );
+    assert!(
+        output_config.is_none(),
+        "Fable 5 must not send an output_config effort (API rejects it with 400)"
+    );
+    assert_eq!(temperature, Some(1.0));
+
+    // Even with show_thinking on, no reasoning fields are requested.
+    let (thinking, output_config, _temp) =
+        provider.build_reasoning_request_parts_inner("claude-fable-5", true, true);
+    assert!(thinking.is_none() && output_config.is_none());
+
+    // The effort picker also surfaces no levels for Fable 5.
+    assert!(!AnthropicProvider::model_supports_reasoning_effort(
+        "claude-fable-5"
+    ));
+}
+
+#[test]
+fn detects_anthropic_reasoning_unsupported_errors() {
+    // The real 400 bodies returned when Fable 5 is sent reasoning fields.
+    let thinking_400 = "anthropic api error (400 bad request): {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"adaptive thinking is not supported on this model\"}}";
+    assert!(is_reasoning_unsupported_error(thinking_400));
+    let effort_400 = "anthropic api error (400 bad request): {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"this model does not support the effort parameter.\"}}";
+    assert!(is_reasoning_unsupported_error(effort_400));
+
+    // Unrelated 400s must not trigger the reasoning self-heal path.
+    assert!(!is_reasoning_unsupported_error(
+        "anthropic api error (400 bad request): {\"type\":\"invalid_request_error\",\"message\":\"max_tokens too large\"}"
+    ));
+    // A thinking-mentioning error that is not a 400 must not match either.
+    assert!(!is_reasoning_unsupported_error(
+        "anthropic api error (429 too many requests): rate_limit on thinking budget"
+    ));
+    // Model-not-found is a different recovery path.
+    assert!(!is_reasoning_unsupported_error(
+        "anthropic api error (404 not found): {\"type\":\"not_found_error\",\"message\":\"model not found\"}"
+    ));
+}
+
+#[test]
+fn detects_anthropic_model_not_found_errors() {
+    // The real 404 body returned when a model id was retired (e.g. Fable 5).
+    let real = "anthropic api error (404 not found): {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"claude fable 5 is not available. please use opus 4.8.\"}}";
+    assert!(is_model_not_found_error(real));
+
+    // Structural marker alone (lowercased error chain).
+    assert!(is_model_not_found_error(
+        "model claude-foo not found (not_found_error)"
+    ));
+
+    // Unrelated failures must not trigger the model fallback path.
+    assert!(!is_model_not_found_error(
+        "anthropic api error (401 unauthorized): invalid authentication credentials"
+    ));
+    assert!(!is_model_not_found_error(
+        "anthropic api error (429 too many requests): rate_limit"
+    ));
+    assert!(!is_model_not_found_error(
+        "anthropic api error (404 not found): resource missing"
+    ));
+}
+
+#[test]
+fn anthropic_fallback_prefers_best_available_and_skips_tried_and_retired() {
+    let known = crate::provider::known_anthropic_model_ids();
+    assert!(
+        !known.is_empty(),
+        "expected a non-empty Anthropic model catalog"
+    );
+
+    // With nothing tried, the fallback offers the highest-quality (flagship)
+    // model, NOT merely the first catalog entry. The curated order ranks Opus
+    // ahead of Haiku, so the chosen model must not be a Haiku/retired tier when
+    // a stronger one exists.
+    let first = anthropic_fallback_model(&[], "").expect("a fallback should exist");
+    let first_key = AnthropicProvider::normalized_model_key(&first);
+    assert!(
+        !first_key.contains("haiku"),
+        "fallback must not downgrade to Haiku when a flagship is available, got {first}"
+    );
+    assert!(
+        !anthropic_model_is_retired(&first),
+        "fallback must never pick a retired model, got {first}"
+    );
+
+    // A retired model in `tried` must never be re-offered, and the result must
+    // skip retired families entirely.
+    let next = anthropic_fallback_model(&["claude-fable-5".to_string()], "")
+        .expect("another fallback should exist");
+    assert!(!anthropic_model_is_retired(&next));
+
+    // Exhausting every viable known model yields None.
+    let exhausted = anthropic_fallback_model(&known, "");
+    assert!(
+        exhausted.is_none(),
+        "no fallback should remain once all known models are tried, got {exhausted:?}"
+    );
+}
+
+#[test]
+fn anthropic_fallback_honors_server_recommendation() {
+    // The real 404 body recommends a specific replacement model. We must honor
+    // it over the generic quality ranking.
+    let body = "anthropic api error (404 not found): {\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"claude fable 5 is not available. please use opus 4.8. learn more: https://anthropic.com\"}}";
+    let recommended =
+        anthropic_recommended_model_from_error(body).expect("should parse a recommendation");
+    assert_eq!(
+        AnthropicProvider::normalized_model_key(&recommended),
+        "claude-opus-4-8",
+        "server recommendation 'Opus 4.8' should map to claude-opus-4-8"
+    );
+
+    // The full fallback also returns the recommended model.
+    let fallback = anthropic_fallback_model(&["claude-fable-5".to_string()], body)
+        .expect("a fallback should exist");
+    assert_eq!(
+        AnthropicProvider::normalized_model_key(&fallback),
+        "claude-opus-4-8"
+    );
+
+    // A recommendation pointing at a retired model is ignored (falls through to
+    // quality ranking).
+    let retired_rec = "model x not available. please use fable 5.";
+    assert!(
+        anthropic_recommended_model_from_error(retired_rec).is_none()
+            || !anthropic_model_is_retired(
+                &anthropic_recommended_model_from_error(retired_rec).unwrap()
+            )
+    );
+
+    // No recommendation phrase -> None.
+    assert!(anthropic_recommended_model_from_error("429 too many requests").is_none());
+}
+
+#[test]
+fn anthropic_quality_rank_orders_opus_before_haiku_and_retired_last() {
+    let opus = anthropic_model_quality_rank("claude-opus-4-8");
+    let sonnet = anthropic_model_quality_rank("claude-sonnet-4-6");
+    let haiku = anthropic_model_quality_rank("claude-haiku-4-5");
+    let retired = anthropic_model_quality_rank("claude-fable-5");
+    assert!(
+        opus < sonnet,
+        "Opus should outrank Sonnet ({opus} vs {sonnet})"
+    );
+    assert!(
+        sonnet < haiku,
+        "Sonnet should outrank Haiku ({sonnet} vs {haiku})"
+    );
+    assert!(
+        haiku < retired,
+        "retired models must sort last ({haiku} vs {retired})"
+    );
+    assert_eq!(retired, usize::MAX);
+    // Dated live ids must rank like their canonical base.
+    assert_eq!(
+        anthropic_model_quality_rank("claude-haiku-4-5-20251001"),
+        haiku
+    );
 }

@@ -93,6 +93,87 @@ fn test_child_process_tree_detection() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn test_grandchild_process_tree_detection() {
+    // Wrapper chain: an outer bash spawns an inner `bash -c cat`, so the actual
+    // stdin reader (`cat`) is a GRANDCHILD of the tracked pid. The intermediate
+    // bash is not itself reading stdin, so detection requires recursing past
+    // direct children (issue #373). A trailing `; true` keeps each bash from
+    // exec-optimizing itself away so the nesting (outer bash -> inner bash ->
+    // cat) is preserved.
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg("bash -c 'cat; true'; true")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("failed to spawn bash");
+
+    let pid = child.id();
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    let state = linux::check_process_tree(pid);
+
+    child.kill().ok();
+    child.wait().ok();
+
+    assert_eq!(
+        state,
+        StdinState::Reading,
+        "grandchild cat should be detected via recursive process-tree walk"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn test_direct_children_lists_immediate_children() {
+    // Spawn a parent shell that itself spawns a long-lived child (`sleep`).
+    // `direct_children` should report the immediate child PID(s) without
+    // scanning all of /proc.
+    // Use a compound command so bash does NOT exec-optimize itself away and
+    // actually stays alive as the parent of a `sleep` child.
+    let mut child = Command::new("bash")
+        .arg("-c")
+        .arg("sleep 5; true")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("failed to spawn bash");
+
+    let pid = child.id();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    let kids = linux::direct_children(pid);
+
+    // Verify parentage BEFORE killing the parent, otherwise the child
+    // reparents to init (ppid 1) and the check races.
+    let mut all_parented_by_pid = !kids.is_empty();
+    for kid in &kids {
+        let status =
+            std::fs::read_to_string(format!("/proc/{}/status", kid)).unwrap_or_default();
+        let ppid = status
+            .lines()
+            .find_map(|l| l.strip_prefix("PPid:\t"))
+            .and_then(|v| v.trim().parse::<u32>().ok());
+        if ppid != Some(pid) {
+            all_parented_by_pid = false;
+        }
+    }
+
+    child.kill().ok();
+    child.wait().ok();
+
+    assert!(
+        !kids.is_empty(),
+        "bash should have at least one direct child (the sleep)"
+    );
+    assert!(
+        all_parented_by_pid,
+        "every reported child should be parented by {pid}; got {kids:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn test_process_that_reads_then_exits() {
     use std::io::Write;
 

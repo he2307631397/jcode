@@ -2,13 +2,39 @@ use super::{
     BackgroundInfo, CacheHitInfo, CacheMissAttribution, GraphEdge, GraphNode, InfoWidgetData,
     Margins, MemoryActivity, MemoryEvent, MemoryEventKind, MemoryInfo, MemoryState, PipelineState,
     StepStatus, SwarmInfo, UsageInfo, UsageProvider, WidgetKind, calculate_placements,
-    occasional_status_tip, render_kv_cache_widget, render_memory_compact, render_memory_widget,
-    render_model_widget, render_todos_compact, render_todos_expanded, render_todos_widget,
-    render_usage_compact, render_usage_widget, truncate_smart,
+    effective_prompt_tokens, occasional_status_tip, render_kv_cache_widget, render_memory_compact,
+    render_memory_widget, render_model_widget, render_todos_compact, render_todos_expanded,
+    render_todos_widget, render_usage_compact, render_usage_widget, truncate_smart,
 };
 use crate::protocol::SwarmMemberStatus;
 use ratatui::layout::Rect;
 use std::time::{Duration, Instant};
+
+#[test]
+fn effective_prompt_tokens_handles_split_and_subset_accounting() {
+    // Anthropic-style split accounting: `input` is only the uncached remainder,
+    // so cache_read pushed beyond input means the true prompt is the sum.
+    assert_eq!(effective_prompt_tokens(2449, 19499, 684), 22632);
+    // OpenAI-style subset accounting: cached tokens are inside `input`.
+    assert_eq!(effective_prompt_tokens(10000, 6000, 0), 10000);
+    // No cache telemetry at all behaves like a plain input count.
+    assert_eq!(effective_prompt_tokens(5000, 0, 0), 5000);
+}
+
+#[test]
+fn cache_hit_ratio_uses_effective_prompt_for_split_providers() {
+    // Mirrors a real Anthropic log line where read >> input and the old code
+    // clamped the ratio to 100%.
+    let cache = CacheHitInfo {
+        reported_input_tokens: 2449,
+        read_tokens: 19499,
+        creation_tokens: 684,
+        ..Default::default()
+    };
+    // 19499 / (2449 + 19499 + 684) = 0.8616...
+    let ratio = cache.hit_ratio().expect("ratio");
+    assert!((ratio - 0.8616).abs() < 0.01, "ratio was {ratio}");
+}
 
 #[test]
 fn truncate_smart_handles_unicode() {
@@ -37,6 +63,7 @@ fn kv_cache_widget_shows_session_hit_ratio() {
             optimal_input_tokens: 16_667,
             last_reported_input_tokens: Some(10_000),
             last_read_tokens: Some(9_400),
+            last_creation_tokens: Some(0),
             last_optimal_input_tokens: Some(9_895),
             miss_attributions: vec![CacheMissAttribution {
                 turn_number: 20,
@@ -54,12 +81,12 @@ fn kv_cache_widget_shows_session_hit_ratio() {
 
     assert_eq!(lines.len(), 4);
     assert!(text.contains("KV cache:"));
-    assert!(text.contains("warm "));
+    assert!(text.contains("yield "));
     assert!(text.contains("90%"));
     assert!(text.contains("last "));
     assert!(text.contains("94%"));
-    assert!(text.contains("all "));
-    assert!(text.contains("75%"));
+    assert!(text.contains("session "));
+    assert!(text.contains("39%"));
     assert!(text.contains("miss attribution"));
     assert!(text.contains("69k missed total"));
     assert!(text.contains("20>"));
@@ -72,6 +99,7 @@ fn todos_widgets_show_item_and_aggregate_confidence() {
     let data = InfoWidgetData {
         todos: vec![
             crate::todo::TodoItem {
+                group: None,
                 id: "todo-1".to_string(),
                 content: "Validate confidence UI".to_string(),
                 status: "in_progress".to_string(),
@@ -82,6 +110,7 @@ fn todos_widgets_show_item_and_aggregate_confidence() {
                 assigned_to: None,
             },
             crate::todo::TodoItem {
+                group: None,
                 id: "todo-2".to_string(),
                 content: "Ship completed item".to_string(),
                 status: "completed".to_string(),
@@ -107,6 +136,111 @@ fn todos_widgets_show_item_and_aggregate_confidence() {
 
     let compact_text = lines_text(&render_todos_compact(&data, Rect::new(0, 0, 80, 2)));
     assert!(compact_text.contains("86%"));
+}
+
+#[test]
+fn todos_widgets_render_group_headers_when_groups_present() {
+    let mk = |group: Option<&str>, id: &str, status: &str| crate::todo::TodoItem {
+        group: group.map(|g| g.to_string()),
+        id: id.to_string(),
+        content: format!("task {id}"),
+        status: status.to_string(),
+        priority: "medium".to_string(),
+        confidence: Some(80),
+        completion_confidence: None,
+        blocked_by: Vec::new(),
+        assigned_to: None,
+    };
+    let data = InfoWidgetData {
+        todos: vec![
+            mk(Some("optimize rendering"), "a", "completed"),
+            mk(Some("optimize rendering"), "b", "in_progress"),
+            mk(Some("fix scrollback"), "c", "pending"),
+            mk(None, "d", "pending"),
+        ],
+        ..Default::default()
+    };
+
+    let expanded = lines_text(&render_todos_expanded(&data, Rect::new(0, 0, 80, 14)));
+    // Group headers appear with per-group progress counters, first-seen order,
+    // and the ungrouped bucket renders under "Other".
+    assert!(expanded.contains("optimize rendering"), "{expanded}");
+    assert!(expanded.contains("1/2"), "{expanded}");
+    assert!(expanded.contains("fix scrollback"), "{expanded}");
+    assert!(expanded.contains("Other"), "{expanded}");
+    let opt_idx = expanded.find("optimize rendering").unwrap();
+    let fix_idx = expanded.find("fix scrollback").unwrap();
+    let other_idx = expanded.find("Other").unwrap();
+    assert!(opt_idx < fix_idx, "first-seen group order: {expanded}");
+    assert!(fix_idx < other_idx, "ungrouped bucket last: {expanded}");
+}
+
+#[test]
+fn todos_widgets_stay_flat_without_groups() {
+    let mk = |id: &str, status: &str| crate::todo::TodoItem {
+        group: None,
+        id: id.to_string(),
+        content: format!("task {id}"),
+        status: status.to_string(),
+        priority: "medium".to_string(),
+        confidence: Some(80),
+        completion_confidence: None,
+        blocked_by: Vec::new(),
+        assigned_to: None,
+    };
+    let data = InfoWidgetData {
+        todos: vec![mk("a", "completed"), mk("b", "pending")],
+        ..Default::default()
+    };
+    let expanded = lines_text(&render_todos_expanded(&data, Rect::new(0, 0, 80, 14)));
+    assert!(!expanded.contains("Other"), "no group bucket: {expanded}");
+}
+
+#[test]
+fn todos_widget_renders_exact_pips_for_small_lists() {
+    let mk = |status: &str| crate::todo::TodoItem {
+        group: None,
+        id: status.to_string(),
+        content: format!("item {status}"),
+        status: status.to_string(),
+        priority: "medium".to_string(),
+        confidence: Some(80),
+        completion_confidence: None,
+        blocked_by: Vec::new(),
+        assigned_to: None,
+    };
+    let data = InfoWidgetData {
+        todos: vec![
+            mk("completed"),
+            mk("completed"),
+            mk("in_progress"),
+            mk("pending"),
+        ],
+        ..Default::default()
+    };
+
+    let lines = render_todos_widget(&data, Rect::new(0, 0, 80, 8));
+    let header = lines_text(&lines[..1]);
+    // Exact 1:1 pips on the header: 2 done + 1 active render as filled ●,
+    // 1 open renders as hollow ○. (Active is full amber, not half.)
+    assert_eq!(
+        header.matches('●').count(),
+        3,
+        "expected 3 filled pips: {header}"
+    );
+    assert_eq!(
+        header.matches('○').count(),
+        1,
+        "expected 1 open pip: {header}"
+    );
+    assert!(
+        !header.contains('◐'),
+        "active pip should be full, not half: {header}"
+    );
+    // The old block bar should be gone everywhere.
+    let all = lines_text(&lines);
+    assert!(!all.contains('█'), "old block bar should be gone: {all}");
+    assert!(!all.contains('░'), "old empty bar should be gone: {all}");
 }
 
 #[test]
@@ -165,7 +299,7 @@ fn lines_text(lines: &[ratatui::text::Line<'_>]) -> String {
 }
 
 #[test]
-fn memory_widget_shows_sidecar_model_when_idle() {
+fn memory_widget_hides_sidecar_model_when_idle() {
     let info = MemoryInfo {
         total_count: 3,
         project_count: 2,
@@ -188,11 +322,9 @@ fn memory_widget_shows_sidecar_model_when_idle() {
         .to_lowercase();
 
     assert!(text.contains("memory"));
-    assert!(text.contains("model:"));
-    assert!(text.contains("openai"));
-    assert!(text.contains("gpt-5.3"));
-    assert!(!text.contains("3 total"));
-    assert!(!text.contains("2p/1g"));
+    assert!(!text.contains("model:"));
+    assert!(!text.contains("gpt-5.3"));
+    assert!(text.contains("3 memories"));
 }
 
 #[test]
@@ -258,9 +390,8 @@ fn memory_widget_renders_current_cycle_activity() {
     assert!(text.contains("update memory"));
     assert!(text.contains("now:"));
     assert!(text.contains("checking 3 candidate"));
-    assert!(text.contains("model:"));
-    assert!(text.contains("openai"));
-    assert!(text.contains("gpt-5.3"));
+    assert!(!text.contains("model:"));
+    assert!(!text.contains("gpt-5.3"));
     assert!(!text.contains("4 project"));
     assert!(!text.contains("3 global"));
 }
@@ -402,7 +533,7 @@ fn memory_widget_uses_distinct_trace_label_when_idle() {
 }
 
 #[test]
-fn memory_compact_shows_short_model_only() {
+fn memory_compact_does_not_show_model() {
     let lines = render_memory_compact(
         &MemoryInfo {
             sidecar_model: Some("openai · gpt-5.3-codex-spark".to_string()),
@@ -419,8 +550,7 @@ fn memory_compact_shows_short_model_only() {
         .join("\n")
         .to_lowercase();
 
-    assert!(text.contains("gpt-5.3"), "{text}");
-    assert!(!text.contains("openai"), "{text}");
+    assert!(!text.contains("gpt-5.3"), "{text}");
     assert!(!text.contains("codex-spark"), "{text}");
 }
 
@@ -451,6 +581,43 @@ fn memory_compact_shows_memory_count_before_status() {
     assert!(text.contains("128 memories"), "{text}");
     assert!(text.contains("idle"), "{text}");
     assert!(!text.contains("memory ·"), "{text}");
+}
+
+#[test]
+fn memory_widget_shows_disabled_badge_when_disabled() {
+    let data = InfoWidgetData {
+        memory_info: Some(MemoryInfo {
+            total_count: 12,
+            project_count: 8,
+            global_count: 4,
+            disabled: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    // Header/expanded view should render a DISABLED badge alongside the count.
+    let text = render_memory_widget(&data, Rect::new(0, 0, 40, 5))
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+
+    assert!(text.contains("disabled"), "{text}");
+    assert!(text.contains("12 memories"), "{text}");
+
+    // Compact (overview) view should also show the disabled state.
+    let compact = render_memory_compact(data.memory_info.as_ref().unwrap(), 40)
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .map(|span| span.content.as_ref())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .to_lowercase();
+
+    assert!(compact.contains("disabled"), "{compact}");
 }
 
 #[test]
@@ -572,6 +739,7 @@ fn overview_widget_is_placed_when_space_allows() {
         if let Some(state) = guard.as_mut() {
             state.enabled = true;
             state.placements.clear();
+            state.anchors.clear();
             state.widget_states.clear();
         }
     }
@@ -585,6 +753,7 @@ fn overview_widget_is_placed_when_space_allows() {
         right_widths: vec![40; 20],
         left_widths: Vec::new(),
         centered: false,
+        ..Default::default()
     };
     let placements = calculate_placements(Rect::new(0, 0, 80, 20), &margins, &data);
     assert!(
@@ -600,6 +769,7 @@ fn workspace_widget_has_high_priority_when_enabled() {
         if let Some(state) = guard.as_mut() {
             state.enabled = true;
             state.placements.clear();
+            state.anchors.clear();
             state.widget_states.clear();
         }
     }
@@ -623,6 +793,7 @@ fn workspace_widget_has_high_priority_when_enabled() {
         right_widths: vec![40; 20],
         left_widths: Vec::new(),
         centered: false,
+        ..Default::default()
     };
     let placements = calculate_placements(Rect::new(0, 0, 80, 20), &margins, &data);
     assert_eq!(
@@ -651,25 +822,21 @@ fn model_widget_renders_connection_type() {
 }
 
 #[test]
-fn usage_bar_shows_centered_numeric_label_when_space_allows() {
-    let line = super::render_usage_bar(200_000, 1_000_000, 26);
+fn usage_pill_renders_filled_and_empty_segments() {
+    let line = super::render_usage_pill(200_000, 1_000_000, 26);
     let text: String = line
         .spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect();
 
-    assert!(text.starts_with('['), "expected opening bracket: {text}");
-    assert!(text.ends_with(']'), "expected closing bracket: {text}");
-    assert!(
-        text.contains("200k/1000k"),
-        "expected inline usage label: {text}"
-    );
+    assert!(text.contains('▰'), "expected filled pill segments: {text}");
+    assert!(text.contains('▱'), "expected empty pill segments: {text}");
 }
 
 #[test]
-fn usage_bar_omits_numeric_label_when_bar_too_narrow() {
-    let line = super::render_usage_bar(200_000, 1_000_000, 10);
+fn usage_pill_renders_when_narrow() {
+    let line = super::render_usage_pill(200_000, 1_000_000, 10);
     let text: String = line
         .spans
         .iter()
@@ -677,8 +844,8 @@ fn usage_bar_omits_numeric_label_when_bar_too_narrow() {
         .collect();
 
     assert!(
-        !text.contains("200k/1000k"),
-        "narrow bar should fall back to plain fill: {text}"
+        text.contains('▰') || text.contains('▱'),
+        "narrow bar should still render pill segments: {text}"
     );
 }
 
@@ -772,6 +939,7 @@ fn swarm_widget_renders_member_roles_and_details() {
                     is_headless: None,
                     live_attachments: None,
                     status_age_secs: None,
+                    output_tail: None,
                 },
                 SwarmMemberStatus {
                     session_id: "tree-12345678".to_string(),
@@ -782,6 +950,7 @@ fn swarm_widget_renders_member_roles_and_details() {
                     is_headless: None,
                     live_attachments: None,
                     status_age_secs: None,
+                    output_tail: None,
                 },
             ],
             ..Default::default()
@@ -849,6 +1018,7 @@ fn sticky_placement_clamps_width_to_current_margin() {
         if let Some(state) = guard.as_mut() {
             state.enabled = true;
             state.placements.clear();
+            state.anchors.clear();
             state.widget_states.clear();
         }
     }
@@ -867,6 +1037,7 @@ fn sticky_placement_clamps_width_to_current_margin() {
             right_widths: vec![30; 10],
             left_widths: Vec::new(),
             centered: false,
+            ..Default::default()
         },
         &data,
     );
@@ -881,6 +1052,7 @@ fn sticky_placement_clamps_width_to_current_margin() {
             right_widths: second_margins.clone(),
             left_widths: Vec::new(),
             centered: false,
+            ..Default::default()
         },
         &data,
     );
@@ -909,6 +1081,7 @@ fn placements_never_include_border_only_widgets() {
         if let Some(state) = guard.as_mut() {
             state.enabled = true;
             state.placements.clear();
+            state.anchors.clear();
             state.widget_states.clear();
         }
     }
@@ -922,6 +1095,7 @@ fn placements_never_include_border_only_widgets() {
             ..Default::default()
         }),
         todos: vec![crate::todo::TodoItem {
+            group: None,
             content: "ship patch".to_string(),
             status: "in_progress".to_string(),
             priority: "high".to_string(),
@@ -961,6 +1135,7 @@ fn placements_never_include_border_only_widgets() {
             right_widths: vec![40; 10],
             left_widths: Vec::new(),
             centered: false,
+            ..Default::default()
         },
         &data,
     );

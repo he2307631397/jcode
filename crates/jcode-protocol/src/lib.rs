@@ -198,7 +198,7 @@ pub struct ContextEntry {
 }
 
 /// Info about an agent
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AgentInfo {
     pub session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -229,6 +229,36 @@ pub struct AgentInfo {
     /// Seconds since the last status change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_secs: Option<u64>,
+    /// Live activity (whether processing + current tool name).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionActivitySnapshot>,
+    /// Provider name (e.g. "anthropic").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_name: Option<String>,
+    /// Provider model id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_model: Option<String>,
+    /// Number of turns the agent has run this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_count: Option<u64>,
+    /// Tokens churned (total, including cache) within the recent lookback window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_total_tokens: Option<u64>,
+    /// Output tokens produced within the recent lookback window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_output_tokens: Option<u64>,
+    /// Width of the recent-token lookback window, in seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_window_secs: Option<u64>,
+    /// Cumulative total tokens observed for the session lifetime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cumulative_total_tokens: Option<u64>,
+    /// Number of completed todos for this agent's session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todos_completed: Option<usize>,
+    /// Total number of todos for this agent's session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub todos_total: Option<usize>,
 }
 
 /// Lightweight status snapshot for a swarm member.
@@ -351,6 +381,11 @@ pub struct SwarmMemberStatus {
     /// Seconds since the last status change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_age_secs: Option<u64>,
+    /// Recent streamed output tail for live inline rendering (last few lines of
+    /// the agent's in-progress assistant text). Only populated for swarm
+    /// members when inline streaming taps are active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
 }
 
 /// Status of a member being awaited by comm_await_members
@@ -387,14 +422,16 @@ impl Request {
             Request::GetHistory { id } => *id,
             Request::GetModelCatalog { id } => *id,
             Request::GetCompactedHistory { id, .. } => *id,
-            Request::Reload { id } => *id,
+            Request::Reload { id, .. } => *id,
             Request::ResumeSession { id, .. } => *id,
+            Request::ResumeAllSessions { id } => *id,
             Request::NotifySession { id, .. } => *id,
             Request::Transcript { id, .. } => *id,
             Request::InputShell { id, .. } => *id,
             Request::CycleModel { id, .. } => *id,
             Request::RefreshModels { id } => *id,
             Request::SetModel { id, .. } => *id,
+            Request::SetRoute { id, .. } => *id,
             Request::SetSubagentModel { id, .. } => *id,
             Request::RunSubagent { id, .. } => *id,
             Request::SetReasoningEffort { id, .. } => *id,
@@ -486,9 +523,47 @@ pub fn encode_event(event: &ServerEvent) -> String {
     json
 }
 
-/// Decode a request from a JSON string
+/// Decode a request from a JSON string.
+///
+/// Handles a legacy/desktop compatibility shape where a model switch was sent as
+/// `{"type":"set_route","model":"..."}` (a bare model string under the
+/// `set_route` tag). The current protocol reserves the `set_route` tag for the
+/// structured [`Request::SetRoute`] variant (which carries a `selection`
+/// object), so this older shape is normalized into [`Request::SetModel`] here
+/// instead of via a serde `alias`. Using an alias would make `SetModel` also
+/// claim the `set_route` tag and, because serde dispatches internally-tagged
+/// enums by tag rather than by fields, shadow the structured variant entirely
+/// (every real route switch would then fail with `missing field \`model\``).
 pub fn decode_request(line: &str) -> Result<Request, serde_json::Error> {
-    serde_json::from_str(line)
+    match serde_json::from_str::<Request>(line) {
+        Ok(request) => Ok(request),
+        Err(error) => {
+            if let Some(request) = decode_legacy_set_route_model(line) {
+                Ok(request)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Recognize the legacy `{"type":"set_route","id":N,"model":"..."}` shape and
+/// translate it into [`Request::SetModel`]. Returns `None` for anything else
+/// (including the current structured `set_route` payload that carries a
+/// `selection` object) so the original decode error is surfaced unchanged.
+fn decode_legacy_set_route_model(line: &str) -> Option<Request> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let obj = value.as_object()?;
+    if obj.get("type")?.as_str()? != "set_route" {
+        return None;
+    }
+    // The structured route switch carries `selection`; never reinterpret it.
+    if obj.contains_key("selection") {
+        return None;
+    }
+    let model = obj.get("model")?.as_str()?.to_string();
+    let id = obj.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+    Some(Request::SetModel { id, model })
 }
 
 #[cfg(test)]

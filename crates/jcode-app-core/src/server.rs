@@ -31,7 +31,9 @@ mod debug_swarm_write;
 mod debug_testers;
 mod durable_state;
 mod headless;
+mod jade_relay;
 mod lifecycle;
+mod live_turn;
 mod provider_control;
 mod reload;
 mod reload_recovery;
@@ -47,7 +49,8 @@ mod util;
 
 pub(super) use self::await_members_state::AwaitMembersRuntime;
 use self::background_tasks::{
-    dispatch_background_task_completion, dispatch_background_task_progress, dispatch_ui_activity,
+    dispatch_background_task_completion, dispatch_background_task_progress,
+    dispatch_swarm_output_tail, dispatch_ui_activity,
 };
 use self::debug::{ClientConnectionInfo, ClientDebugState};
 use self::debug_jobs::DebugJob;
@@ -55,11 +58,11 @@ use self::headless::create_headless_session;
 use self::reload::await_reload_signal;
 use self::runtime::ServerRuntime;
 use self::swarm::{
-    broadcast_swarm_plan, broadcast_swarm_plan_with_previous, broadcast_swarm_status,
-    record_swarm_event, record_swarm_event_for_session, refresh_swarm_task_staleness,
-    remove_plan_participant, remove_session_file_touches, remove_session_from_swarm,
-    rename_plan_participant, run_swarm_message, update_member_status,
-    update_member_status_with_report,
+    MAX_SWARM_SPAWN_DEPTH, broadcast_swarm_plan, broadcast_swarm_plan_with_previous,
+    broadcast_swarm_status, record_swarm_event, record_swarm_event_for_session,
+    refresh_swarm_task_staleness, remove_plan_participant, remove_session_from_swarm,
+    rename_plan_participant, run_swarm_message, swarm_is_self_or_ancestor, swarm_spawn_depth,
+    update_member_status, update_member_status_with_report,
 };
 use self::swarm_channels::{
     remove_session_channel_subscriptions, subscribe_session_to_channel,
@@ -321,9 +324,10 @@ pub use self::state::{
 };
 use self::state::{
     SessionInterruptQueues, fanout_live_client_event, fanout_session_event,
-    queue_soft_interrupt_for_session, register_session_event_sender,
-    register_session_interrupt_queue, remove_session_interrupt_queue,
-    rename_session_interrupt_queue, session_event_fanout_sender, unregister_session_event_sender,
+    queue_soft_interrupt_for_session, register_background_tool_signal,
+    register_session_event_sender, register_session_interrupt_queue, remove_background_tool_signal,
+    remove_session_interrupt_queue, rename_background_tool_signal, rename_session_interrupt_queue,
+    session_event_fanout_sender, unregister_session_event_sender,
 };
 pub use crate::plan::{SwarmTaskProgress, VersionedPlan};
 
@@ -346,18 +350,22 @@ pub use self::socket::spawn_server_notify;
 use self::socket::{acquire_daemon_lock, mark_close_on_exec};
 pub use self::socket::{
     cleanup_socket_pair, connect_socket, debug_socket_path, has_live_listener, is_server_ready,
-    set_socket_path, socket_path, wait_for_server_ready,
+    reap_stale_socket_if_dead, set_socket_path, socket_path, wait_for_server_ready,
 };
 use self::socket::{signal_ready_fd, socket_has_live_listener};
 
 pub use self::util::ServerIdentity;
+pub(crate) use self::util::server_has_newer_binary;
 use self::util::{
-    debug_control_allowed, embedding_idle_unload_secs, git_common_dir_for, server_has_newer_binary,
-    server_update_candidate, startup_headless_recovery_test_delay, swarm_id_for_dir,
+    debug_control_allowed, embedding_idle_unload_secs, git_common_dir_for, reload_exec_target,
+    startup_headless_recovery_test_delay, swarm_id_for_dir,
 };
 
 mod file_activity;
 use self::file_activity::file_activity_scope_label;
+
+mod file_touch_service;
+pub(crate) use self::file_touch_service::FileTouchService;
 
 #[cfg(test)]
 mod socket_tests;
@@ -400,10 +408,8 @@ pub struct Server {
     client_count: Arc<RwLock<usize>>,
     /// Connected client mapping (client_id -> session_id)
     client_connections: Arc<RwLock<HashMap<String, ClientConnectionInfo>>>,
-    /// Track file touches: path -> list of accesses
-    file_touches: Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    /// Reverse index for file touches: session_id -> touched paths
-    files_touched_by_session: Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    /// File-touch tracking service (forward path index + reverse session index)
+    file_touch: FileTouchService,
     /// Shared ownership of core swarm coordination state.
     swarm_state: SwarmState,
     /// Shared context by swarm (swarm_id -> key -> SharedContext)
@@ -443,6 +449,13 @@ pub struct Server {
 impl Server {
     pub fn new(provider: Arc<dyn Provider>) -> Self {
         use crate::id::{new_memorable_server_id, server_icon};
+
+        // Register the live provider so background helpers (the memory sidecar)
+        // can make cheap model calls on whatever provider the user is running.
+        // Without this, the sidecar only works on OpenAI/Claude OAuth and
+        // silently degrades (rerank -> hybrid order, no relevance/extraction) on
+        // Copilot, Antigravity, Gemini, Cursor, Bedrock, and OpenRouter.
+        crate::provider::set_active_provider(Arc::clone(&provider));
 
         let (event_tx, _) = broadcast::channel(1024);
         let (client_debug_response_tx, _) = broadcast::channel(64);
@@ -487,8 +500,7 @@ impl Server {
             session_id: Arc::new(RwLock::new(String::new())),
             client_count: Arc::new(RwLock::new(0)),
             client_connections: Arc::new(RwLock::new(HashMap::new())),
-            file_touches: Arc::new(RwLock::new(HashMap::new())),
-            files_touched_by_session: Arc::new(RwLock::new(HashMap::new())),
+            file_touch: FileTouchService::new(),
             swarm_state: SwarmState::new(
                 restored_swarm_members,
                 restored_swarms_by_id,
@@ -668,6 +680,7 @@ impl Server {
                 .await;
                 let mut shutdown_signals = self.shutdown_signals.write().await;
                 shutdown_signals.insert(session_id.clone(), agent_guard.graceful_shutdown_signal());
+                register_background_tool_signal(&session_id, agent_guard.background_tool_signal());
             }
 
             let stored_recovery_record = reload_recovery::peek_for_session(&session_id)
@@ -1003,8 +1016,7 @@ impl Server {
         }
 
         // Spawn the bus monitor for swarm coordination
-        let monitor_file_touches = Arc::clone(&self.file_touches);
-        let monitor_files_touched_by_session = Arc::clone(&self.files_touched_by_session);
+        let monitor_file_touch = self.file_touch.clone();
         let monitor_swarm_members = Arc::clone(&self.swarm_state.members);
         let monitor_swarms_by_id = Arc::clone(&self.swarm_state.swarms_by_id);
         let monitor_swarm_plans = Arc::clone(&self.swarm_state.plans);
@@ -1017,8 +1029,7 @@ impl Server {
         let monitor_swarm_event_tx = self.swarm_event_tx.clone();
         tokio::spawn(async move {
             Self::monitor_bus(
-                monitor_file_touches,
-                monitor_files_touched_by_session,
+                monitor_file_touch,
                 monitor_swarm_members,
                 monitor_swarms_by_id,
                 monitor_swarm_plans,
@@ -1053,6 +1064,11 @@ impl Server {
             }
         });
 
+        // Keep the machine awake while any session is actively streaming/processing.
+        // This watches the same "running" member signal Waybar surfaces as
+        // "N streaming" and toggles a best-effort OS power inhibitor accordingly.
+        Self::spawn_power_inhibitor(Arc::clone(&self.swarm_state.members));
+
         // Initialize the memory agent early so it's ready for all sessions
         if crate::config::config().features.memory {
             tokio::spawn(async {
@@ -1069,6 +1085,17 @@ impl Server {
                 ambient_handle.run_loop(ambient_provider).await;
             });
         }
+
+        // Spawn the Jade cloud relay listener independently of ambient mode. The
+        // worker is strictly opt-in and requires an explicit API base, token,
+        // session id, and reply-enabled flag before it makes any outbound calls.
+        jade_relay::spawn_if_configured(
+            &crate::config::config().safety,
+            Arc::clone(&self.sessions),
+            Arc::clone(&self.soft_interrupt_queues),
+            Arc::clone(&self.shutdown_signals),
+            Arc::clone(&self.swarm_state.members),
+        );
 
         // Spawn embedding idle monitor so the model can be unloaded when this
         // server has been quiet for a while.
@@ -1455,14 +1482,77 @@ impl Server {
         });
     }
 
+    /// Spawn the background loop that keeps the machine awake while any session
+    /// is actively streaming/processing.
+    ///
+    /// The shared daemon owns every session, so a single inhibitor here covers
+    /// all of them. We poll the swarm-member map (the authoritative "running"
+    /// signal that also drives Waybar's "N streaming" indicator) on a short
+    /// interval and reconcile a best-effort OS power inhibitor against it. The
+    /// inhibitor only blocks system suspend / lid sleep; the display can still
+    /// turn off. When no session is running the helper is killed so normal power
+    /// management resumes immediately.
+    fn spawn_power_inhibitor(swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>) {
+        // Reconcile interval. Short enough that the inhibitor engages promptly
+        // when a turn starts and releases promptly when work finishes, but cheap
+        // (a read lock + a scan) so it adds no meaningful load.
+        const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+
+        let mut inhibitor = crate::power_inhibit::PowerInhibitor::new();
+        if !inhibitor.is_available() {
+            // Disabled via the legacy env escape hatch, or unsupported platform.
+            crate::logging::info(
+                "power_inhibit: unavailable (unsupported platform or JCODE_DISABLE_POWER_INHIBIT set); not monitoring",
+            );
+            return;
+        }
+
+        crate::logging::info(
+            "power_inhibit: monitoring active sessions to prevent sleep while streaming",
+        );
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(RECONCILE_INTERVAL);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut last_active: Option<bool> = None;
+            loop {
+                interval.tick().await;
+
+                // Re-evaluate the config each tick so toggling it at runtime
+                // takes effect without restarting the daemon.
+                let enabled = crate::config::config().power.prevent_sleep_while_streaming;
+
+                let active = enabled && Self::any_session_streaming(&swarm_members).await;
+                if last_active != Some(active) {
+                    crate::logging::info(&format!(
+                        "power_inhibit: {} (streaming sessions {})",
+                        if active { "engaging" } else { "releasing" },
+                        if active { "present" } else { "absent" },
+                    ));
+                    last_active = Some(active);
+                }
+                inhibitor.set_active(active);
+            }
+        });
+    }
+
+    /// Whether at least one session is currently in the "running" state, i.e.
+    /// actively streaming/processing a turn. This is the same signal that drives
+    /// the Waybar "N streaming" indicator.
+    async fn any_session_streaming(
+        swarm_members: &Arc<RwLock<HashMap<String, SwarmMember>>>,
+    ) -> bool {
+        let members = swarm_members.read().await;
+        members.values().any(|member| member.status == "running")
+    }
+
     /// Monitor the global Bus for FileTouch events and detect conflicts
     #[expect(
         clippy::too_many_arguments,
         reason = "bus monitor needs file state, swarm state, sessions, queues, and event history sinks"
     )]
     async fn monitor_bus(
-        file_touches: Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-        files_touched_by_session: Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+        file_touch: FileTouchService,
         swarm_members: Arc<RwLock<HashMap<String, SwarmMember>>>,
         swarms_by_id: Arc<RwLock<HashMap<String, HashSet<String>>>>,
         _swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
@@ -1482,23 +1572,7 @@ impl Server {
         loop {
             // Periodic cleanup of expired file touches
             if last_cleanup.elapsed() > CLEANUP_INTERVAL {
-                let mut touches = file_touches.write().await;
-                let now = Instant::now();
-                touches.retain(|_, accesses| {
-                    accesses.retain(|a| now.duration_since(a.timestamp) < TOUCH_EXPIRY);
-                    !accesses.is_empty()
-                });
-                let mut rebuilt_reverse_index: HashMap<String, HashSet<PathBuf>> = HashMap::new();
-                for (path, accesses) in touches.iter() {
-                    for access in accesses {
-                        rebuilt_reverse_index
-                            .entry(access.session_id.clone())
-                            .or_default()
-                            .insert(path.clone());
-                    }
-                }
-                drop(touches);
-                *files_touched_by_session.write().await = rebuilt_reverse_index;
+                file_touch.expire_older_than(TOUCH_EXPIRY).await;
                 last_cleanup = Instant::now();
             }
 
@@ -1508,26 +1582,20 @@ impl Server {
                     let session_id = touch.session_id.clone();
 
                     // Record this touch
-                    {
-                        let mut touches = file_touches.write().await;
-                        let accesses = touches.entry(path.clone()).or_insert_with(Vec::new);
-                        accesses.push(FileAccess {
-                            session_id: session_id.clone(),
-                            op: touch.op.clone(),
-                            timestamp: Instant::now(),
-                            absolute_time: std::time::SystemTime::now(),
-                            intent: touch.intent.clone(),
-                            summary: touch.summary.clone(),
-                            detail: touch.detail.clone(),
-                        });
-                    }
-                    {
-                        let mut reverse_index = files_touched_by_session.write().await;
-                        reverse_index
-                            .entry(session_id.clone())
-                            .or_default()
-                            .insert(path.clone());
-                    }
+                    file_touch
+                        .record_touch(
+                            path.clone(),
+                            FileAccess {
+                                session_id: session_id.clone(),
+                                op: touch.op.clone(),
+                                timestamp: Instant::now(),
+                                absolute_time: std::time::SystemTime::now(),
+                                intent: touch.intent.clone(),
+                                summary: touch.summary.clone(),
+                                detail: touch.detail.clone(),
+                            },
+                        )
+                        .await;
 
                     // Record event for subscription
                     {
@@ -1590,12 +1658,11 @@ impl Server {
                         ));
                     }
                     let previous_touches: Vec<FileAccess> = if is_modification {
-                        let touches = file_touches.read().await;
-                        if let Some(accesses) = touches.get(&path) {
+                        if let Some(accesses) = file_touch.accesses_for_path(&path).await {
                             let swarm_session_ids_set: HashSet<String> =
                                 swarm_session_ids.iter().cloned().collect();
                             let result =
-                                latest_peer_touches(accesses, &session_id, &swarm_session_ids_set);
+                                latest_peer_touches(&accesses, &session_id, &swarm_session_ids_set);
                             crate::logging::info(&format!(
                                 "[file-activity] {} prior peer touches ({} total accesses)",
                                 result.len(),
@@ -1739,6 +1806,10 @@ impl Server {
                         &sessions,
                         &soft_interrupt_queues,
                         &swarm_members,
+                        &swarms_by_id,
+                        &event_history,
+                        &event_counter,
+                        &swarm_event_tx,
                     )
                     .await;
                 }
@@ -1752,6 +1823,9 @@ impl Server {
                 // communication actions (comm_propose_plan / comm_approve_plan), not
                 // todowrite broadcasts.
                 Ok(BusEvent::TodoUpdated(_)) => {}
+                Ok(BusEvent::SwarmOutputTail(tail)) => {
+                    dispatch_swarm_output_tail(&tail, &swarm_members, &swarms_by_id).await;
+                }
                 Ok(_) => {
                     // Ignore other events
                 }

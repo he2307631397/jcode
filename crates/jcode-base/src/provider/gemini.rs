@@ -1,21 +1,22 @@
 use super::{EventStream, Provider};
 use crate::auth::gemini as gemini_auth;
-use crate::message::{ConnectionPhase, Message, Role, StreamEvent, ToolDefinition};
+use crate::message::{ConnectionPhase, Message, StreamEvent, ToolDefinition};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 pub use jcode_provider_gemini::{
     AVAILABLE_MODELS, CODE_ASSIST_API_VERSION, CODE_ASSIST_ENDPOINT, ClientMetadata,
-    CodeAssistGenerateRequest, CodeAssistGenerateResponse, DEFAULT_MODEL, GeminiCandidate,
-    GeminiContent, GeminiFunctionCall, GeminiFunctionCallingConfig, GeminiFunctionDeclaration,
-    GeminiFunctionResponse, GeminiPart, GeminiPromptFeedback, GeminiRuntimeState, GeminiTool,
-    GeminiToolConfig, GeminiUsageMetadata, GeminiUserTier, IneligibleTier, InlineData,
-    LoadCodeAssistRequest, LoadCodeAssistResponse, LongRunningOperationResponse,
-    OnboardUserRequest, OnboardUserResponse, ProjectRef, USER_TIER_FREE,
-    VertexGenerateContentRequest, VertexGenerateContentResponse, choose_onboard_tier,
-    client_metadata, extract_gemini_model_ids, gemini_fallback_models,
-    google_cloud_project_from_env, ineligible_or_project_error, is_gemini_model_id,
-    load_code_assist_request, merge_gemini_model_lists, validate_load_code_assist_response,
+    CodeAssistGenerateRequest, CodeAssistGenerateResponse, DEFAULT_MODEL, GEMINI_API_ENDPOINT,
+    GEMINI_API_VERSION, GeminiCandidate, GeminiContent, GeminiFunctionCall,
+    GeminiFunctionCallingConfig, GeminiFunctionDeclaration, GeminiFunctionResponse, GeminiPart,
+    GeminiPromptFeedback, GeminiRuntimeState, GeminiTool, GeminiToolConfig, GeminiUsageMetadata,
+    GeminiUserTier, IneligibleTier, InlineData, LoadCodeAssistRequest, LoadCodeAssistResponse,
+    LongRunningOperationResponse, OnboardUserRequest, OnboardUserResponse, ProjectRef,
+    USER_TIER_FREE, VertexGenerateContentRequest, VertexGenerateContentResponse, build_contents,
+    build_system_instruction_with_tool_guard, build_tools, choose_onboard_tier, client_metadata,
+    extract_gemini_model_ids, gemini_fallback_models, google_cloud_project_from_env,
+    ineligible_or_project_error, is_gemini_model_id, load_code_assist_request,
+    merge_gemini_model_lists, validate_load_code_assist_response,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -37,6 +38,17 @@ pub struct GeminiProvider {
     model: Arc<RwLock<String>>,
     state: Arc<Mutex<Option<GeminiRuntimeState>>>,
     fetched_models: Arc<RwLock<Vec<String>>>,
+}
+
+/// How the Gemini provider authenticates to Google.
+#[derive(Clone)]
+enum GeminiAuthMode {
+    /// OAuth Code Assist (cloudcode-pa, free tier). The default when no API key
+    /// is configured.
+    Oauth,
+    /// Official Gemini Developer API key (Google AI Studio), sent as
+    /// `x-goog-api-key` to `generativelanguage.googleapis.com`.
+    ApiKey(String),
 }
 
 impl GeminiProvider {
@@ -99,7 +111,55 @@ impl GeminiProvider {
         format!("{endpoint}/{version}")
     }
 
+    /// Base URL for the official Gemini Developer API (Google AI Studio).
+    fn developer_api_base_url() -> String {
+        let endpoint = std::env::var("GEMINI_API_ENDPOINT")
+            .unwrap_or_else(|_| GEMINI_API_ENDPOINT.to_string());
+        let version =
+            std::env::var("GEMINI_API_VERSION").unwrap_or_else(|_| GEMINI_API_VERSION.to_string());
+        format!(
+            "{}/{}",
+            endpoint.trim_end_matches('/'),
+            version.trim_matches('/')
+        )
+    }
+
+    /// Resolve the active authentication mode.
+    ///
+    /// An official Gemini Developer API key takes precedence over OAuth Code
+    /// Assist credentials: it points at `generativelanguage.googleapis.com` with
+    /// the key's own (often higher) quota, while OAuth uses the free
+    /// cloudcode-pa tier. Set `JCODE_GEMINI_FORCE_OAUTH=1` to pin OAuth even when
+    /// a key is present.
+    fn auth_mode() -> GeminiAuthMode {
+        let force_oauth = std::env::var("JCODE_GEMINI_FORCE_OAUTH")
+            .map(|value| {
+                let value = value.trim();
+                !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false);
+        if !force_oauth && let Some(api_key) = gemini_auth::api_key() {
+            return GeminiAuthMode::ApiKey(api_key);
+        }
+        GeminiAuthMode::Oauth
+    }
+
     async fn ensure_state(&self) -> Result<GeminiRuntimeState> {
+        // The Developer API key path is stateless: there is no Code Assist
+        // project/onboarding handshake, so synthesize a lightweight session.
+        if let GeminiAuthMode::ApiKey(_) = Self::auth_mode() {
+            let mut guard = self.state.lock().await;
+            if let Some(state) = guard.clone() {
+                return Ok(state);
+            }
+            let state = GeminiRuntimeState {
+                project_id: String::new(),
+                session_id: Uuid::new_v4().to_string(),
+            };
+            *guard = Some(state.clone());
+            return Ok(state);
+        }
+
         let mut guard = self.state.lock().await;
         if let Some(state) = guard.clone() {
             return Ok(state);
@@ -199,6 +259,9 @@ impl GeminiProvider {
     }
 
     async fn refresh_available_models(&self) -> Result<Vec<String>> {
+        if let GeminiAuthMode::ApiKey(api_key) = Self::auth_mode() {
+            return self.refresh_available_models_api_key(&api_key).await;
+        }
         let project_id_env = google_cloud_project_from_env();
         let load_req = load_code_assist_request(
             project_id_env.clone(),
@@ -226,35 +289,63 @@ impl GeminiProvider {
         Ok(models)
     }
 
-    async fn post_json<T: DeserializeOwned>(
-        &self,
-        method: &str,
-        body: &impl Serialize,
-    ) -> Result<T> {
-        let tokens = gemini_auth::load_or_refresh_tokens().await?;
-        let url = format!("{}:{method}", Self::base_url());
-        let body_value =
-            serde_json::to_value(body).context("Failed to serialize Gemini request body")?;
+    /// Discover models via the official Developer API `ListModels` endpoint.
+    /// Returned names look like `models/gemini-2.5-pro`, so strip the prefix
+    /// before normalizing through the shared catalog merge.
+    async fn refresh_available_models_api_key(&self, api_key: &str) -> Result<Vec<String>> {
+        let url = format!("{}/models", Self::developer_api_base_url());
+        let response: Value = match self.get_json_api_key(&url, api_key, "ListModels").await {
+            Ok(response) => response,
+            Err(err) => {
+                crate::logging::info(&format!(
+                    "Gemini Developer API model discovery failed: {err:#}"
+                ));
+                return Ok(Vec::new());
+            }
+        };
+
+        let raw: Vec<String> = response
+            .get("models")
+            .and_then(|models| models.as_array())
+            .map(|models| {
+                models
+                    .iter()
+                    .filter_map(|model| model.get("name").and_then(|name| name.as_str()))
+                    .map(|name| name.trim_start_matches("models/").to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let models = merge_gemini_model_lists(raw);
+        if !models.is_empty() {
+            crate::logging::info(&format!(
+                "Discovered Gemini Developer API models: {}",
+                models.join(", ")
+            ));
+            if let Ok(mut guard) = self.fetched_models.write() {
+                *guard = models.clone();
+            }
+            Self::persist_catalog(&models);
+        }
+        Ok(models)
+    }
+
+    /// Send a request with a single transient-error retry, transparently
+    /// rebuilding the HTTP client on the second attempt. The `make` closure
+    /// produces a fully-configured (auth + body) request builder for each try.
+    async fn send_with_retry<F>(&self, make: F, url: &str) -> Result<reqwest::Response>
+    where
+        F: Fn(reqwest::Client) -> reqwest::RequestBuilder,
+    {
         let mut last_error: Option<anyhow::Error> = None;
-        let mut resp = None;
         for attempt in 0..2 {
             let client = if attempt == 0 {
                 self.client.clone()
             } else {
                 gemini_http_client()
             };
-            match client
-                .post(&url)
-                .bearer_auth(&tokens.access_token)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .json(&body_value)
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    resp = Some(response);
-                    break;
-                }
+            match make(client).send().await {
+                Ok(response) => return Ok(response),
                 Err(err) if attempt == 0 && is_transient_gemini_transport_error(&err) => {
                     last_error = Some(err.into());
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -264,13 +355,31 @@ impl GeminiProvider {
                 }
             }
         }
-        let resp = match resp {
-            Some(resp) => resp,
-            None => {
-                let err = last_error.unwrap_or_else(|| anyhow::anyhow!("Gemini request failed"));
-                return Err(err).with_context(|| format!("Gemini request to {} failed", url));
-            }
-        };
+        let err = last_error.unwrap_or_else(|| anyhow::anyhow!("Gemini request failed"));
+        Err(err).with_context(|| format!("Gemini request to {} failed", url))
+    }
+
+    async fn post_json<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        body: &impl Serialize,
+    ) -> Result<T> {
+        let tokens = gemini_auth::load_or_refresh_tokens().await?;
+        let url = format!("{}:{method}", Self::base_url());
+        let body_value =
+            serde_json::to_value(body).context("Failed to serialize Gemini request body")?;
+        let resp = self
+            .send_with_retry(
+                |client| {
+                    client
+                        .post(&url)
+                        .bearer_auth(&tokens.access_token)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .json(&body_value)
+                },
+                &url,
+            )
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -288,45 +397,91 @@ impl GeminiProvider {
             .with_context(|| format!("Failed to parse Gemini {} response", method))
     }
 
+    /// POST a JSON body to the official Gemini Developer API, authenticating
+    /// with an `x-goog-api-key` header instead of an OAuth bearer token.
+    async fn post_json_api_key<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        api_key: &str,
+        body: &impl Serialize,
+        label: &str,
+    ) -> Result<T> {
+        let body_value =
+            serde_json::to_value(body).context("Failed to serialize Gemini request body")?;
+        let resp = self
+            .send_with_retry(
+                |client| {
+                    client
+                        .post(url)
+                        .header("x-goog-api-key", api_key)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .json(&body_value)
+                },
+                url,
+            )
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = crate::util::http_error_body(resp, "HTTP error").await;
+            anyhow::bail!(
+                "Gemini request {} failed (HTTP {}): {}",
+                label,
+                status,
+                body.trim()
+            );
+        }
+
+        resp.json()
+            .await
+            .with_context(|| format!("Failed to parse Gemini {} response", label))
+    }
+
+    /// GET a JSON resource from the official Gemini Developer API using an
+    /// `x-goog-api-key` header.
+    async fn get_json_api_key<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        api_key: &str,
+        label: &str,
+    ) -> Result<T> {
+        let resp = self
+            .send_with_retry(
+                |client| {
+                    client
+                        .get(url)
+                        .header("x-goog-api-key", api_key)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                },
+                url,
+            )
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = crate::util::http_error_body(resp, "HTTP error").await;
+            anyhow::bail!("Gemini {} failed (HTTP {}): {}", label, status, body.trim());
+        }
+
+        resp.json()
+            .await
+            .with_context(|| format!("Failed to parse Gemini {} response", label))
+    }
+
     async fn get_operation<T: DeserializeOwned>(&self, name: &str) -> Result<T> {
         let tokens = gemini_auth::load_or_refresh_tokens().await?;
         let url = format!("{}/{}", Self::base_url(), name.trim_start_matches('/'));
-        let mut last_error: Option<anyhow::Error> = None;
-        let mut resp = None;
-        for attempt in 0..2 {
-            let client = if attempt == 0 {
-                self.client.clone()
-            } else {
-                gemini_http_client()
-            };
-            match client
-                .get(&url)
-                .bearer_auth(&tokens.access_token)
-                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                .send()
-                .await
-            {
-                Ok(response) => {
-                    resp = Some(response);
-                    break;
-                }
-                Err(err) if attempt == 0 && is_transient_gemini_transport_error(&err) => {
-                    last_error = Some(err.into());
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                Err(err) => {
-                    return Err(err).with_context(|| format!("Gemini request to {} failed", url));
-                }
-            }
-        }
-        let resp = match resp {
-            Some(resp) => resp,
-            None => {
-                let err =
-                    last_error.unwrap_or_else(|| anyhow::anyhow!("Gemini operation lookup failed"));
-                return Err(err).with_context(|| format!("Gemini request to {} failed", url));
-            }
-        };
+        let resp = self
+            .send_with_retry(
+                |client| {
+                    client
+                        .get(&url)
+                        .bearer_auth(&tokens.access_token)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                },
+                &url,
+            )
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -358,7 +513,10 @@ impl GeminiProvider {
             user_prompt_id: Uuid::new_v4().to_string(),
             request: VertexGenerateContentRequest {
                 contents: build_contents(messages),
-                system_instruction: build_system_instruction(system),
+                system_instruction: build_system_instruction_with_tool_guard(
+                    system,
+                    !tools.is_empty(),
+                ),
                 tools: build_tools(tools),
                 tool_config: if tools.is_empty() {
                     None
@@ -413,9 +571,32 @@ impl GeminiProvider {
             ],
         );
 
-        self.post_json("generateContent", &request)
-            .await
-            .context("Gemini generateContent failed")
+        match Self::auth_mode() {
+            GeminiAuthMode::ApiKey(api_key) => {
+                // The Developer API consumes the inner generateContent body
+                // directly (no Code Assist envelope) and returns the response
+                // without the `{ response: ... }` wrapper, so adapt both sides.
+                let mut inner = request.request;
+                inner.session_id = None;
+                let url = format!(
+                    "{}/models/{}:generateContent",
+                    Self::developer_api_base_url(),
+                    model
+                );
+                let response: VertexGenerateContentResponse = self
+                    .post_json_api_key(&url, &api_key, &inner, "generateContent")
+                    .await
+                    .context("Gemini generateContent failed")?;
+                Ok(CodeAssistGenerateResponse {
+                    trace_id: None,
+                    response: Some(response),
+                })
+            }
+            GeminiAuthMode::Oauth => self
+                .post_json("generateContent", &request)
+                .await
+                .context("Gemini generateContent failed"),
+        }
     }
 }
 
@@ -632,14 +813,36 @@ impl Provider for GeminiProvider {
                         .await;
                     return;
                 }
+                // Track whether this candidate produced any usable output (text or
+                // a tool call). Gemini-3 thinking models intermittently emit
+                // Python-style pseudo-code instead of a clean functionCall and
+                // finish with `MALFORMED_FUNCTION_CALL` and empty content; surface
+                // that as a retryable error below rather than a silent empty turn.
+                let mut produced_output = false;
                 if let Some(content) = candidate.content {
+                    // Gemini 3 attaches a `thoughtSignature` to function-call
+                    // parts (and occasionally to a standalone preceding part).
+                    // Replay it via a ToolUseSignature event so it is persisted
+                    // on the ToolUse block and resent on later turns; the API
+                    // rejects follow-up turns whose functionCall omits it
+                    // ("Function call is missing a thought_signature").
+                    let mut pending_signature: Option<String> = None;
                     for part in content.parts {
+                        let part_signature = part
+                            .thought_signature
+                            .as_ref()
+                            .filter(|sig| !sig.is_empty())
+                            .cloned();
                         if let Some(text) = part.text
                             && !text.is_empty()
                         {
+                            produced_output = true;
                             let _ = tx.send(Ok(StreamEvent::TextDelta(text))).await;
                         }
                         if let Some(function_call) = part.function_call {
+                            produced_output = true;
+                            let signature =
+                                part_signature.clone().or_else(|| pending_signature.take());
                             let raw_call_id = function_call
                                 .id
                                 .clone()
@@ -657,7 +860,55 @@ impl Provider for GeminiProvider {
                                 )))
                                 .await;
                             let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
+                            if let Some(signature) = signature {
+                                let _ = tx.send(Ok(StreamEvent::ToolUseSignature(signature))).await;
+                            }
+                        } else if let Some(signature) = part_signature {
+                            // Standalone signature part; remember it for the next
+                            // function call in this candidate.
+                            pending_signature = Some(signature);
                         }
+                    }
+                    // A thought signature not consumed by a following function
+                    // call (e.g. a pure-text reasoning turn) is still an opaque
+                    // reasoning signal. Surface it as a ThinkingSignatureDelta
+                    // instead of dropping it.
+                    if let Some(signature) = pending_signature.take() {
+                        let _ = tx
+                            .send(Ok(StreamEvent::ThinkingSignatureDelta(signature)))
+                            .await;
+                    }
+                }
+
+                // An abnormal finish (typically Gemini-3's intermittent
+                // `MALFORMED_FUNCTION_CALL`) that yielded no text and no tool call
+                // is a dead turn: surface it as a retryable error instead of a
+                // silent empty `MessageEnd`. `STOP`/`MAX_TOKENS` are normal.
+                if !produced_output {
+                    let abnormal = candidate
+                        .finish_reason
+                        .as_deref()
+                        .map(|reason| {
+                            !matches!(
+                                reason.to_ascii_uppercase().as_str(),
+                                "STOP" | "MAX_TOKENS" | "FINISH_REASON_UNSPECIFIED" | ""
+                            )
+                        })
+                        .unwrap_or(false);
+                    if abnormal {
+                        let reason = candidate.finish_reason.as_deref().unwrap_or("unknown");
+                        let detail = candidate
+                            .finish_message
+                            .as_deref()
+                            .filter(|msg| !msg.trim().is_empty())
+                            .map(|msg| format!(": {}", crate::util::truncate_str(msg.trim(), 300)))
+                            .unwrap_or_default();
+                        let _ = tx
+                            .send(Err(anyhow::anyhow!(
+                                "Gemini returned no usable output (finish_reason={reason}){detail}"
+                            )))
+                            .await;
+                        return;
                     }
                 }
             }
@@ -801,146 +1052,6 @@ fn is_gemini_model_not_found_error(err: &anyhow::Error) -> bool {
     lower.contains("http 404")
         || lower.contains("\"status\": \"not_found\"")
         || lower.contains("requested entity was not found")
-}
-
-pub(crate) fn build_system_instruction(system: &str) -> Option<GeminiContent> {
-    let trimmed = system.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(GeminiContent {
-            role: "user".to_string(),
-            parts: vec![GeminiPart {
-                text: Some(trimmed.to_string()),
-                ..Default::default()
-            }],
-        })
-    }
-}
-
-pub(crate) fn build_contents(messages: &[Message]) -> Vec<GeminiContent> {
-    messages
-        .iter()
-        .filter_map(|message| {
-            let role = match message.role {
-                Role::User => "user",
-                Role::Assistant => "model",
-            };
-            let mut parts = Vec::new();
-            for block in &message.content {
-                match block {
-                    crate::message::ContentBlock::Text { text, .. } => {
-                        parts.push(GeminiPart {
-                            text: Some(text.clone()),
-                            ..Default::default()
-                        });
-                    }
-                    crate::message::ContentBlock::Reasoning { .. }
-                    | crate::message::ContentBlock::AnthropicThinking { .. }
-                    | crate::message::ContentBlock::OpenAIReasoning { .. } => {}
-                    crate::message::ContentBlock::ToolUse { id, name, input } => {
-                        parts.push(GeminiPart {
-                            function_call: Some(GeminiFunctionCall {
-                                name: name.clone(),
-                                args: crate::message::ToolCall::input_as_object(input),
-                                id: Some(id.clone()),
-                            }),
-                            ..Default::default()
-                        });
-                    }
-                    crate::message::ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        is_error,
-                    } => {
-                        parts.push(GeminiPart {
-                            function_response: Some(GeminiFunctionResponse {
-                                name: tool_name_from_tool_result(tool_use_id, messages),
-                                response: if is_error.unwrap_or(false) {
-                                    json!({ "error": content })
-                                } else {
-                                    json!({ "content": content })
-                                },
-                                id: Some(tool_use_id.clone()),
-                            }),
-                            ..Default::default()
-                        });
-                    }
-                    crate::message::ContentBlock::Image { media_type, data } => {
-                        parts.push(GeminiPart {
-                            inline_data: Some(InlineData {
-                                mime_type: media_type.clone(),
-                                data: data.clone(),
-                            }),
-                            ..Default::default()
-                        });
-                    }
-                    crate::message::ContentBlock::OpenAICompaction { .. } => {}
-                }
-            }
-            if parts.is_empty() {
-                None
-            } else {
-                Some(GeminiContent {
-                    role: role.to_string(),
-                    parts,
-                })
-            }
-        })
-        .collect()
-}
-
-fn tool_name_from_tool_result(tool_use_id: &str, messages: &[Message]) -> String {
-    for message in messages.iter().rev() {
-        for block in &message.content {
-            if let crate::message::ContentBlock::ToolUse { id, name, .. } = block
-                && id == tool_use_id
-            {
-                return name.clone();
-            }
-        }
-    }
-    "tool".to_string()
-}
-
-pub(crate) fn build_tools(tools: &[ToolDefinition]) -> Option<Vec<GeminiTool>> {
-    if tools.is_empty() {
-        return None;
-    }
-
-    Some(vec![GeminiTool {
-        function_declarations: tools
-            .iter()
-            .map(|tool| GeminiFunctionDeclaration {
-                name: tool.name.clone(),
-                // Prompt-visible. Approximate token cost for this field:
-                // tool.description_token_estimate().
-                description: tool.description.clone(),
-                parameters: gemini_compatible_schema(&tool.input_schema),
-            })
-            .collect(),
-    }])
-}
-
-fn gemini_compatible_schema(schema: &Value) -> Value {
-    match schema {
-        Value::Object(map) => {
-            let mut out = serde_json::Map::new();
-            for (key, value) in map {
-                if key == "const" {
-                    out.insert(
-                        "enum".to_string(),
-                        Value::Array(vec![gemini_compatible_schema(value)]),
-                    );
-                } else {
-                    out.insert(key.clone(), gemini_compatible_schema(value));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(gemini_compatible_schema).collect()),
-        _ => schema.clone(),
-    }
 }
 
 #[cfg(test)]

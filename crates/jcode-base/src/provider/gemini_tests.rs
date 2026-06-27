@@ -18,6 +18,18 @@ impl EnvVarGuard {
         crate::env::set_var(key, value);
         Self { key, previous }
     }
+
+    fn set_value(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var_os(key);
+        crate::env::set_var(key, value);
+        Self { key, previous }
+    }
+
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var_os(key);
+        crate::env::remove_var(key);
+        Self { key, previous }
+    }
 }
 
 impl Drop for EnvVarGuard {
@@ -177,6 +189,229 @@ fn available_models_display_seeds_from_persisted_catalog() {
 }
 
 #[test]
+fn build_contents_replays_thought_signature_on_function_call() {
+    // Gemini 3 (Antigravity Cloud Code backend) rejects function calls that
+    // omit the original thoughtSignature on later turns. Verify the signature
+    // captured on the ToolUse block is replayed verbatim on the functionCall
+    // part. A later unsigned call inherits the most recent real signature so the
+    // backend (which 400s a fully-unsigned turn) accepts it (issue #339).
+    let messages = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_sig".to_string(),
+                name: "read".to_string(),
+                input: json!({"path":"README.md"}),
+                thought_signature: Some("SIGNATURE_ABC".to_string()),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "call_nosig".to_string(),
+                name: "bash".to_string(),
+                input: json!({"command":"ls"}),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let contents = build_contents(&messages);
+    assert_eq!(
+        contents[0].parts[0].thought_signature.as_deref(),
+        Some("SIGNATURE_ABC"),
+        "signature must be replayed on the matching function call part"
+    );
+    assert_eq!(
+        contents[1].parts[0].thought_signature.as_deref(),
+        Some("SIGNATURE_ABC"),
+        "an unsigned later call must inherit the most recent real signature so \
+         the backend does not reject a fully-unsigned turn"
+    );
+}
+
+#[test]
+fn build_contents_replays_every_signature_across_multi_tool_history() {
+    // Regression guard for the Antigravity/Cloud Code 400
+    // ("Function call is missing a thought_signature ... position 5"): the
+    // backend validates *every* functionCall in the replayed history, not just
+    // the latest one. A multi-turn transcript where an earlier tool_use drops
+    // its signature is exactly what triggers the field failure, so assert that
+    // each captured signature survives serialization onto its matching part.
+    let signatures = ["SIG_A", "SIG_B", "SIG_C"];
+    let mut messages = Vec::new();
+    for (idx, sig) in signatures.iter().enumerate() {
+        messages.push(Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: format!("call_{idx}"),
+                name: "bash".to_string(),
+                input: json!({ "command": format!("echo {idx}") }),
+                thought_signature: Some(sig.to_string()),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        });
+        messages.push(Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: format!("call_{idx}"),
+                content: format!("out {idx}"),
+                is_error: Some(false),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        });
+    }
+
+    let contents = build_contents(&messages);
+    let replayed: Vec<Option<&str>> = contents
+        .iter()
+        .flat_map(|content| content.parts.iter())
+        .filter(|part| part.function_call.is_some())
+        .map(|part| part.thought_signature.as_deref())
+        .collect();
+    assert_eq!(
+        replayed,
+        vec![Some("SIG_A"), Some("SIG_B"), Some("SIG_C")],
+        "every functionCall in the history must carry its captured thought_signature, \
+         not just the most recent one"
+    );
+}
+
+#[test]
+fn build_contents_carries_first_signature_onto_unsigned_same_turn_siblings() {
+    // Issue #339: when Gemini-3 emits MULTIPLE function calls in ONE turn it
+    // signs only the first; the siblings persist without a signature. The
+    // Antigravity/Cloud Code backend then rejects the unsigned siblings with
+    // "Function call is missing a thought_signature ... position N". Verify the
+    // first call's signature is carried forward onto same-turn siblings that
+    // lack one (the backend accepts a replayed signature on sibling calls).
+    let messages = vec![Message {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::ToolUse {
+                id: "call_todo".to_string(),
+                name: "todo".to_string(),
+                input: json!({ "items": ["a", "b"] }),
+                thought_signature: Some("SIG_TURN_1".to_string()),
+            },
+            ContentBlock::ToolUse {
+                id: "call_bash".to_string(),
+                name: "bash".to_string(),
+                input: json!({ "command": "ls" }),
+                thought_signature: None,
+            },
+            ContentBlock::ToolUse {
+                id: "call_write".to_string(),
+                name: "write".to_string(),
+                input: json!({ "path": "a.txt", "content": "hi" }),
+                thought_signature: None,
+            },
+        ],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+
+    let contents = build_contents(&messages);
+    let replayed: Vec<Option<&str>> = contents
+        .iter()
+        .flat_map(|content| content.parts.iter())
+        .filter(|part| part.function_call.is_some())
+        .map(|part| part.thought_signature.as_deref())
+        .collect();
+    assert_eq!(
+        replayed,
+        vec![Some("SIG_TURN_1"), Some("SIG_TURN_1"), Some("SIG_TURN_1")],
+        "every functionCall in a multi-call turn must carry a signature so the \
+         backend does not reject unsigned siblings"
+    );
+}
+
+#[test]
+fn build_contents_carries_signature_forward_across_turns_for_unsigned_calls() {
+    // Issue #339: the Antigravity/Cloud Code backend 400s an assistant turn
+    // whose function calls are ALL unsigned. A later turn made entirely of
+    // locally synthesized / unsigned tool calls (auto-poke continuation, batch,
+    // manual tool use, or an imported pre-signature session) must inherit the
+    // most recent real signature from earlier in the conversation so at least
+    // one call carries a signature and the backend accepts the turn.
+    let messages = vec![
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "turn1".to_string(),
+                name: "read".to_string(),
+                input: json!({ "path": "README.md" }),
+                thought_signature: Some("SIG_TURN_1".to_string()),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "turn1".to_string(),
+                content: "ok".to_string(),
+                is_error: Some(false),
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "turn2".to_string(),
+                name: "bash".to_string(),
+                input: json!({ "command": "ls" }),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+    ];
+
+    let contents = build_contents(&messages);
+    let last_turn_sig = contents
+        .last()
+        .and_then(|content| content.parts.first())
+        .and_then(|part| part.thought_signature.as_deref());
+    assert_eq!(
+        last_turn_sig,
+        Some("SIG_TURN_1"),
+        "a fully-unsigned later turn must inherit the most recent real signature \
+         so the backend does not reject it"
+    );
+}
+
+#[test]
+fn build_contents_leaves_unsigned_calls_unsigned_when_no_prior_signature_exists() {
+    // If the conversation has never produced a real signature there is nothing
+    // to carry; we must not fabricate one out of thin air.
+    let messages = vec![Message {
+        role: Role::Assistant,
+        content: vec![ContentBlock::ToolUse {
+            id: "call".to_string(),
+            name: "bash".to_string(),
+            input: json!({ "command": "ls" }),
+            thought_signature: None,
+        }],
+        timestamp: None,
+        tool_duration_ms: None,
+    }];
+
+    let contents = build_contents(&messages);
+    assert_eq!(
+        contents[0].parts[0].thought_signature, None,
+        "with no prior signature in the conversation, an unsigned call stays unsigned"
+    );
+}
+
+#[test]
 fn build_contents_preserves_tool_calls_and_results() {
     let messages = vec![
         Message {
@@ -185,6 +420,7 @@ fn build_contents_preserves_tool_calls_and_results() {
                 id: "call_1".to_string(),
                 name: "read".to_string(),
                 input: json!({"path":"README.md"}),
+                thought_signature: None,
             }],
             timestamp: None,
             tool_duration_ms: None,
@@ -227,6 +463,7 @@ fn build_contents_normalizes_non_object_tool_call_args_for_gemini_struct() {
             id: "call_primitive".to_string(),
             name: "read".to_string(),
             input: json!(20),
+            thought_signature: None,
         }],
         timestamp: None,
         tool_duration_ms: None,
@@ -299,6 +536,47 @@ fn build_tools_rewrites_const_for_gemini_schema_compatibility() {
     );
 }
 
+#[test]
+fn build_tools_strips_additional_properties_for_gemini_schema_compatibility() {
+    // The Gemini Code Assist generateContent endpoint rejects `additionalProperties`
+    // (and other draft-JSON-Schema keywords) with HTTP 400, so build_tools must
+    // strip them recursively while preserving the rest of the schema.
+    let defs = vec![ToolDefinition {
+        name: "read".to_string(),
+        description: "Reads a file".to_string(),
+        input_schema: json!({
+            "type": "object",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "properties": {
+                "file_path": { "type": "string" },
+                "opts": {
+                    "type": "object",
+                    "properties": { "limit": { "type": "integer" } },
+                    "additionalProperties": false
+                }
+            },
+            "required": ["file_path"],
+            "additionalProperties": false
+        }),
+    }];
+
+    let built = build_tools(&defs).expect("gemini tools");
+    let parameters = &built[0].function_declarations[0].parameters;
+
+    assert!(!schema_contains_key(parameters, "additionalProperties"));
+    assert!(!schema_contains_key(parameters, "$schema"));
+    // Real schema content is preserved.
+    assert_eq!(
+        parameters["properties"]["file_path"]["type"],
+        json!("string")
+    );
+    assert_eq!(
+        parameters["properties"]["opts"]["properties"]["limit"]["type"],
+        json!("integer")
+    );
+    assert_eq!(parameters["required"], json!(["file_path"]));
+}
+
 #[tokio::test]
 async fn build_tools_from_registry_definitions_omits_const_keywords() {
     let provider: Arc<dyn Provider> = Arc::new(MockProvider);
@@ -352,4 +630,138 @@ fn parses_candidate_finish_message() {
         candidate.finish_message.as_deref(),
         Some("Response blocked by safety filters")
     );
+}
+
+#[test]
+fn auth_mode_prefers_api_key_when_present() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _google = EnvVarGuard::unset("GOOGLE_API_KEY");
+    let _force = EnvVarGuard::unset("JCODE_GEMINI_FORCE_OAUTH");
+    let _key = EnvVarGuard::set_value("GEMINI_API_KEY", "test-developer-key");
+
+    match GeminiProvider::auth_mode() {
+        GeminiAuthMode::ApiKey(key) => assert_eq!(key, "test-developer-key"),
+        GeminiAuthMode::Oauth => panic!("expected API-key auth mode when GEMINI_API_KEY is set"),
+    }
+}
+
+#[test]
+fn auth_mode_force_oauth_overrides_api_key() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _google = EnvVarGuard::unset("GOOGLE_API_KEY");
+    let _key = EnvVarGuard::set_value("GEMINI_API_KEY", "test-developer-key");
+    let _force = EnvVarGuard::set_value("JCODE_GEMINI_FORCE_OAUTH", "1");
+
+    assert!(matches!(GeminiProvider::auth_mode(), GeminiAuthMode::Oauth));
+}
+
+#[test]
+fn auth_mode_defaults_to_oauth_without_api_key() {
+    let _guard = crate::storage::lock_test_env();
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let _home = EnvVarGuard::set_path("JCODE_HOME", temp.path());
+    let _key = EnvVarGuard::unset("GEMINI_API_KEY");
+    let _google = EnvVarGuard::unset("GOOGLE_API_KEY");
+    let _force = EnvVarGuard::unset("JCODE_GEMINI_FORCE_OAUTH");
+
+    assert!(matches!(GeminiProvider::auth_mode(), GeminiAuthMode::Oauth));
+}
+
+#[test]
+fn developer_api_base_url_defaults_to_generativelanguage() {
+    let _guard = crate::storage::lock_test_env();
+    let _endpoint = EnvVarGuard::unset("GEMINI_API_ENDPOINT");
+    let _version = EnvVarGuard::unset("GEMINI_API_VERSION");
+
+    assert_eq!(
+        GeminiProvider::developer_api_base_url(),
+        "https://generativelanguage.googleapis.com/v1beta"
+    );
+}
+
+#[test]
+fn developer_api_base_url_honors_env_overrides() {
+    let _guard = crate::storage::lock_test_env();
+    let _endpoint = EnvVarGuard::set_value("GEMINI_API_ENDPOINT", "https://example.test/");
+    let _version = EnvVarGuard::set_value("GEMINI_API_VERSION", "/v9/");
+
+    assert_eq!(
+        GeminiProvider::developer_api_base_url(),
+        "https://example.test/v9"
+    );
+}
+
+#[test]
+fn developer_api_response_parses_without_code_assist_envelope() {
+    // The Developer API returns the bare generateContent body; ensure it maps
+    // onto the same response type the Code Assist envelope yields.
+    let response: VertexGenerateContentResponse = serde_json::from_value(json!({
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [{ "text": "hello from developer api" }]
+                },
+                "finishReason": "STOP"
+            }
+        ],
+        "usageMetadata": {
+            "promptTokenCount": 3,
+            "candidatesTokenCount": 5
+        }
+    }))
+    .expect("parse developer api response");
+
+    let candidate = response
+        .candidates
+        .expect("missing candidates")
+        .into_iter()
+        .next()
+        .expect("missing first candidate");
+    assert_eq!(candidate.finish_reason.as_deref(), Some("STOP"));
+    let text = candidate
+        .content
+        .expect("missing content")
+        .parts
+        .into_iter()
+        .next()
+        .and_then(|part| part.text)
+        .expect("missing text");
+    assert_eq!(text, "hello from developer api");
+}
+
+#[test]
+fn system_instruction_tool_guard_only_applies_with_tools() {
+    // Without tools, the system instruction is passed through unchanged.
+    let plain = super::build_system_instruction_with_tool_guard("You are helpful.", false)
+        .expect("system instruction present");
+    let plain_text = plain.parts[0].text.clone().unwrap();
+    assert_eq!(plain_text, "You are helpful.");
+    assert!(!plain_text.contains("Function calling"));
+
+    // With tools, the MALFORMED_FUNCTION_CALL prevention guidance is appended.
+    let guarded = super::build_system_instruction_with_tool_guard("You are helpful.", true)
+        .expect("system instruction present");
+    let guarded_text = guarded.parts[0].text.clone().unwrap();
+    assert!(guarded_text.starts_with("You are helpful."));
+    assert!(guarded_text.contains("Function calling"));
+    assert!(guarded_text.contains("native function call, not code"));
+    assert!(guarded_text.contains("default_api."));
+}
+
+#[test]
+fn system_instruction_tool_guard_with_empty_system_still_emits_guidance() {
+    // An empty base system prompt plus tools must still carry the guard so the
+    // model is steered away from pseudo-code tool calls.
+    let guarded = super::build_system_instruction_with_tool_guard("", true)
+        .expect("guard-only instruction present");
+    let text = guarded.parts[0].text.clone().unwrap();
+    assert!(text.contains("Function calling"));
+
+    // Empty system and no tools yields no instruction at all.
+    assert!(super::build_system_instruction_with_tool_guard("", false).is_none());
 }

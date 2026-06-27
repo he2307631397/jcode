@@ -20,6 +20,9 @@ mod session_data;
 mod session_launch;
 mod single_session;
 mod single_session_render;
+#[cfg(test)]
+#[path = "state_space_tests.rs"]
+mod state_space_tests;
 mod workspace;
 
 use ab_glyph::{Font, FontArc, Glyph as AbGlyph, PxScale, ScaleFont, point};
@@ -107,13 +110,13 @@ const DESKTOP_RELOAD_HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(25)
 const DESKTOP_RELOAD_HANDOFF_TIMEOUT: Duration = Duration::from_secs(8);
 const DESKTOP_RELOAD_STARTUP_RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
 const DESKTOP_RELOAD_MAX_RESTORED_DIMENSION: u32 = 32_768;
-const OUTER_PADDING: f32 = 8.0;
-const GAP: f32 = 6.0;
+const OUTER_PADDING: f32 = 12.0;
+const GAP: f32 = 10.0;
 const STATUS_BAR_HEIGHT: f32 = 30.0;
 const FOCUSED_BORDER_WIDTH: f32 = 2.0;
 const UNFOCUSED_BORDER_WIDTH: f32 = 1.5;
-const PANEL_RADIUS: f32 = 8.0;
-const STATUS_RADIUS: f32 = 7.0;
+const PANEL_RADIUS: f32 = 12.0;
+const STATUS_RADIUS: f32 = 9.0;
 const ROUNDED_CORNER_SEGMENTS: usize = 6;
 const PANEL_FIT_TOLERANCE: f32 = 0.15;
 const STATUS_PREVIEW_LANE_RADIUS: i32 = 2;
@@ -145,6 +148,16 @@ const SINGLE_SESSION_CARET_COLOR: [f32; 4] = [0.130, 0.150, 0.190, 0.92];
 const SESSION_SPAWN_REFRESH_DELAY: Duration = Duration::from_millis(350);
 const BACKGROUND_POLL_INTERVAL: Duration = Duration::from_millis(33);
 const BACKEND_REDRAW_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// Minimum spacing between animation-driven redraws.
+///
+/// Without this, the desktop render loop re-requests a redraw immediately after
+/// every animated frame (welcome-hero reveal, focus pulse, spinners, smooth
+/// scroll, etc.). Because the surface uses non-blocking `Mailbox` presentation,
+/// `present()` returns instantly, so the unthrottled loop renders at hundreds of
+/// fps and pins the main thread near 100% CPU, starving input handling and the
+/// compositor (the root cause of desktop lag/jank). ~16ms paces continuous
+/// animations to about 60fps, matching typical display refresh.
+const DESKTOP_ANIMATION_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const SURFACE_TIMEOUT_BACKOFF_MIN: Duration = Duration::from_millis(16);
 const SURFACE_TIMEOUT_BACKOFF_MAX: Duration = Duration::from_millis(250);
 const HEADLESS_CHAT_SMOKE_TIMEOUT: Duration = Duration::from_secs(90);
@@ -383,6 +396,17 @@ fn desktop_background_wake(
     }
 }
 
+/// Compute the next paced animation redraw time.
+///
+/// Returns `Some(now + DESKTOP_ANIMATION_FRAME_INTERVAL)` while an animation is
+/// active and `None` once it settles. Callers schedule this instead of calling
+/// `request_redraw()` immediately, which would render as fast as the CPU allows
+/// (the surface presents without blocking) and pin the main thread near 100%
+/// CPU, starving input handling and the compositor.
+fn next_animation_redraw_at(now: Instant, animation_active: bool) -> Option<Instant> {
+    animation_active.then(|| now + DESKTOP_ANIMATION_FRAME_INTERVAL)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct StreamingTextArrivalStyle {
     opacity: f32,
@@ -476,6 +500,22 @@ fn streaming_text_handoff_style_for_elapsed(elapsed: Duration) -> StreamingTextA
     }
 }
 
+/// Body cache key that also tracks how much of the streaming response is
+/// revealed, so the cached wrapped lines rebuild as the reveal advances.
+fn streaming_reveal_body_cache_key(
+    rendered_body_key: u64,
+    streaming_response_empty: bool,
+    revealed_bytes: usize,
+) -> u64 {
+    if streaming_response_empty {
+        return rendered_body_key;
+    }
+    let mut hasher = DefaultHasher::new();
+    rendered_body_key.hash(&mut hasher);
+    revealed_bytes.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn streaming_text_handoff_start_after_len_change(
     previous_len: usize,
     next_len: usize,
@@ -508,13 +548,13 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-const BACKGROUND_TOP_LEFT: [f32; 4] = [0.858, 0.910, 1.000, 1.0];
-const BACKGROUND_TOP_RIGHT: [f32; 4] = [0.945, 0.884, 1.000, 1.0];
-const BACKGROUND_BOTTOM_RIGHT: [f32; 4] = [0.846, 0.972, 0.910, 1.0];
-const BACKGROUND_BOTTOM_LEFT: [f32; 4] = [0.930, 0.950, 0.988, 1.0];
-const FOCUS_RING_COLOR: [f32; 4] = [0.165, 0.185, 0.225, 0.94];
-const NAV_STATUS_COLOR: [f32; 4] = [0.184, 0.204, 0.251, 1.0];
-const INSERT_STATUS_COLOR: [f32; 4] = [0.310, 0.435, 0.376, 1.0];
+const BACKGROUND_TOP_LEFT: [f32; 4] = [0.890, 0.930, 1.000, 1.0];
+const BACKGROUND_TOP_RIGHT: [f32; 4] = [0.960, 0.910, 1.000, 1.0];
+const BACKGROUND_BOTTOM_RIGHT: [f32; 4] = [0.875, 0.980, 0.930, 1.0];
+const BACKGROUND_BOTTOM_LEFT: [f32; 4] = [0.945, 0.960, 0.995, 1.0];
+const FOCUS_RING_COLOR: [f32; 4] = [0.135, 0.155, 0.205, 0.90];
+const NAV_STATUS_COLOR: [f32; 4] = [0.145, 0.165, 0.220, 1.0];
+const INSERT_STATUS_COLOR: [f32; 4] = [0.245, 0.395, 0.340, 1.0];
 const STATUS_PREVIEW_ACTIVE_GROUP_COLOR: [f32; 4] = [0.953, 0.965, 0.984, 0.16];
 const STATUS_PREVIEW_EMPTY_FOCUSED_COLOR: [f32; 4] = [0.953, 0.965, 0.984, 0.50];
 const STATUS_PREVIEW_VIEWPORT_COLOR: [f32; 4] = [0.953, 0.965, 0.984, 0.78];
@@ -536,13 +576,13 @@ const TOOL_RUNNING_TEXT_COLOR: [f32; 4] = [0.045, 0.265, 0.640, 1.0];
 const TOOL_SUCCESS_TEXT_COLOR: [f32; 4] = [0.035, 0.360, 0.220, 1.0];
 const TOOL_FAILED_TEXT_COLOR: [f32; 4] = [0.560, 0.070, 0.095, 1.0];
 const TOOL_PENDING_TEXT_COLOR: [f32; 4] = [0.320, 0.345, 0.405, 1.0];
-const TOOL_CARD_BACKGROUND_COLOR: [f32; 4] = [0.985, 0.990, 1.000, 0.56];
-const TOOL_CARD_ACTIVE_BACKGROUND_COLOR: [f32; 4] = [0.890, 0.945, 1.000, 0.62];
-const TOOL_CARD_SUCCESS_BACKGROUND_COLOR: [f32; 4] = [0.875, 0.975, 0.925, 0.46];
-const TOOL_CARD_FAILED_BACKGROUND_COLOR: [f32; 4] = [1.000, 0.900, 0.910, 0.54];
-const TOOL_CARD_GROUP_BACKGROUND_COLOR: [f32; 4] = [0.945, 0.930, 1.000, 0.40];
-const TOOL_CARD_BORDER_COLOR: [f32; 4] = [0.105, 0.165, 0.295, 0.16];
-const TOOL_CARD_ACTIVE_BORDER_COLOR: [f32; 4] = [0.000, 0.260, 0.720, 0.28];
+const TOOL_CARD_BACKGROUND_COLOR: [f32; 4] = [0.985, 0.990, 1.000, 0.68];
+const TOOL_CARD_ACTIVE_BACKGROUND_COLOR: [f32; 4] = [0.890, 0.945, 1.000, 0.72];
+const TOOL_CARD_SUCCESS_BACKGROUND_COLOR: [f32; 4] = [0.875, 0.975, 0.925, 0.56];
+const TOOL_CARD_FAILED_BACKGROUND_COLOR: [f32; 4] = [1.000, 0.900, 0.910, 0.64];
+const TOOL_CARD_GROUP_BACKGROUND_COLOR: [f32; 4] = [0.945, 0.930, 1.000, 0.50];
+const TOOL_CARD_BORDER_COLOR: [f32; 4] = [0.105, 0.165, 0.295, 0.22];
+const TOOL_CARD_ACTIVE_BORDER_COLOR: [f32; 4] = [0.000, 0.260, 0.720, 0.36];
 const TOOL_TIMELINE_RAIL_COLOR: [f32; 4] = [0.105, 0.165, 0.295, 0.20];
 const TOOL_TIMELINE_ACTIVE_RAIL_COLOR: [f32; 4] = [0.000, 0.260, 0.720, 0.46];
 const TOOL_OUTPUT_DRAWER_COLOR: [f32; 4] = [0.030, 0.055, 0.095, 0.070];
@@ -562,10 +602,10 @@ const WELCOME_AURORA_MINT: [f32; 4] = [0.220, 0.840, 0.660, 0.115];
 const WELCOME_AURORA_WARM: [f32; 4] = [1.000, 0.620, 0.360, 0.075];
 const WELCOME_HANDWRITING_COLOR: [f32; 4] = [0.012, 0.080, 0.250, 0.94];
 const NATIVE_SPINNER_HEAD_COLOR: [f32; 4] = [0.000, 0.260, 0.720, 1.0];
-const CODE_BLOCK_BACKGROUND_COLOR: [f32; 4] = [0.075, 0.095, 0.135, 0.075];
-const INLINE_CODE_BACKGROUND_COLOR: [f32; 4] = [0.075, 0.095, 0.135, 0.135];
-const QUOTE_CARD_BACKGROUND_COLOR: [f32; 4] = [0.520, 0.330, 0.760, 0.070];
-const TABLE_CARD_BACKGROUND_COLOR: [f32; 4] = [0.080, 0.460, 0.520, 0.060];
+const CODE_BLOCK_BACKGROUND_COLOR: [f32; 4] = [0.075, 0.095, 0.135, 0.105];
+const INLINE_CODE_BACKGROUND_COLOR: [f32; 4] = [0.075, 0.095, 0.135, 0.175];
+const QUOTE_CARD_BACKGROUND_COLOR: [f32; 4] = [0.520, 0.330, 0.760, 0.090];
+const TABLE_CARD_BACKGROUND_COLOR: [f32; 4] = [0.080, 0.460, 0.520, 0.085];
 const ERROR_CARD_BACKGROUND_COLOR: [f32; 4] = [0.850, 0.170, 0.170, 0.105];
 const OVERLAY_SELECTION_BACKGROUND_COLOR: [f32; 4] = [0.280, 0.470, 0.780, 0.115];
 const STATUS_PREVIEW_ACCENTS: [[f32; 3]; 8] = [
@@ -695,8 +735,17 @@ async fn run() -> Result<()> {
     if let Some(frames) = scroll_render_benchmark_frames(&args) {
         return run_scroll_render_benchmark(frames);
     }
+    if let Some(frames) = real_transcript_scroll_benchmark_frames(&args) {
+        return run_real_transcript_scroll_benchmark(frames);
+    }
+    if let Some(frames) = real_transcript_action_benchmark_frames(&args) {
+        return run_real_transcript_action_benchmark(frames);
+    }
     if let Some(output_dir) = hero_screenshot_capture_dir(&args) {
         return run_hero_screenshot_capture(&output_dir).await;
+    }
+    if let Some(capture) = gallery_screenshot_capture_request(&args) {
+        return run_gallery_screenshot_capture(&capture).await;
     }
     if let Some(raw_events) = stream_e2e_benchmark_raw_events(&args) {
         return run_stream_e2e_benchmark(raw_events);
@@ -789,6 +838,16 @@ async fn run() -> Result<()> {
     let mut power_inhibitor = power_inhibit::PowerInhibitor::new();
     let (session_event_tx, session_event_rx) = mpsc::channel();
     spawn_session_event_forwarder(session_event_rx, event_loop_proxy.clone());
+    if simulate_stream_requested(&args) && app.is_single_session() {
+        // Dev-only: drive the real streaming pipeline with synthetic, bursty
+        // TextDelta events so the streaming reveal animation can be observed and
+        // recorded live without a backend. Mirrors provider chunk cadence.
+        if let DesktopApp::SingleSession(single) = &mut app {
+            seed_desktop_stream_simulator_transcript(single);
+        }
+        window.set_title(&app.status_title());
+        spawn_desktop_stream_simulator(session_event_tx.clone());
+    }
     let reasoning_effort_queue = spawn_desktop_reasoning_effort_request_queue()?;
     let mut recovery_scan_pending = app.is_single_session() && !desktop_gallery;
     let mut first_frame_presented = false;
@@ -799,6 +858,10 @@ async fn run() -> Result<()> {
     let mut pending_backend_redraw_since: Option<Instant> = None;
     let mut surface_timeout_backoff = SurfaceTimeoutBackoff::default();
     let mut surface_timeout_redraw_at: Option<Instant> = None;
+    // Scheduled time for the next animation-driven redraw. Continuous animations
+    // re-arm this each presented frame so the loop paces itself to roughly the
+    // display refresh rate instead of busy-spinning the main thread.
+    let mut animation_redraw_at: Option<Instant> = None;
     let mut pending_resize: Option<PhysicalSize<u32>> = None;
     let mut space_hold_started_at: Option<Instant> = None;
     let mut space_hold_consumed = false;
@@ -845,6 +908,7 @@ async fn run() -> Result<()> {
             hot_reload_wake,
             space_hold_wake,
             surface_timeout_redraw_at,
+            animation_redraw_at,
         ]
             .into_iter()
             .flatten()
@@ -1195,6 +1259,20 @@ async fn run() -> Result<()> {
                                 window.request_redraw();
                             }
                         }
+                        KeyOutcome::SpawnSelfDevSession => {
+                            if let Err(error) = session_launch::launch_selfdev_session() {
+                                desktop_log::error(format_args!(
+                                    "jcode-desktop: failed to spawn self-dev session: {error:#}"
+                                ));
+                            }
+                        }
+                        KeyOutcome::SpawnHomeSession => {
+                            if let Err(error) = session_launch::launch_home_session() {
+                                desktop_log::error(format_args!(
+                                    "jcode-desktop: failed to spawn home session: {error:#}"
+                                ));
+                            }
+                        }
                         KeyOutcome::SendDraft {
                             session_id,
                             title,
@@ -1394,14 +1472,13 @@ async fn run() -> Result<()> {
                                     if app
                                         .set_reasoning_effort_via_active_session(effort.clone())
                                         .is_err()
-                                    {
-                                        if let Err(error) = reasoning_effort_queue.request(
+                                        && let Err(error) = reasoning_effort_queue.request(
                                             effort,
                                             target_session_id,
                                             session_event_tx.clone(),
-                                        ) {
-                                            apply_single_session_error(&mut app, error);
-                                        }
+                                        )
+                                    {
+                                        apply_single_session_error(&mut app, error);
                                     }
                                 }
                                 None => app.set_single_session_status_label(
@@ -1544,6 +1621,9 @@ async fn run() -> Result<()> {
                         window.set_title(&app.status_title());
                         window.request_redraw();
                     }
+                    if start_pending_transcript_hydration(&mut app, event_loop_proxy.clone()) {
+                        window.request_redraw();
+                    }
                     log_desktop_slow_interaction(
                         "keyboard_input",
                         keyboard_started.elapsed(),
@@ -1608,9 +1688,14 @@ async fn run() -> Result<()> {
                             target.exit();
                             return;
                         }
-                        if frame.animation_active {
-                            window.request_redraw();
-                        }
+                        // Pace continuous animations instead of immediately
+                        // re-requesting a redraw. An immediate request makes the
+                        // event loop render as fast as the CPU allows (the surface
+                        // presents without blocking), pinning the main thread near
+                        // 100% CPU and starving input/compositor scheduling. The
+                        // scheduled wake is serviced in AboutToWait.
+                        animation_redraw_at =
+                            next_animation_redraw_at(Instant::now(), frame.animation_active);
                     }
                     Err(SurfaceError::Lost | SurfaceError::Outdated) => {
                         surface_timeout_backoff.reset();
@@ -1764,6 +1849,21 @@ async fn run() -> Result<()> {
                 interaction_latency.mark("github_issue_sync", Instant::now());
                 window.request_redraw();
             }
+            Event::UserEvent(DesktopUserEvent::TranscriptHydrated {
+                session_id,
+                result,
+                loaded_in,
+            }) => {
+                if app.apply_hydrated_transcript(&session_id, result) {
+                    desktop_log::info(format_args!(
+                        "jcode-desktop: hydrated resumed transcript for {session_id} in {}ms",
+                        loaded_in.as_millis()
+                    ));
+                    window.set_title(&app.status_title());
+                    interaction_latency.mark("transcript_hydration", Instant::now());
+                    window.request_redraw();
+                }
+            }
             Event::UserEvent(DesktopUserEvent::SessionEvents(batch)) => {
                 let ui_received_at = Instant::now();
                 let accumulated_for = batch.accumulated_for();
@@ -1841,6 +1941,18 @@ async fn run() -> Result<()> {
                         }
                     }
                 }
+                // Service the paced animation redraw scheduled by RedrawRequested.
+                // This keeps continuous animations advancing at ~display refresh
+                // without busy-spinning the loop between frames.
+                if let Some(redraw_at) = animation_redraw_at {
+                    let now = Instant::now();
+                    if now >= redraw_at {
+                        animation_redraw_at = None;
+                        if surface_renderable {
+                            window.request_redraw();
+                        }
+                    }
+                }
                 if surface_renderable && app.is_single_session() {
                     let about_to_wait_started = Instant::now();
                     let size = window.inner_size();
@@ -1909,8 +2021,15 @@ async fn run() -> Result<()> {
                 {
                     canvas.needs_initial_frame = false;
                     window.request_redraw();
-                } else if surface_renderable && app.has_frame_animation() {
-                    window.request_redraw();
+                } else if surface_renderable
+                    && app.has_frame_animation()
+                    && animation_redraw_at.is_none()
+                {
+                    // An animation is active but no paced redraw is scheduled yet
+                    // (e.g. it just became active). Schedule one instead of
+                    // requesting a redraw on every loop iteration, which would
+                    // busy-spin the main thread at 100% CPU.
+                    animation_redraw_at = next_animation_redraw_at(Instant::now(), true);
                 }
             }
             _ => {}
@@ -2122,6 +2241,48 @@ fn start_pending_github_issue_sync(
     }
 }
 
+/// Start an off-thread transcript load for a session resumed from the
+/// switcher (or a promoted workspace card). The result is delivered back to
+/// the event loop as `DesktopUserEvent::TranscriptHydrated`, so large
+/// transcript parses never stall key handling. Falls back to a synchronous
+/// load if the job slot or thread spawn fails.
+fn start_pending_transcript_hydration(
+    app: &mut DesktopApp,
+    event_loop_proxy: EventLoopProxy<DesktopUserEvent>,
+) -> bool {
+    let Some(session_id) = app.take_pending_transcript_hydration() else {
+        return false;
+    };
+    let job_session_id = session_id.clone();
+    let spawned =
+        spawn_bounded_desktop_async_job("jcode-desktop-transcript-hydration", move || {
+            let started = Instant::now();
+            let result = session_data::load_session_transcript_by_id(&job_session_id)
+                .map_err(|error| format!("{error:#}"));
+            if event_loop_proxy
+                .send_event(DesktopUserEvent::TranscriptHydrated {
+                    session_id: job_session_id,
+                    result,
+                    loaded_in: started.elapsed(),
+                })
+                .is_err()
+            {
+                desktop_log::warn(format_args!(
+                    "jcode-desktop: failed to deliver hydrated transcript"
+                ));
+            }
+        });
+    if let Err(error) = spawned {
+        desktop_log::warn(format_args!(
+            "jcode-desktop: transcript hydration fell back to blocking load: {error:#}"
+        ));
+        let result = session_data::load_session_transcript_by_id(&session_id)
+            .map_err(|error| format!("{error:#}"));
+        app.apply_hydrated_transcript(&session_id, result);
+    }
+    true
+}
+
 fn spawn_desktop_preferences_saver() -> Option<mpsc::Sender<workspace::DesktopPreferences>> {
     let (tx, rx) = mpsc::channel::<workspace::DesktopPreferences>();
     match std::thread::Builder::new()
@@ -2202,6 +2363,104 @@ fn headless_chat_smoke_message(args: &[String]) -> Option<String> {
     })
 }
 
+/// Dev-only flag: `--simulate-stream` drives the live single-session app with
+/// synthetic streaming deltas so the streaming reveal animation can be observed
+/// and recorded without a real backend.
+fn simulate_stream_requested(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg == "--simulate-stream" || arg == "--simulate-streaming")
+}
+
+const DESKTOP_STREAM_SIMULATOR_SCRIPT: &str = "Sure, let me walk through how the streaming text reveal works in the desktop app. \
+When the provider sends tokens, they arrive in bursty chunks rather than a smooth flow, \
+so the renderer keeps a `revealed_chars` cursor that eases toward the full response length. \
+The trailing characters get a per-character alpha ramp called the tail fade, \
+and a soft breathing cursor sits at the very end of the revealed text to signal activity.\n\n\
+Here is a short list of the moving parts:\n\
+- The reveal motion integrates a rate proportional to the backlog.\n\
+- The body text buffer is rebuilt as the reveal advances.\n\
+- A separate overlay buffer paints the streaming tail with its own opacity.\n\n\
+Once the response finishes, the overlay hands off to the committed transcript message. \
+That handoff should be seamless, with no visible jump or flicker as the text settles into place. \
+This paragraph is intentionally long so the streaming text wraps across many lines and the \
+viewport scrolls while new tokens keep arriving at the bottom of the transcript.";
+
+/// Seed a small prior transcript so the simulated stream appends after existing
+/// messages, mirroring the common case of streaming inside an active session.
+fn seed_desktop_stream_simulator_transcript(app: &mut SingleSessionApp) {
+    app.replace_session(Some(workspace::SessionCard {
+        session_id: "simulate-stream".to_string(),
+        title: "Streaming simulation".to_string(),
+        subtitle: "dev stream harness".to_string(),
+        detail: "fixture".to_string(),
+        preview_lines: Vec::new(),
+        detail_lines: Vec::new(),
+        transcript_messages: Vec::new(),
+    }));
+    app.messages.push(SingleSessionMessage::user(
+        "Explain how the desktop streaming text reveal works.",
+    ));
+    app.messages.push(SingleSessionMessage::assistant(
+        "Earlier reply: the desktop renders streamed assistant text with an adaptive reveal so bursty provider chunks flow in smoothly instead of popping.",
+    ));
+    app.scroll_body_to_bottom();
+}
+
+/// Spawn a background thread that emits synthetic streaming events to exercise
+/// the real desktop streaming animation pipeline.
+fn spawn_desktop_stream_simulator(
+    session_event_tx: mpsc::Sender<session_launch::DesktopSessionEvent>,
+) {
+    std::thread::Builder::new()
+        .name("jcode-desktop-stream-simulator".to_string())
+        .spawn(move || {
+            // Give the window a moment to come up before streaming starts.
+            std::thread::sleep(Duration::from_millis(900));
+            if session_event_tx
+                .send(session_launch::DesktopSessionEvent::SessionStarted {
+                    session_id: "simulate-stream".to_string(),
+                })
+                .is_err()
+            {
+                return;
+            }
+            // Emit word-sized deltas, occasionally bursting several words at once
+            // to mimic real provider chunking, with brief stalls between bursts.
+            let words: Vec<&str> = DESKTOP_STREAM_SIMULATOR_SCRIPT
+                .split_inclusive(' ')
+                .collect();
+            let mut index = 0usize;
+            let mut burst_phase = 0usize;
+            while index < words.len() {
+                let burst = match burst_phase % 4 {
+                    0 => 1,
+                    1 => 3,
+                    2 => 2,
+                    _ => 5,
+                };
+                burst_phase += 1;
+                let end = (index + burst).min(words.len());
+                let chunk: String = words[index..end].concat();
+                index = end;
+                if session_event_tx
+                    .send(session_launch::DesktopSessionEvent::TextDelta(chunk))
+                    .is_err()
+                {
+                    return;
+                }
+                let pause = match burst_phase % 5 {
+                    0 => Duration::from_millis(220),
+                    3 => Duration::from_millis(120),
+                    _ => Duration::from_millis(45),
+                };
+                std::thread::sleep(pause);
+            }
+            std::thread::sleep(Duration::from_millis(400));
+            let _ = session_event_tx.send(session_launch::DesktopSessionEvent::Done);
+        })
+        .ok();
+}
+
 const DESKTOP_HELP_LINES: &[&str] = &[
     "Jcode Desktop",
     "",
@@ -2217,8 +2476,13 @@ const DESKTOP_HELP_LINES: &[&str] = &[
     "  --startup-log                Print launch timing milestones to stderr",
     "  --startup-benchmark          Print launch timings and exit after the first frame",
     "  --capture-hero-animation DIR Write deterministic hero animation PNG frames and exit",
+    "  --capture-gallery-screens DIR Render gallery fixture states to PNGs headlessly and exit",
+    "  --capture-keys KEYS          With --capture-gallery-screens: comma-separated keys to replay first",
+    "  --capture-size WxH           With --capture-gallery-screens: render size in pixels",
     "  --resize-render-benchmark[N]  Print CPU resize/render benchmark JSON and exit",
     "  --scroll-render-benchmark[N]  Print CPU scroll/render benchmark JSON and exit",
+    "  --real-transcript-scroll-benchmark[N]  Profile scrolling against your real on-disk transcripts and exit",
+    "  --real-transcript-action-benchmark[N]  Profile mixed user actions (scroll/resize/typing/pickers/selection/streaming) on real transcripts and exit",
     "  --stream-e2e-benchmark[N]     Print stream event-to-paint guardrail JSON and exit",
     "  --headless-chat-smoke <MSG>  Run a hidden backend smoke test and print JSON events",
     "  --headless-chat-smoke=<MSG>  Same as above",
@@ -2241,6 +2505,193 @@ fn hero_screenshot_capture_dir(args: &[String]) -> Option<PathBuf> {
                     .flatten()
             })
     })
+}
+
+/// Request for a headless gallery screenshot capture.
+///
+/// `--capture-gallery-screens DIR` renders every gallery fixture state to a
+/// PNG in DIR without opening a window. `--gallery-state STATE` (optional)
+/// restricts the capture to a single state, and `--capture-keys KEYSPEC`
+/// (optional) replays comma-separated key names against each state before
+/// rendering, so arbitrary interaction states can be inspected visually.
+struct GalleryScreenshotCaptureRequest {
+    output_dir: PathBuf,
+    state: Option<String>,
+    keys: Vec<String>,
+    size: Option<PhysicalSize<u32>>,
+}
+
+fn gallery_screenshot_capture_request(args: &[String]) -> Option<GalleryScreenshotCaptureRequest> {
+    let output_dir = args.iter().enumerate().find_map(|(index, arg)| {
+        arg.strip_prefix("--capture-gallery-screens=")
+            .map(PathBuf::from)
+            .or_else(|| {
+                (arg == "--capture-gallery-screens")
+                    .then(|| args.get(index + 1).map(PathBuf::from))
+                    .flatten()
+            })
+    })?;
+    let keys = args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| {
+            arg.strip_prefix("--capture-keys=")
+                .map(str::to_string)
+                .or_else(|| {
+                    (arg == "--capture-keys")
+                        .then(|| args.get(index + 1).cloned())
+                        .flatten()
+                })
+        })
+        .map(|spec| {
+            spec.split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let size = args
+        .iter()
+        .enumerate()
+        .find_map(|(index, arg)| {
+            arg.strip_prefix("--capture-size=")
+                .map(str::to_string)
+                .or_else(|| {
+                    (arg == "--capture-size")
+                        .then(|| args.get(index + 1).cloned())
+                        .flatten()
+                })
+        })
+        .and_then(|spec| {
+            let (width, height) = spec.split_once('x')?;
+            Some(PhysicalSize::new(
+                width.trim().parse().ok()?,
+                height.trim().parse().ok()?,
+            ))
+        });
+    Some(GalleryScreenshotCaptureRequest {
+        output_dir,
+        state: desktop_gallery::state_from_args(args),
+        keys,
+        size,
+    })
+}
+
+/// Parse a key name from `--capture-keys` into a `KeyInput`.
+fn capture_key_input(name: &str) -> Option<KeyInput> {
+    Some(match name {
+        "escape" => KeyInput::Escape,
+        "enter" => KeyInput::Enter,
+        "backspace" => KeyInput::Backspace,
+        "tab" => KeyInput::Autocomplete,
+        "submit" => KeyInput::SubmitDraft,
+        "model-picker" => KeyInput::OpenModelPicker,
+        "session-switcher" => KeyInput::OpenSessionSwitcher,
+        "hotkey-help" => KeyInput::HotkeyHelp,
+        "session-info" => KeyInput::ToggleSessionInfo,
+        "scroll-up" => KeyInput::ScrollBodyLines(-3),
+        "scroll-down" => KeyInput::ScrollBodyLines(3),
+        "scroll-top" => KeyInput::ScrollBodyToTop,
+        "scroll-bottom" => KeyInput::ScrollBodyToBottom,
+        "page-up" => KeyInput::ScrollBodyPages(-1),
+        "page-down" => KeyInput::ScrollBodyPages(1),
+        "text-bigger" => KeyInput::AdjustTextScale(1),
+        "text-smaller" => KeyInput::AdjustTextScale(-1),
+        other => {
+            let text = other.strip_prefix("char:")?;
+            KeyInput::Character(text.to_string())
+        }
+    })
+}
+
+async fn run_gallery_screenshot_capture(request: &GalleryScreenshotCaptureRequest) -> Result<()> {
+    std::fs::create_dir_all(&request.output_dir).with_context(|| {
+        format!(
+            "failed to create gallery screenshot directory {}",
+            request.output_dir.display()
+        )
+    })?;
+    let states: Vec<String> = match &request.state {
+        Some(state) => vec![state.clone()],
+        None => desktop_gallery::gallery_states()
+            .iter()
+            .map(|state| state.to_string())
+            .collect(),
+    };
+    let keys = request
+        .keys
+        .iter()
+        .map(|name| {
+            capture_key_input(name).with_context(|| format!("unknown capture key name {name:?}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let size = request.size.unwrap_or_else(|| {
+        PhysicalSize::new(DEFAULT_WINDOW_WIDTH as u32, DEFAULT_WINDOW_HEIGHT as u32)
+    });
+    let mut manifest = Vec::new();
+    for state in &states {
+        let mut app = desktop_gallery::temporary_app(state);
+        for key in &keys {
+            app.handle_key(key.clone());
+        }
+        let DesktopApp::SingleSession(single) = &mut app else {
+            anyhow::bail!("gallery screenshot capture only supports single-session states");
+        };
+        single.settle_animations_for_capture();
+        let single = &*single;
+        let rendered_lines = single_session_rendered_body_lines_for_tick(single, size, 4);
+        let widget_geometry =
+            inline_widget_capture_geometry(single, size, rendered_lines.len()).map(
+                |(card, text_top, line_height, visible_text_bottom, visible_text_right)| {
+                    serde_json::json!({
+                        "card": { "x": card.x, "y": card.y, "width": card.width, "height": card.height },
+                        "text_top": text_top,
+                        "line_height": line_height,
+                        "visible_text_bottom": visible_text_bottom,
+                        "visible_text_right": visible_text_right,
+                    })
+                },
+            );
+        let (image, vertices) = render_hero_frame_to_image(single, size, 4, 1.0, false).await?;
+        let filename = if request.keys.is_empty() {
+            format!("gallery-{state}.png")
+        } else {
+            let key_part = request
+                .keys
+                .join("+")
+                .chars()
+                .map(|ch| {
+                    if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '_' | ':') {
+                        ch
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            format!("gallery-{state}+{key_part}.png")
+        };
+        let path = request.output_dir.join(&filename);
+        image
+            .save(&path)
+            .with_context(|| format!("failed to save {}", path.display()))?;
+        manifest.push(serde_json::json!({
+            "state": state,
+            "file": filename,
+            "keys": request.keys,
+            "vertices": vertices,
+            "inline_widget": widget_geometry,
+            "snapshot": serde_json::to_value(app.snapshot())?,
+        }));
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "output_dir": request.output_dir,
+            "screens": manifest,
+        })
+    );
+    Ok(())
 }
 
 async fn run_hero_screenshot_capture(output_dir: &Path) -> Result<()> {
@@ -2453,7 +2904,7 @@ async fn render_hero_frame_to_image(
             0.0,
             &rendered_body_lines,
         );
-        vertices.truncate(0);
+        vertices.clear();
         push_gradient_rect(
             &mut vertices,
             Rect {
@@ -2609,6 +3060,11 @@ enum DesktopUserEvent {
     GitHubIssuesSyncFinished(
         std::result::Result<desktop_issue_cache::GitHubIssueSyncSummary, String>,
     ),
+    TranscriptHydrated {
+        session_id: String,
+        result: std::result::Result<Option<Vec<workspace::SessionTranscriptMessage>>, String>,
+        loaded_in: Duration,
+    },
     RecoveryCount(usize),
 }
 
@@ -3202,9 +3658,70 @@ fn run_resize_render_benchmark(frames: usize) -> Result<()> {
             ^ body_glyphs
     });
 
+    let mut workspace_resize_cards = benchmark_workspace_session_cards(16);
+    for (index, card) in workspace_resize_cards.iter_mut().enumerate() {
+        card.transcript_messages = vec![
+            workspace::SessionTranscriptMessage {
+                role: "user".to_string(),
+                content: format!("resize prompt {index}"),
+            },
+            workspace::SessionTranscriptMessage {
+                role: "assistant".to_string(),
+                content: format!(
+                    "resize response {index}: representative workspace transcript content that wraps while the window is resized"
+                ),
+            },
+        ];
+    }
+    let workspace_resize_app = Workspace::from_session_cards(workspace_resize_cards);
+    let mut workspace_resize_font_system = benchmark_font_system();
+    let mut workspace_resize_text_pane_cache = HashMap::new();
+    let (workspace_resize_samples, workspace_resize_checksum) =
+        benchmark_frame_samples(frames, |frame| {
+            let size = sizes[frame];
+            let layout = workspace_render_layout(&workspace_resize_app, size, Some(size));
+            let panes = build_workspace_single_session_text_panes(
+                &mut workspace_resize_text_pane_cache,
+                &workspace_resize_app,
+                size,
+                layout,
+                None,
+                &mut workspace_resize_font_system,
+            );
+            let pane_count = panes.len();
+            let areas = workspace_single_session_text_areas(&panes);
+            let area_count = areas.len();
+            drop(areas);
+            drop(panes);
+            let mut vertices =
+                Vec::with_capacity(workspace_vertex_capacity_hint(&workspace_resize_app));
+            build_vertices_into(
+                WorkspaceVertexBuildParams {
+                    workspace: &workspace_resize_app,
+                    size,
+                    render_layout: layout,
+                    focus_pulse: 0.0,
+                    space_hold_progress: None,
+                    surface_frames: None,
+                    exiting_surfaces: &HashMap::new(),
+                    workspace_panel_cache: Some(&workspace_resize_text_pane_cache),
+                    status_color: workspace_status_bar_target_color(&workspace_resize_app),
+                    status_text_frame: None,
+                },
+                &mut vertices,
+            );
+            pane_count ^ area_count ^ vertices.len() ^ workspace_resize_app.surfaces.len()
+        });
+
     let optimized_p95 = percentile_ms(&optimized_samples, 0.95);
     let optimized_max = max_sample_ms(&optimized_samples);
-    let passes_resize_cpu_budget = optimized_p95 <= target_p95_ms && optimized_max <= target_max_ms;
+    let workspace_resize_p95 = percentile_ms(&workspace_resize_samples, 0.95);
+    let workspace_resize_max = max_sample_ms(&workspace_resize_samples);
+    let passes_workspace_resize_budget =
+        workspace_resize_p95 <= target_p95_ms && workspace_resize_max <= target_max_ms;
+    let passes_resize_cpu_budget = optimized_p95 <= target_p95_ms
+        && optimized_max <= target_max_ms
+        && passes_workspace_resize_budget;
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
@@ -3212,7 +3729,8 @@ fn run_resize_render_benchmark(frames: usize) -> Result<()> {
             "target_p95_ms": target_p95_ms,
             "target_repeated_max_ms": target_max_ms,
             "passes_resize_cpu_budget": passes_resize_cpu_budget,
-            "scenario": "large transcript continuous resize CPU layout path",
+            "passes_workspace_resize_budget": passes_workspace_resize_budget,
+            "scenario": "large transcript and workspace continuous resize CPU layout paths",
             "size_range": {
                 "min_width": sizes.iter().map(|size| size.width).min().unwrap_or_default(),
                 "max_width": sizes.iter().map(|size| size.width).max().unwrap_or_default(),
@@ -3223,6 +3741,7 @@ fn run_resize_render_benchmark(frames: usize) -> Result<()> {
             "optimized_body_buffer_rebuilds": optimized_body_rebuilds,
             "legacy": benchmark_samples_json("legacy_resize_full_text_relayout", &legacy_samples, legacy_checksum),
             "optimized": benchmark_samples_json("optimized_resize_cached_visible_body", &optimized_samples, optimized_checksum),
+            "workspace_multi_pane": benchmark_samples_json("workspace_multi_pane_resize_reflow", &workspace_resize_samples, workspace_resize_checksum),
         }))?
     );
     Ok(())
@@ -4299,6 +4818,8 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
     let mut workspace_layout_ms = 0.0;
     let mut workspace_vertices_ms = 0.0;
     let mut workspace_visible_surfaces = 0usize;
+    let mut workspace_navigation_font_system = benchmark_font_system();
+    let mut workspace_navigation_text_pane_cache = HashMap::new();
     let (workspace_navigation_ms, workspace_navigation_checksum) =
         benchmark_phase(frames, |frame| {
             let key = if frame % 2 == 0 { "l" } else { "h" };
@@ -4306,12 +4827,40 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
             let phase_started = Instant::now();
             let layout = workspace_render_layout(&workspace_app, size, Some(size));
             workspace_layout_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
+            let panes = build_workspace_single_session_text_panes(
+                &mut workspace_navigation_text_pane_cache,
+                &workspace_app,
+                size,
+                layout,
+                None,
+                &mut workspace_navigation_font_system,
+            );
+            let pane_count = panes.len();
+            drop(panes);
             let phase_started = Instant::now();
-            let vertices = build_vertices(&workspace_app, size, layout, 0.0, None);
+            let mut vertices = Vec::with_capacity(workspace_vertex_capacity_hint(&workspace_app));
+            build_vertices_into(
+                WorkspaceVertexBuildParams {
+                    workspace: &workspace_app,
+                    size,
+                    render_layout: layout,
+                    focus_pulse: 0.0,
+                    space_hold_progress: None,
+                    surface_frames: None,
+                    exiting_surfaces: &HashMap::new(),
+                    workspace_panel_cache: Some(&workspace_navigation_text_pane_cache),
+                    status_color: workspace_status_bar_target_color(&workspace_app),
+                    status_text_frame: None,
+                },
+                &mut vertices,
+            );
             workspace_vertices_ms += phase_started.elapsed().as_secs_f64() * 1000.0;
             workspace_visible_surfaces +=
                 workspace_visible_surface_count(&workspace_app, size, layout);
-            vertices.len() ^ (workspace_app.focused_id as usize) ^ workspace_app.surfaces.len()
+            vertices.len()
+                ^ pane_count
+                ^ (workspace_app.focused_id as usize)
+                ^ workspace_app.surfaces.len()
         });
 
     let mut workspace_full_app =
@@ -4414,6 +4963,295 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
         (key as usize) ^ frame ^ large_app.messages.len()
     });
 
+    let mut workspace_focus_app =
+        Workspace::from_session_cards(benchmark_workspace_session_cards(128));
+    let workspace_focus_layout = workspace_render_layout(&workspace_focus_app, size, Some(size));
+    let mut workspace_focus_font_system = benchmark_font_system();
+    let mut workspace_focus_text_pane_cache = HashMap::new();
+    let _ = build_workspace_single_session_text_panes(
+        &mut workspace_focus_text_pane_cache,
+        &workspace_focus_app,
+        size,
+        workspace_focus_layout,
+        None,
+        &mut workspace_focus_font_system,
+    );
+    let (workspace_focus_pulse_ms, workspace_focus_pulse_checksum) =
+        benchmark_phase(frames, |frame| {
+            let key = match frame % 4 {
+                0 => "l",
+                1 => "j",
+                2 => "h",
+                _ => "k",
+            };
+            let _ = workspace_focus_app.handle_key(KeyInput::Character(key.to_string()));
+            let layout = workspace_render_layout(&workspace_focus_app, size, Some(size));
+            let focus_pulse = 0.35 + 0.45 * ((frame as f32) * 0.19).sin().abs();
+            let mut vertices =
+                Vec::with_capacity(workspace_vertex_capacity_hint(&workspace_focus_app));
+            build_vertices_into(
+                WorkspaceVertexBuildParams {
+                    workspace: &workspace_focus_app,
+                    size,
+                    render_layout: layout,
+                    focus_pulse,
+                    space_hold_progress: None,
+                    surface_frames: None,
+                    exiting_surfaces: &HashMap::new(),
+                    workspace_panel_cache: Some(&workspace_focus_text_pane_cache),
+                    status_color: workspace_status_bar_target_color(&workspace_focus_app),
+                    status_text_frame: None,
+                },
+                &mut vertices,
+            );
+            vertices.len() ^ workspace_focus_app.focused_id as usize
+        });
+
+    let mut workspace_transition_app =
+        Workspace::from_session_cards(benchmark_workspace_session_cards(128));
+    let mut workspace_transition_animator = SurfaceTransitionAnimator::default();
+    let mut workspace_transition_exit_cache = HashMap::new();
+    let transition_base_layout =
+        workspace_render_layout(&workspace_transition_app, size, Some(size));
+    let transition_targets = workspace_surface_transition_targets(
+        &workspace_transition_app,
+        size,
+        transition_base_layout,
+    );
+    let transition_start = Instant::now();
+    let _ = workspace_transition_animator.frame(transition_targets, transition_start);
+    let mut workspace_transition_font_system = benchmark_font_system();
+    let mut workspace_transition_text_pane_cache = HashMap::new();
+    let _ = build_workspace_single_session_text_panes(
+        &mut workspace_transition_text_pane_cache,
+        &workspace_transition_app,
+        size,
+        transition_base_layout,
+        None,
+        &mut workspace_transition_font_system,
+    );
+    let (workspace_surface_transition_ms, workspace_surface_transition_checksum) =
+        benchmark_phase(frames, |frame| {
+            if frame == 0 || frame % 20 == 0 {
+                let _ = workspace_transition_app.handle_key(KeyInput::Character("l".to_string()));
+            } else if frame % 20 == 10 {
+                let _ = workspace_transition_app.handle_key(KeyInput::Character("h".to_string()));
+            }
+            let layout = workspace_render_layout(&workspace_transition_app, size, Some(size));
+            let targets =
+                workspace_surface_transition_targets(&workspace_transition_app, size, layout);
+            let now = transition_start + Duration::from_millis((frame as u64 + 1) * 8);
+            let surface_frames = WorkspaceSurfaceTransitionFrames::new(
+                workspace_transition_animator.frame(targets, now),
+                workspace_transition_animator.is_animating(),
+            );
+            update_workspace_surface_exit_cache(
+                &mut workspace_transition_exit_cache,
+                &workspace_transition_app,
+                &surface_frames,
+            );
+            let mut vertices =
+                Vec::with_capacity(workspace_vertex_capacity_hint(&workspace_transition_app));
+            build_vertices_into(
+                WorkspaceVertexBuildParams {
+                    workspace: &workspace_transition_app,
+                    size,
+                    render_layout: layout,
+                    focus_pulse: 0.0,
+                    space_hold_progress: None,
+                    surface_frames: Some(&surface_frames),
+                    exiting_surfaces: &workspace_transition_exit_cache,
+                    workspace_panel_cache: Some(&workspace_transition_text_pane_cache),
+                    status_color: workspace_status_bar_target_color(&workspace_transition_app),
+                    status_text_frame: None,
+                },
+                &mut vertices,
+            );
+            vertices.len() ^ surface_frames.frames.len() ^ usize::from(surface_frames.animating)
+        });
+
+    let mut selection_drag_app = desktop_scroll_benchmark_app_with_turns(120);
+    let selection_body_lines =
+        single_session_rendered_body_lines_for_tick(&selection_drag_app, size, 0);
+    if let Some(metrics) = single_session_body_scroll_metrics_for_total_lines(
+        &selection_drag_app,
+        size,
+        selection_body_lines.len(),
+    ) {
+        selection_drag_app.body_scroll_lines = metrics.max_scroll_lines as f32 / 2.0;
+    }
+    selection_drag_app.begin_selection(SelectionPoint { line: 0, column: 0 });
+    let (selection_drag_ms, selection_drag_checksum) = benchmark_phase(frames, |frame| {
+        let viewport = single_session_body_viewport_from_lines(
+            &selection_drag_app,
+            size,
+            0.0,
+            &selection_body_lines,
+        );
+        let line = (frame * 3).min(viewport.lines.len().saturating_sub(1));
+        selection_drag_app.update_selection(SelectionPoint {
+            line,
+            column: viewport
+                .lines
+                .get(line)
+                .map(|line| line.text.len())
+                .unwrap_or_default(),
+        });
+        let vertices = build_single_session_vertices_with_cached_body(
+            &selection_drag_app,
+            size,
+            0.0,
+            frame as u64,
+            0.0,
+            1.0,
+            &selection_body_lines,
+        );
+        viewport.lines.len() ^ vertices.len()
+    });
+
+    let mut streaming_scroll_app = app.clone();
+    streaming_scroll_app.streaming_response.clear();
+    let mut streaming_scroll_body_lines =
+        single_session_rendered_body_lines_for_tick(&streaming_scroll_app, size, 0);
+    let (streaming_while_scrolling_ms, streaming_while_scrolling_checksum) =
+        benchmark_phase(frames, |frame| {
+            streaming_scroll_app
+                .streaming_response
+                .push(benchmark_typing_char(frame));
+            if frame % 13 == 0 {
+                streaming_scroll_app.streaming_response.push('\n');
+            }
+            streaming_scroll_app.scroll_body_lines(if frame % 2 == 0 { 1 } else { -1 });
+            streaming_scroll_body_lines = single_session_rendered_body_lines_for_tick(
+                &streaming_scroll_app,
+                size,
+                frame as u64,
+            );
+            let viewport = single_session_body_viewport_from_lines(
+                &streaming_scroll_app,
+                size,
+                benchmark_smooth_scroll_lines(frame),
+                &streaming_scroll_body_lines,
+            );
+            let vertices = build_single_session_vertices_with_cached_body(
+                &streaming_scroll_app,
+                size,
+                0.0,
+                frame as u64,
+                benchmark_smooth_scroll_lines(frame),
+                1.0,
+                &streaming_scroll_body_lines,
+            );
+            streaming_scroll_body_lines.len() ^ viewport.lines.len() ^ vertices.len()
+        });
+
+    let mut many_tools_app = desktop_scroll_benchmark_app_with_turns(16);
+    for index in 0..320usize {
+        let id = Some(format!("tool-{index}"));
+        many_tools_app.apply_session_event(session_launch::DesktopSessionEvent::ToolStarted {
+            id: id.clone(),
+            name: "bash".to_string(),
+        });
+        many_tools_app.apply_session_event(session_launch::DesktopSessionEvent::ToolInput {
+            id: id.clone(),
+            delta: format!("echo card {index}\n"),
+        });
+        many_tools_app.apply_session_event(session_launch::DesktopSessionEvent::ToolExecuting {
+            id: id.clone(),
+            name: "bash".to_string(),
+        });
+        many_tools_app.apply_session_event(session_launch::DesktopSessionEvent::ToolFinished {
+            id,
+            name: "bash".to_string(),
+            summary: format!("output line for tool card {index}\n"),
+            is_error: false,
+        });
+    }
+    let many_tools_body_lines =
+        single_session_rendered_body_lines_for_tick(&many_tools_app, size, 0);
+    if let Some(metrics) = single_session_body_scroll_metrics_for_total_lines(
+        &many_tools_app,
+        size,
+        many_tools_body_lines.len(),
+    ) {
+        many_tools_app.body_scroll_lines = metrics.max_scroll_lines as f32 / 2.0;
+    }
+    let (many_tool_cards_ms, many_tool_cards_checksum) = benchmark_phase(frames, |frame| {
+        many_tools_app.scroll_body_lines(if frame % 2 == 0 { 4 } else { -4 });
+        let viewport = single_session_body_viewport_from_lines(
+            &many_tools_app,
+            size,
+            0.0,
+            &many_tools_body_lines,
+        );
+        let vertices = build_single_session_vertices_with_cached_body(
+            &many_tools_app,
+            size,
+            0.0,
+            frame as u64,
+            0.0,
+            1.0,
+            &many_tools_body_lines,
+        );
+        many_tools_body_lines.len() ^ viewport.lines.len() ^ vertices.len()
+    });
+
+    let mut large_composer_app = app.clone();
+    large_composer_app.scroll_body_to_bottom();
+    large_composer_app.draft = (0..40).map(|index| format!("large pasted paragraph {index}: lorem ipsum dolor sit amet, consectetur adipiscing elit. ")).collect::<String>();
+    large_composer_app.draft_cursor = large_composer_app.draft.len();
+    let large_composer_body_lines =
+        single_session_rendered_body_lines_for_tick(&large_composer_app, size, 0);
+    let mut large_composer_font_system = benchmark_font_system();
+    let mut large_composer_previous_key = None;
+    let mut large_composer_buffers: Vec<Buffer> = Vec::new();
+    let (large_composer_draft_ms, large_composer_draft_checksum) =
+        benchmark_phase(frames, |frame| {
+            large_composer_app.draft.push(benchmark_typing_char(frame));
+            if frame % 41 == 0 {
+                large_composer_app.draft.push('\n');
+            }
+            large_composer_app.draft_cursor = large_composer_app.draft.len();
+            let key = single_session_text_key_for_tick_with_rendered_body(
+                &large_composer_app,
+                size,
+                frame as u64,
+                0.0,
+                &large_composer_body_lines,
+            );
+            let previous_key = large_composer_previous_key.take();
+            let old_buffers = std::mem::take(&mut large_composer_buffers);
+            large_composer_buffers = single_session_text_buffers_from_key_reusing_unchanged(
+                &key,
+                previous_key.as_ref(),
+                old_buffers,
+                true,
+                size,
+                &mut large_composer_font_system,
+            );
+            large_composer_previous_key = Some(key);
+            let areas = single_session_text_areas_for_app_with_cached_body(
+                &large_composer_app,
+                &large_composer_buffers,
+                size,
+                0.0,
+                &large_composer_body_lines,
+            );
+            let vertices = build_single_session_vertices_with_cached_body(
+                &large_composer_app,
+                size,
+                0.0,
+                frame as u64,
+                0.0,
+                1.0,
+                &large_composer_body_lines,
+            );
+            large_composer_app.draft.len()
+                ^ large_composer_buffers.len()
+                ^ areas.len()
+                ^ vertices.len()
+        });
+
     let target_budget_ms = duration_ms(DESKTOP_120FPS_FRAME_BUDGET);
     let critical_phase_means_ms = [
         visible_whole_line_text_ms / frames as f64,
@@ -4430,6 +5268,10 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
         action_visible_ms / frames as f64,
         workspace_navigation_ms / frames as f64,
         workspace_full_frame_ms / frames as f64,
+        workspace_focus_pulse_ms / frames as f64,
+        workspace_surface_transition_ms / frames as f64,
+        streaming_while_scrolling_ms / frames as f64,
+        many_tool_cards_ms / frames as f64,
         large_scroll_ms / frames as f64,
         large_cache_key_ms / frames as f64,
     ];
@@ -4450,6 +5292,12 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
             "passes_long_streaming_body_wrap_budget": (long_streaming_body_wrap_ms / frames as f64) <= target_budget_ms,
             "passes_long_streaming_line_count_budget": (long_streaming_line_count_ms / frames as f64) <= target_budget_ms,
             "passes_long_unbroken_streaming_wrap_budget": (long_unbroken_streaming_wrap_ms / frames as f64) <= target_budget_ms,
+            "passes_workspace_focus_pulse_budget": (workspace_focus_pulse_ms / frames as f64) <= target_budget_ms,
+            "passes_workspace_surface_transition_budget": (workspace_surface_transition_ms / frames as f64) <= target_budget_ms,
+            "passes_selection_drag_budget": (selection_drag_ms / frames as f64) <= 16.0,
+            "passes_streaming_while_scrolling_budget": (streaming_while_scrolling_ms / frames as f64) <= target_budget_ms,
+            "passes_many_tool_cards_budget": (many_tool_cards_ms / frames as f64) <= target_budget_ms,
+            "passes_large_composer_draft_budget": (large_composer_draft_ms / frames as f64) <= 16.0,
             "event_delivery": {
                 "previous_background_poll_interval_ms": duration_ms(BACKGROUND_POLL_INTERVAL),
                 "backend_redraw_frame_interval_ms": duration_ms(BACKEND_REDRAW_FRAME_INTERVAL),
@@ -4584,6 +5432,42 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
                     workspace_full_frame_checksum,
                 ),
                 benchmark_phase_json(
+                    "workspace_focus_pulse_animation",
+                    workspace_focus_pulse_ms,
+                    frames,
+                    workspace_focus_pulse_checksum,
+                ),
+                benchmark_phase_json(
+                    "workspace_surface_enter_exit_transition",
+                    workspace_surface_transition_ms,
+                    frames,
+                    workspace_surface_transition_checksum,
+                ),
+                benchmark_phase_json(
+                    "selection_drag_large_transcript",
+                    selection_drag_ms,
+                    frames,
+                    selection_drag_checksum,
+                ),
+                benchmark_phase_json(
+                    "streaming_while_scrolling",
+                    streaming_while_scrolling_ms,
+                    frames,
+                    streaming_while_scrolling_checksum,
+                ),
+                benchmark_phase_json(
+                    "many_tool_cards_scroll",
+                    many_tool_cards_ms,
+                    frames,
+                    many_tool_cards_checksum,
+                ),
+                benchmark_phase_json(
+                    "large_composer_draft_edit",
+                    large_composer_draft_ms,
+                    frames,
+                    large_composer_draft_checksum,
+                ),
+                benchmark_phase_json(
                     "large_transcript_scroll_visible_body_only",
                     large_scroll_ms,
                     frames,
@@ -4681,6 +5565,916 @@ fn run_scroll_render_benchmark(frames: usize) -> Result<()> {
         }))?
     );
     Ok(())
+}
+
+/// Selection knobs for the real-transcript benchmarks.
+///
+/// Returns `(max_sessions, min_messages)`: how many of the largest on-disk
+/// transcripts to profile, and the minimum message count for a transcript to
+/// qualify. Both are overridable via environment variables so a run can target
+/// more (or fewer) of the biggest transcripts without a rebuild:
+///
+/// - `JCODE_DESKTOP_BENCHMARK_SESSIONS` (default 8)
+/// - `JCODE_DESKTOP_BENCHMARK_MIN_MESSAGES` (default 24)
+fn real_transcript_benchmark_selection() -> (usize, usize) {
+    let max_sessions = std::env::var("JCODE_DESKTOP_BENCHMARK_SESSIONS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(8);
+    let min_messages = std::env::var("JCODE_DESKTOP_BENCHMARK_MIN_MESSAGES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(24);
+    (max_sessions, min_messages)
+}
+
+/// Profile scrolling against the user's real on-disk transcripts.
+///
+/// This loads the largest real session files (full, untruncated message lists)
+/// and drives the exact production windowed-scroll render path: cached body
+/// wrap, a sliding text-buffer window, viewport extraction, glyph shaping for
+/// the visible window, text areas, and primitive geometry. Per-frame work is
+/// reported per session and aggregated so we can attribute any scroll jank to a
+/// specific stage on real content rather than synthetic fixtures.
+fn run_real_transcript_scroll_benchmark(frames: usize) -> Result<()> {
+    let frames = frames.max(1);
+    let size = PhysicalSize::new(1200, 760);
+    let (max_sessions, min_messages) = real_transcript_benchmark_selection();
+    let transcripts = session_data::load_largest_real_transcripts(max_sessions, min_messages)
+        .context("failed to load real transcripts for scroll benchmark")?;
+
+    if transcripts.is_empty() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "frames": frames,
+                "sessions": [],
+                "note": "no real transcripts with >=24 messages found under ~/.jcode/sessions",
+            }))?
+        );
+        return Ok(());
+    }
+
+    let mut session_reports = Vec::new();
+    let mut all_frame_samples: Vec<f64> = Vec::new();
+    let mut worst_stage_us = 0.0_f64;
+    let mut worst_stage_name = String::new();
+
+    for transcript in &transcripts {
+        let report = benchmark_real_transcript_scroll(transcript, size, frames);
+        if report.worst_stage_us > worst_stage_us {
+            worst_stage_us = report.worst_stage_us;
+            worst_stage_name = report.worst_stage_name.clone();
+        }
+        all_frame_samples.extend_from_slice(&report.frame_samples);
+        session_reports.push(report);
+    }
+
+    let budget_ms = duration_ms(DESKTOP_120FPS_FRAME_BUDGET);
+    let aggregate_p50 = percentile_ms(&all_frame_samples, 0.50);
+    let aggregate_p95 = percentile_ms(&all_frame_samples, 0.95);
+    let aggregate_p99 = percentile_ms(&all_frame_samples, 0.99);
+    let aggregate_max = max_sample_ms(&all_frame_samples);
+    let passes_budget = aggregate_p99 <= budget_ms;
+
+    let sessions_json = session_reports
+        .iter()
+        .map(RealTranscriptScrollReport::to_json)
+        .collect::<Vec<_>>();
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "frames": frames,
+            "size": { "width": size.width, "height": size.height },
+            "target_frame_budget_ms": budget_ms,
+            "sessions_profiled": session_reports.len(),
+            "aggregate_full_scroll_frame": {
+                "frames": all_frame_samples.len(),
+                "p50_ms": aggregate_p50,
+                "p95_ms": aggregate_p95,
+                "p99_ms": aggregate_p99,
+                "max_ms": aggregate_max,
+            },
+            "worst_stage": { "name": worst_stage_name, "max_us_per_frame": worst_stage_us },
+            "passes_120fps_scroll_cpu_budget": passes_budget,
+            "sessions": sessions_json,
+        }))?
+    );
+    Ok(())
+}
+
+struct RealTranscriptScrollReport {
+    session_id: String,
+    title: String,
+    file_bytes: u64,
+    message_count: usize,
+    total_body_lines: usize,
+    max_scroll_lines: usize,
+    body_buffer_rebuilds: usize,
+    frame_samples: Vec<f64>,
+    stage_totals_us: Vec<(&'static str, f64)>,
+    setup_full_relayout_ms: f64,
+    worst_stage_name: String,
+    worst_stage_us: f64,
+    worst_rebuild_us: f64,
+    worst_rebuild_window_lines: usize,
+    worst_rebuild_max_line_chars: usize,
+    worst_rebuild_advanced_lines: usize,
+    worst_rebuild_segments: usize,
+}
+
+impl RealTranscriptScrollReport {
+    fn to_json(&self) -> serde_json::Value {
+        let frames = self.frame_samples.len().max(1);
+        let total_ms = self.frame_samples.iter().sum::<f64>();
+        let stages = self
+            .stage_totals_us
+            .iter()
+            .map(|(name, total_us)| {
+                serde_json::json!({
+                    "name": name,
+                    "mean_us_per_frame": total_us / frames as f64,
+                    "total_ms": total_us / 1000.0,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "session_id": self.session_id,
+            "title": self.title,
+            "file_bytes": self.file_bytes,
+            "message_count": self.message_count,
+            "total_body_lines": self.total_body_lines,
+            "max_scroll_lines": self.max_scroll_lines,
+            "body_buffer_rebuilds": self.body_buffer_rebuilds,
+            "setup_full_body_relayout_ms": self.setup_full_relayout_ms,
+            "worst_window_rebuild": {
+                "us": self.worst_rebuild_us,
+                "window_lines": self.worst_rebuild_window_lines,
+                "max_line_chars": self.worst_rebuild_max_line_chars,
+                "advanced_shaping_lines": self.worst_rebuild_advanced_lines,
+                "segments": self.worst_rebuild_segments,
+            },
+            "full_scroll_frame": {
+                "frames": self.frame_samples.len(),
+                "mean_ms_per_frame": total_ms / frames as f64,
+                "p50_ms": percentile_ms(&self.frame_samples, 0.50),
+                "p95_ms": percentile_ms(&self.frame_samples, 0.95),
+                "p99_ms": percentile_ms(&self.frame_samples, 0.99),
+                "max_ms": max_sample_ms(&self.frame_samples),
+            },
+            "subphases": stages,
+        })
+    }
+}
+
+/// Build a `SingleSessionApp` backed by a full real transcript, exactly the way
+/// the production resume path hydrates one from disk.
+fn real_transcript_scroll_app(transcript: &session_data::BenchmarkTranscript) -> SingleSessionApp {
+    let mut app = SingleSessionApp::new(None);
+    app.apply_resumed_session_transcript(transcript.messages.clone());
+    app.set_status_label(format!("real transcript: {}", transcript.title));
+    app
+}
+
+fn benchmark_real_transcript_scroll(
+    transcript: &session_data::BenchmarkTranscript,
+    size: PhysicalSize<u32>,
+    frames: usize,
+) -> RealTranscriptScrollReport {
+    let mut app = real_transcript_scroll_app(transcript);
+    let mut font_system = benchmark_font_system();
+
+    // One-time full body wrap (the cost paid when a transcript is first loaded
+    // or the window is resized). After this, scrolling must stay windowed.
+    let setup_started = Instant::now();
+    let body_lines = single_session_rendered_body_lines_for_tick(&app, size, 0);
+    let setup_full_relayout_ms = setup_started.elapsed().as_secs_f64() * 1000.0;
+    let total_body_lines = body_lines.len();
+
+    let max_scroll_lines =
+        single_session_body_scroll_metrics_for_total_lines(&app, size, total_body_lines)
+            .map(|metrics| metrics.max_scroll_lines)
+            .unwrap_or(0);
+
+    // Prime the sliding text-buffer window at the bottom of the transcript, the
+    // way the app does after hydrating a resumed session.
+    app.scroll_body_to_bottom();
+    let initial_viewport = single_session_body_viewport_from_lines(&app, size, 0.0, &body_lines);
+    let initial_key =
+        single_session_text_key_for_tick_with_rendered_body(&app, size, 0, 0.0, &body_lines);
+    let mut buffers = single_session_text_buffers_from_key(&initial_key, size, &mut font_system);
+    let (mut window_start, mut window_end) =
+        single_session_body_text_window_bounds(&initial_viewport);
+    if let Some(body_buffer) = buffers.get_mut(1) {
+        *body_buffer = single_session_body_text_buffer_from_lines(
+            &mut font_system,
+            &body_lines[window_start..window_end],
+            size,
+            app.text_scale(),
+        );
+        body_buffer.set_scroll(
+            initial_viewport
+                .start_line
+                .saturating_sub(window_start)
+                .min(i32::MAX as usize) as i32,
+        );
+    }
+    let mut last_scroll_start = initial_viewport.start_line;
+
+    // Drive a long scroll sweep from bottom to top and back, one whole line per
+    // frame, so every frame crosses a new line boundary (the worst realistic
+    // continuous-scroll case).
+    let span = max_scroll_lines.max(1);
+    let mut viewport_us = 0.0;
+    let mut window_rebuild_us = 0.0;
+    let mut scroll_us = 0.0;
+    let mut glyph_us = 0.0;
+    let mut areas_us = 0.0;
+    let mut vertices_us = 0.0;
+    let mut body_buffer_rebuilds = 0usize;
+
+    // Optional diagnostic: capture the single slowest window rebuild and describe
+    // the window content so we can attribute the cost (line count, advanced
+    // shaping triggers, longest line) rather than guessing.
+    let diagnose = std::env::var_os("JCODE_DESKTOP_SCROLL_DIAG").is_some();
+    let mut worst_rebuild_us = 0.0_f64;
+    let mut worst_rebuild_window_lines = 0usize;
+    let mut worst_rebuild_max_line_chars = 0usize;
+    let mut worst_rebuild_advanced_lines = 0usize;
+    let mut worst_rebuild_segments = 0usize;
+
+    let (frame_samples, _checksum) = benchmark_frame_samples(frames, |frame| {
+        // Triangle-wave scroll position covering the full transcript height.
+        let phase = frame % (span * 2);
+        let target = if phase <= span {
+            phase
+        } else {
+            span * 2 - phase
+        };
+        app.body_scroll_lines = target as f32;
+        let tick = frame as u64;
+
+        let phase_started = Instant::now();
+        let viewport = single_session_body_viewport_from_lines(&app, size, 0.0, &body_lines);
+        viewport_us += phase_started.elapsed().as_secs_f64() * 1_000_000.0;
+
+        let phase_started = Instant::now();
+        if !single_session_body_text_window_contains(window_start, window_end, &viewport) {
+            (window_start, window_end) = single_session_body_text_window_bounds(&viewport);
+            let rebuild_started = Instant::now();
+            if let Some(body_buffer) = buffers.get_mut(1) {
+                *body_buffer = single_session_body_text_buffer_from_lines(
+                    &mut font_system,
+                    &body_lines[window_start..window_end],
+                    size,
+                    app.text_scale(),
+                );
+            }
+            if diagnose {
+                let rebuild_us = rebuild_started.elapsed().as_secs_f64() * 1_000_000.0;
+                if rebuild_us > worst_rebuild_us {
+                    worst_rebuild_us = rebuild_us;
+                    let window = &body_lines[window_start..window_end];
+                    worst_rebuild_window_lines = window.len();
+                    worst_rebuild_max_line_chars = window
+                        .iter()
+                        .map(|l| l.text.chars().count())
+                        .max()
+                        .unwrap_or(0);
+                    worst_rebuild_advanced_lines =
+                        window.iter().filter(|l| !l.text.is_ascii()).count();
+                    worst_rebuild_segments = window.iter().map(|l| l.inline_spans.len() + 1).sum();
+                    if let Ok(path) = std::env::var("JCODE_DESKTOP_SCROLL_DIAG_DUMP") {
+                        let text = window
+                            .iter()
+                            .map(|l| l.text.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        let _ = std::fs::write(format!("{path}.{}", transcript.session_id), text);
+                    }
+                }
+            }
+            body_buffer_rebuilds += 1;
+            last_scroll_start = usize::MAX;
+        }
+        window_rebuild_us += phase_started.elapsed().as_secs_f64() * 1_000_000.0;
+
+        let phase_started = Instant::now();
+        if viewport.start_line != last_scroll_start {
+            if let Some(body_buffer) = buffers.get_mut(1) {
+                body_buffer.set_scroll(
+                    viewport
+                        .start_line
+                        .saturating_sub(window_start)
+                        .min(i32::MAX as usize) as i32,
+                );
+            }
+            last_scroll_start = viewport.start_line;
+        }
+        scroll_us += phase_started.elapsed().as_secs_f64() * 1_000_000.0;
+
+        let phase_started = Instant::now();
+        let glyph_checksum = buffers
+            .get(1)
+            .map(|body_buffer| {
+                body_buffer
+                    .layout_runs()
+                    .map(|run| run.glyphs.len())
+                    .sum::<usize>()
+            })
+            .unwrap_or_default();
+        glyph_us += phase_started.elapsed().as_secs_f64() * 1_000_000.0;
+
+        let phase_started = Instant::now();
+        let areas = single_session_text_areas_for_app_with_cached_body_viewport(
+            &app, &buffers, size, 0.0, viewport,
+        );
+        areas_us += phase_started.elapsed().as_secs_f64() * 1_000_000.0;
+
+        let phase_started = Instant::now();
+        let vertices = build_single_session_vertices_with_cached_body(
+            &app,
+            size,
+            0.0,
+            tick,
+            0.0,
+            1.0,
+            &body_lines,
+        );
+        vertices_us += phase_started.elapsed().as_secs_f64() * 1_000_000.0;
+
+        buffers.len() ^ areas.len() ^ vertices.len() ^ glyph_checksum
+    });
+
+    let stage_totals_us = vec![
+        ("viewport_extract", viewport_us),
+        ("body_window_rebuild", window_rebuild_us),
+        ("body_scroll_set", scroll_us),
+        ("glyph_layout_count", glyph_us),
+        ("text_areas", areas_us),
+        ("primitive_vertices", vertices_us),
+    ];
+    let frames_f = frames.max(1) as f64;
+    let (worst_stage_name, worst_stage_us) = stage_totals_us
+        .iter()
+        .map(|(name, total)| (name.to_string(), total / frames_f))
+        .fold((String::new(), 0.0_f64), |acc, candidate| {
+            if candidate.1 > acc.1 { candidate } else { acc }
+        });
+
+    RealTranscriptScrollReport {
+        session_id: transcript.session_id.clone(),
+        title: transcript.title.clone(),
+        file_bytes: transcript.file_bytes,
+        message_count: transcript.messages.len(),
+        total_body_lines,
+        max_scroll_lines,
+        body_buffer_rebuilds,
+        frame_samples,
+        stage_totals_us,
+        setup_full_relayout_ms,
+        worst_stage_name,
+        worst_stage_us,
+        worst_rebuild_us,
+        worst_rebuild_window_lines,
+        worst_rebuild_max_line_chars,
+        worst_rebuild_advanced_lines,
+        worst_rebuild_segments,
+    }
+}
+
+/// Profile a realistic mix of user *actions* (not just scrolling) against the
+/// user's largest real on-disk transcripts. Each action phase is measured
+/// separately as per-frame CPU samples and reported as p50/p95/p99/max, plus a
+/// `passes_120fps_cpu_budget` flag against the existing frame budget. This is the
+/// broad interaction-coverage companion to `--real-transcript-scroll-benchmark`.
+fn run_real_transcript_action_benchmark(frames: usize) -> Result<()> {
+    let frames = frames.max(1);
+    let size = PhysicalSize::new(1200, 760);
+    let (max_sessions, min_messages) = real_transcript_benchmark_selection();
+    let transcripts = session_data::load_largest_real_transcripts(max_sessions, min_messages)
+        .context("failed to load real transcripts for action benchmark")?;
+
+    if transcripts.is_empty() {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "frames": frames,
+                "sessions": [],
+                "note": "no real transcripts with >=24 messages found under ~/.jcode/sessions",
+            }))?
+        );
+        return Ok(());
+    }
+
+    let budget_ms = duration_ms(DESKTOP_120FPS_FRAME_BUDGET);
+    // phase name -> all per-frame samples across every session
+    let mut phase_samples: std::collections::BTreeMap<&'static str, Vec<f64>> =
+        std::collections::BTreeMap::new();
+    let mut session_json = Vec::new();
+
+    for transcript in &transcripts {
+        let phases = benchmark_real_transcript_actions(transcript, size, frames);
+        let phase_json = phases
+            .iter()
+            .map(|(name, samples)| {
+                phase_samples
+                    .entry(name)
+                    .or_default()
+                    .extend_from_slice(samples);
+                action_phase_json(name, samples, budget_ms)
+            })
+            .collect::<Vec<_>>();
+        session_json.push(serde_json::json!({
+            "session_id": transcript.session_id,
+            "title": transcript.title,
+            "message_count": transcript.messages.len(),
+            "phases": phase_json,
+        }));
+    }
+
+    let mut aggregate = Vec::new();
+    let mut slowest_phase = String::new();
+    let mut slowest_p99 = 0.0_f64;
+    let mut all_pass = true;
+    for (name, samples) in &phase_samples {
+        let value = action_phase_json(name, samples, budget_ms);
+        let p99 = percentile_ms(samples, 0.99);
+        if p99 > slowest_p99 {
+            slowest_p99 = p99;
+            slowest_phase = (*name).to_string();
+        }
+        if p99 > budget_ms {
+            all_pass = false;
+        }
+        aggregate.push(value);
+    }
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "frames_per_phase": frames,
+            "size": { "width": size.width, "height": size.height },
+            "target_frame_budget_ms": budget_ms,
+            "sessions_profiled": transcripts.len(),
+            "aggregate_phases": aggregate,
+            "slowest_phase": { "name": slowest_phase, "p99_ms": slowest_p99 },
+            "passes_120fps_cpu_budget": all_pass,
+            "sessions": session_json,
+        }))?
+    );
+    Ok(())
+}
+
+fn action_phase_json(name: &str, samples: &[f64], budget_ms: f64) -> serde_json::Value {
+    let frames = samples.len().max(1);
+    let total_ms = samples.iter().sum::<f64>();
+    let p99 = percentile_ms(samples, 0.99);
+    serde_json::json!({
+        "name": name,
+        "frames": samples.len(),
+        "mean_ms": total_ms / frames as f64,
+        "p50_ms": percentile_ms(samples, 0.50),
+        "p95_ms": percentile_ms(samples, 0.95),
+        "p99_ms": p99,
+        "max_ms": max_sample_ms(samples),
+        "passes_budget": p99 <= budget_ms,
+    })
+}
+
+/// Run every simulated action phase for one transcript, returning per-phase
+/// per-frame CPU samples (milliseconds). Each phase reproduces the production
+/// render path: cached/wrapped body lines, viewport extraction, a windowed body
+/// text buffer that is reused across frames, text areas, and primitive geometry.
+fn benchmark_real_transcript_actions(
+    transcript: &session_data::BenchmarkTranscript,
+    size: PhysicalSize<u32>,
+    frames: usize,
+) -> Vec<(&'static str, Vec<f64>)> {
+    let base_app = real_transcript_scroll_app(transcript);
+    let body_lines = single_session_rendered_body_lines_for_tick(&base_app, size, 0);
+    let total_lines = body_lines.len();
+    let max_scroll =
+        single_session_body_scroll_metrics_for_total_lines(&base_app, size, total_lines)
+            .map(|metrics| metrics.max_scroll_lines)
+            .unwrap_or(0)
+            .max(1);
+
+    let mut phases: Vec<(&'static str, Vec<f64>)> = Vec::new();
+
+    // 1. Smooth (fractional) scroll: scroll position advances a whole line per
+    //    frame with a fractional offset, the common trackpad-scroll case.
+    phases.push((
+        "smooth_scroll",
+        action_windowed_render_phase(&base_app, &body_lines, size, frames, |app, frame| {
+            let phase = frame % (max_scroll * 2);
+            let target = if phase <= max_scroll {
+                phase
+            } else {
+                max_scroll * 2 - phase
+            };
+            app.body_scroll_lines = target as f32;
+            benchmark_smooth_scroll_lines(frame)
+        }),
+    ));
+
+    // 2. Whole-line scroll: integer line steps, no fractional offset.
+    phases.push((
+        "whole_line_scroll",
+        action_windowed_render_phase(&base_app, &body_lines, size, frames, |app, frame| {
+            let phase = frame % (max_scroll * 2);
+            let target = if phase <= max_scroll {
+                phase
+            } else {
+                max_scroll * 2 - phase
+            };
+            app.body_scroll_lines = target as f32;
+            0.0
+        }),
+    ));
+
+    // 3. Selection drag across the visible transcript while parked mid-scroll.
+    //    This mirrors the real mouse-handler input path, which calls
+    //    single_session_visible_body (a full transcript wrap, now memoized) and
+    //    hit-tests the cursor on every pointer move, then redraws.
+    {
+        let mut app = base_app.clone();
+        app.body_scroll_lines = (max_scroll / 2) as f32;
+        let initial_visible = single_session_visible_body(&app, size);
+        if let Some(point) =
+            single_session_body_point_at_position(size, 40.0, 80.0, &initial_visible)
+        {
+            app.begin_selection(point);
+        } else {
+            app.begin_selection(SelectionPoint { line: 0, column: 0 });
+        }
+        let mut font_system = benchmark_font_system();
+        let (mut buffers, mut window_start, mut window_end, mut last_start) =
+            action_prime_window(&app, &body_lines, size, &mut font_system);
+        let (samples, _) = benchmark_frame_samples(frames, |frame| {
+            // Real input path: resolve the cursor against the visible body
+            // (full-transcript wrap, memoized) and update the selection.
+            let visible = single_session_visible_body(&app, size);
+            let y = 80.0 + (frame % 600) as f32;
+            let x = 40.0 + (frame % 400) as f32;
+            if let Some(point) = single_session_body_point_at_position(size, x, y, &visible) {
+                app.update_selection(point);
+            }
+            action_render_window(
+                &app,
+                &body_lines,
+                size,
+                frame as u64,
+                0.0,
+                &mut font_system,
+                &mut buffers,
+                &mut window_start,
+                &mut window_end,
+                &mut last_start,
+            )
+        });
+        phases.push(("selection_drag", samples));
+    }
+
+    // 3b. Pure input-side selection hit-test cost (no redraw). This isolates the
+    //     real per-mouse-move work the desktop selection handler does:
+    //     single_session_visible_body (a full-transcript wrap, now memoized) plus
+    //     cursor hit-testing. The redraw it triggers is separately cached, so this
+    //     phase exposes the wrap/memo cost that the combined selection_drag phase
+    //     hides behind geometry building.
+    {
+        let mut app = base_app.clone();
+        app.body_scroll_lines = (max_scroll / 2) as f32;
+        app.begin_selection(SelectionPoint { line: 0, column: 0 });
+        let (samples, _) = benchmark_frame_samples(frames, |frame| {
+            let visible = single_session_visible_body(&app, size);
+            let y = 80.0 + (frame % 600) as f32;
+            let x = 40.0 + (frame % 400) as f32;
+            if let Some(point) = single_session_body_point_at_position(size, x, y, &visible) {
+                app.update_selection(point);
+            }
+            visible.len()
+        });
+        phases.push(("selection_input_hittest", samples));
+    }
+
+    // 4. Typing in the composer while parked at the bottom of the transcript.
+    {
+        let mut app = base_app.clone();
+        app.scroll_body_to_bottom();
+        app.draft.clear();
+        app.draft_cursor = 0;
+        let mut font_system = benchmark_font_system();
+        let (mut buffers, mut window_start, mut window_end, mut last_start) =
+            action_prime_window(&app, &body_lines, size, &mut font_system);
+        let (samples, _) = benchmark_frame_samples(frames, |frame| {
+            app.draft.push(benchmark_typing_char(frame));
+            app.draft_cursor = app.draft.len();
+            action_render_window(
+                &app,
+                &body_lines,
+                size,
+                frame as u64,
+                0.0,
+                &mut font_system,
+                &mut buffers,
+                &mut window_start,
+                &mut window_end,
+                &mut last_start,
+            )
+        });
+        phases.push(("composer_typing", samples));
+    }
+
+    // 5. Model picker open/close toggling over the transcript: every other frame
+    //    opens the inline picker card, invalidating the inline-widget geometry.
+    {
+        let mut app = base_app.clone();
+        app.body_scroll_lines = (max_scroll / 3) as f32;
+        let mut font_system = benchmark_font_system();
+        let (mut buffers, mut window_start, mut window_end, mut last_start) =
+            action_prime_window(&app, &body_lines, size, &mut font_system);
+        let (samples, _) = benchmark_frame_samples(frames, |frame| {
+            app.model_picker.open = frame % 2 == 0;
+            app.model_picker.loading = app.model_picker.open;
+            action_render_window(
+                &app,
+                &body_lines,
+                size,
+                frame as u64,
+                0.0,
+                &mut font_system,
+                &mut buffers,
+                &mut window_start,
+                &mut window_end,
+                &mut last_start,
+            )
+        });
+        app.model_picker.open = false;
+        phases.push(("model_picker_toggle", samples));
+    }
+
+    // 6. Session switcher open/close toggling over the transcript.
+    {
+        let mut app = base_app.clone();
+        app.body_scroll_lines = (max_scroll / 3) as f32;
+        let mut font_system = benchmark_font_system();
+        let (mut buffers, mut window_start, mut window_end, mut last_start) =
+            action_prime_window(&app, &body_lines, size, &mut font_system);
+        let (samples, _) = benchmark_frame_samples(frames, |frame| {
+            app.session_switcher.open = frame % 2 == 0;
+            action_render_window(
+                &app,
+                &body_lines,
+                size,
+                frame as u64,
+                0.0,
+                &mut font_system,
+                &mut buffers,
+                &mut window_start,
+                &mut window_end,
+                &mut last_start,
+            )
+        });
+        app.session_switcher.open = false;
+        phases.push(("session_switcher_toggle", samples));
+    }
+
+    // 7. Window resize sweep: each frame is a different surface size, forcing a
+    //    body re-wrap + window rebuild (the worst non-scroll case).
+    //
+    //    Mirrors production (`cached_single_session_body_lines` non-streaming
+    //    branch): the raw styled lines (markdown parse) are generated ONCE and
+    //    cached across sizes; only the width-dependent wrap re-runs per resize.
+    {
+        let app = base_app.clone();
+        let raw_lines = app.body_styled_lines_for_tick(0);
+        let mut font_system = benchmark_font_system();
+        let (samples, _) = benchmark_frame_samples(frames, |frame| {
+            let resize = benchmark_resize_size(frame);
+            let lines = single_session_rendered_body_lines_from_raw_ref(&app, resize, &raw_lines);
+            let viewport = single_session_body_viewport_from_lines(&app, resize, 0.0, &lines);
+            let key =
+                single_session_text_key_for_tick_with_rendered_body(&app, resize, 0, 0.0, &lines);
+            let mut buffers = single_session_text_buffers_from_key(&key, resize, &mut font_system);
+            let (window_start, window_end) = single_session_body_text_window_bounds(&viewport);
+            if let Some(body_buffer) = buffers.get_mut(1) {
+                *body_buffer = single_session_body_text_buffer_from_lines(
+                    &mut font_system,
+                    &lines[window_start..window_end],
+                    resize,
+                    app.text_scale(),
+                );
+            }
+            let areas = single_session_text_areas_for_app_with_cached_body_viewport(
+                &app, &buffers, resize, 0.0, viewport,
+            );
+            let vertices = build_single_session_vertices_with_cached_body(
+                &app,
+                resize,
+                0.0,
+                frame as u64,
+                0.0,
+                1.0,
+                &lines,
+            );
+            buffers.len() ^ areas.len() ^ vertices.len()
+        });
+        phases.push(("window_resize", samples));
+    }
+
+    // 8. Streaming response growth while scrolled near the bottom: a synthetic
+    //    assistant reply grows by a chunk each frame, the live-streaming case.
+    //
+    //    This mirrors the production renderer's incremental path
+    //    (`cached_single_session_body_lines` for the streaming branch): the
+    //    static transcript body is wrapped ONCE, then each frame only truncates
+    //    back to the static base and appends the wrapped streaming tail, rather
+    //    than re-wrapping the whole transcript every frame.
+    {
+        let mut app = base_app.clone();
+        app.scroll_body_to_bottom();
+        app.streaming_response
+            .push_str("Streaming response starting. ");
+        let mut font_system = benchmark_font_system();
+        let static_base = single_session_rendered_static_body_lines_for_streaming(&app, size, 0)
+            .unwrap_or_else(|| single_session_rendered_body_lines_for_tick(&app, size, 0));
+        let static_len = static_base.len();
+        let mut stream_lines = static_base.clone();
+        let (samples, _) = benchmark_frame_samples(frames, |frame| {
+            app.streaming_response.push_str(
+                "Streaming update chunk with `inline code` and prose that wraps across lines. ",
+            );
+            if frame % 9 == 0 {
+                app.streaming_response.push('\n');
+            }
+            // Incremental: reuse the wrapped static base, only re-wrap the tail.
+            stream_lines.truncate(static_len);
+            append_single_session_streaming_response_rendered_body_lines(
+                &app,
+                size,
+                &mut stream_lines,
+            );
+            let viewport = single_session_body_viewport_from_lines(&app, size, 0.0, &stream_lines);
+            let key = single_session_text_key_for_tick_with_rendered_body(
+                &app,
+                size,
+                0,
+                0.0,
+                &stream_lines,
+            );
+            let mut buffers = single_session_text_buffers_from_key(&key, size, &mut font_system);
+            let (window_start, window_end) = single_session_body_text_window_bounds(&viewport);
+            if let Some(body_buffer) = buffers.get_mut(1) {
+                *body_buffer = single_session_body_text_buffer_from_lines(
+                    &mut font_system,
+                    &stream_lines[window_start..window_end],
+                    size,
+                    app.text_scale(),
+                );
+            }
+            let areas = single_session_text_areas_for_app_with_cached_body_viewport(
+                &app, &buffers, size, 0.0, viewport,
+            );
+            let vertices = build_single_session_vertices_with_cached_body(
+                &app,
+                size,
+                0.0,
+                frame as u64,
+                0.0,
+                1.0,
+                &stream_lines,
+            );
+            buffers.len() ^ areas.len() ^ vertices.len()
+        });
+        phases.push(("streaming_growth", samples));
+    }
+
+    phases
+}
+
+/// Prime a reusable text-buffer set and its windowed body buffer for `app`,
+/// matching how the production renderer seeds the sliding window. Returns the
+/// buffers plus the current (window_start, window_end, last_scroll_start).
+fn action_prime_window(
+    app: &SingleSessionApp,
+    body_lines: &[SingleSessionStyledLine],
+    size: PhysicalSize<u32>,
+    font_system: &mut FontSystem,
+) -> (Vec<Buffer>, usize, usize, usize) {
+    let viewport = single_session_body_viewport_from_lines(app, size, 0.0, body_lines);
+    let key = single_session_text_key_for_tick_with_rendered_body(app, size, 0, 0.0, body_lines);
+    let mut buffers = single_session_text_buffers_from_key(&key, size, font_system);
+    let (window_start, window_end) = single_session_body_text_window_bounds(&viewport);
+    if let Some(body_buffer) = buffers.get_mut(1) {
+        *body_buffer = single_session_body_text_buffer_from_lines(
+            font_system,
+            &body_lines[window_start..window_end],
+            size,
+            app.text_scale(),
+        );
+        body_buffer.set_scroll(
+            viewport
+                .start_line
+                .saturating_sub(window_start)
+                .min(i32::MAX as usize) as i32,
+        );
+    }
+    (buffers, window_start, window_end, viewport.start_line)
+}
+
+/// Render one frame through the production windowed path, reusing the body text
+/// buffer and only rebuilding/rescrolling the window when the viewport leaves it.
+#[allow(clippy::too_many_arguments)]
+fn action_render_window(
+    app: &SingleSessionApp,
+    body_lines: &[SingleSessionStyledLine],
+    size: PhysicalSize<u32>,
+    tick: u64,
+    smooth_scroll_lines: f32,
+    font_system: &mut FontSystem,
+    buffers: &mut [Buffer],
+    window_start: &mut usize,
+    window_end: &mut usize,
+    last_scroll_start: &mut usize,
+) -> usize {
+    let viewport =
+        single_session_body_viewport_from_lines(app, size, smooth_scroll_lines, body_lines);
+    if !single_session_body_text_window_contains(*window_start, *window_end, &viewport) {
+        let (start, end) = single_session_body_text_window_bounds(&viewport);
+        *window_start = start;
+        *window_end = end;
+        if let Some(body_buffer) = buffers.get_mut(1) {
+            *body_buffer = single_session_body_text_buffer_from_lines(
+                font_system,
+                &body_lines[start..end],
+                size,
+                app.text_scale(),
+            );
+        }
+        *last_scroll_start = usize::MAX;
+    }
+    if viewport.start_line != *last_scroll_start {
+        if let Some(body_buffer) = buffers.get_mut(1) {
+            body_buffer.set_scroll(
+                viewport
+                    .start_line
+                    .saturating_sub(*window_start)
+                    .min(i32::MAX as usize) as i32,
+            );
+        }
+        *last_scroll_start = viewport.start_line;
+    }
+    let areas = single_session_text_areas_for_app_with_cached_body_viewport(
+        app,
+        buffers,
+        size,
+        smooth_scroll_lines,
+        viewport,
+    );
+    let vertices = build_single_session_vertices_with_cached_body(
+        app,
+        size,
+        0.0,
+        tick,
+        smooth_scroll_lines,
+        1.0,
+        body_lines,
+    );
+    buffers.len() ^ areas.len() ^ vertices.len()
+}
+
+/// Drive a windowed-scroll render phase, calling `prepare` each frame to mutate
+/// the app's scroll position (and return any fractional smooth-scroll offset).
+fn action_windowed_render_phase(
+    base_app: &SingleSessionApp,
+    body_lines: &[SingleSessionStyledLine],
+    size: PhysicalSize<u32>,
+    frames: usize,
+    mut prepare: impl FnMut(&mut SingleSessionApp, usize) -> f32,
+) -> Vec<f64> {
+    let mut app = base_app.clone();
+    let mut font_system = benchmark_font_system();
+    let (mut buffers, mut window_start, mut window_end, mut last_start) =
+        action_prime_window(&app, body_lines, size, &mut font_system);
+    let (samples, _) = benchmark_frame_samples(frames, |frame| {
+        let smooth = prepare(&mut app, frame);
+        action_render_window(
+            &app,
+            body_lines,
+            size,
+            frame as u64,
+            smooth,
+            &mut font_system,
+            &mut buffers,
+            &mut window_start,
+            &mut window_end,
+            &mut last_start,
+        )
+    });
+    samples
 }
 
 fn run_stream_e2e_benchmark(raw_events: usize) -> Result<()> {
@@ -5067,6 +6861,9 @@ fn run_desktop_app_worker_process(desktop_mode: DesktopMode) -> Result<()> {
                         {
                             let outcome =
                                 runtime.handle_key_input(desktop_key_event_to_key_input(&key));
+                            runtime
+                                .driver_mut()
+                                .service_pending_transcript_hydration_blocking();
                             if matches!(outcome, KeyOutcome::ForceReload) {
                                 let reload_requested = DesktopProtocolEnvelope::new(
                                     next_worker_sequence,
@@ -5610,10 +7407,11 @@ impl DesktopHotReloader {
     }
 
     fn drain_app_worker_messages(&mut self) -> DesktopWorkerDrain {
-        let Some(worker) = self.app_worker.as_ref() else {
+        let Some(worker) = self.app_worker.as_mut() else {
             return DesktopWorkerDrain::default();
         };
         let mut drained = DesktopWorkerDrain::default();
+        let mut should_drop_worker = false;
         while let Some(message) = worker.try_recv() {
             match message {
                 Ok(DesktopWorkerToHostMessage::Ready(ready)) => {
@@ -5656,9 +7454,35 @@ impl DesktopHotReloader {
                     desktop_log::error(format_args!(
                         "jcode-desktop: failed to read app worker message: {error:#}"
                     ));
+                    should_drop_worker = true;
                     break;
                 }
             }
+        }
+        if !should_drop_worker {
+            match worker.try_wait() {
+                Ok(Some(status)) => {
+                    desktop_log::warn(format_args!(
+                        "jcode-desktop: app worker process exited unexpectedly: {status}"
+                    ));
+                    should_drop_worker = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    desktop_log::warn(format_args!(
+                        "jcode-desktop: failed to poll app worker process: {error:#}"
+                    ));
+                    should_drop_worker = true;
+                }
+            }
+        }
+        if should_drop_worker
+            && let Some(worker) = self.app_worker.take()
+            && let Err(error) = worker.kill()
+        {
+            desktop_log::warn(format_args!(
+                "jcode-desktop: failed to clean up stopped app worker: {error:#}"
+            ));
         }
         drained
     }
@@ -6367,9 +8191,40 @@ impl DesktopApp {
         let session_id = card.session_id.clone();
         let mut single_session = SingleSessionApp::new(Some(card));
         single_session.initialize_resumed_session(&session_id);
-        single_session.hydrate_resumed_session_from_disk(&session_id);
+        single_session.request_transcript_hydration(&session_id);
         *self = Self::SingleSession(single_session);
         true
+    }
+
+    /// Take the session id queued for off-thread transcript hydration.
+    fn take_pending_transcript_hydration(&mut self) -> Option<String> {
+        match self {
+            Self::SingleSession(app) => app.take_pending_transcript_hydration(),
+            Self::Workspace(_) => None,
+        }
+    }
+
+    /// Apply a transcript that finished loading off the UI thread.
+    fn apply_hydrated_transcript(
+        &mut self,
+        session_id: &str,
+        result: std::result::Result<Option<Vec<workspace::SessionTranscriptMessage>>, String>,
+    ) -> bool {
+        match self {
+            Self::SingleSession(app) => app.apply_hydrated_transcript(session_id, result),
+            Self::Workspace(_) => false,
+        }
+    }
+
+    /// Service any queued transcript hydration synchronously. Used by the
+    /// app-worker process, which has no event-loop proxy; the disk scan is
+    /// bounded so the worst case stays small.
+    fn service_pending_transcript_hydration_blocking(&mut self) {
+        if let Self::SingleSession(app) = self
+            && let Some(session_id) = app.take_pending_transcript_hydration()
+        {
+            app.hydrate_resumed_session_from_disk(&session_id);
+        }
     }
 
     fn apply_session_event(&mut self, event: session_launch::DesktopSessionEvent) {
@@ -6662,7 +8517,9 @@ fn to_key_input(key: &Key, modifiers: ModifiersState) -> KeyInput {
         }
         Key::Named(NamedKey::Tab) if modifiers.control_key() => KeyInput::CycleModel(1),
         Key::Named(NamedKey::Tab) => KeyInput::Autocomplete,
-        Key::Named(NamedKey::Backspace) if modifiers.control_key() || modifiers.alt_key() => {
+        Key::Named(NamedKey::Backspace)
+            if modifiers.control_key() || modifiers.alt_key() || modifiers.super_key() =>
+        {
             KeyInput::DeletePreviousWord
         }
         Key::Named(NamedKey::Backspace) => KeyInput::Backspace,
@@ -6766,10 +8623,10 @@ fn to_key_input(key: &Key, modifiers: ModifiersState) -> KeyInput {
         Key::Character(text) if modifiers.control_key() && text == "[" => KeyInput::JumpPrompt(-1),
         Key::Character(text) if modifiers.control_key() && text == "]" => KeyInput::JumpPrompt(1),
         Key::Character(text) if modifiers.super_key() && text.eq_ignore_ascii_case("k") => {
-            KeyInput::ScrollBodyLines(1)
+            KeyInput::JumpPrompt(-1)
         }
         Key::Character(text) if modifiers.super_key() && text.eq_ignore_ascii_case("j") => {
-            KeyInput::ScrollBodyLines(-1)
+            KeyInput::JumpPrompt(1)
         }
         Key::Character(text)
             if (modifiers.control_key() || modifiers.super_key())
@@ -6777,6 +8634,10 @@ fn to_key_input(key: &Key, modifiers: ModifiersState) -> KeyInput {
         {
             KeyInput::ExitApp
         }
+        Key::Character(text) if modifiers.super_key() && text == ";" => {
+            KeyInput::SpawnSelfDevSession
+        }
+        Key::Character(text) if modifiers.super_key() && text == "'" => KeyInput::SpawnHomeSession,
         Key::Character(text) if modifiers.control_key() && text == ";" => KeyInput::SpawnPanel,
         Key::Character(text) if modifiers.control_key() && (text == "?" || text == "/") => {
             KeyInput::HotkeyHelp
@@ -7770,6 +9631,18 @@ fn desktop_spinner_tick(_now: Instant) -> u64 {
     (millis / DESKTOP_SPINNER_FRAME_MS) as u64
 }
 
+/// Continuous wall-clock seconds for smooth (unquantized) pulse animations.
+/// Unlike `desktop_spinner_tick`, this is not stepped to 180ms frames, so
+/// breathing cues animate fluidly at the paced 16ms redraw interval.
+fn desktop_pulse_seconds() -> f32 {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    // Wrap at a day to keep f32 precision; pulse phases only use fract().
+    ((millis % 86_400_000) as f64 / 1000.0) as f32
+}
+
 fn single_session_text_buffer_cache_key(
     app: &SingleSessionApp,
     size: PhysicalSize<u32>,
@@ -7784,7 +9657,22 @@ fn single_session_text_buffer_cache_key(
     app.text_scale().to_bits().hash(&mut hasher);
     app.header_title().hash(&mut hasher);
     app.welcome_hero_text().hash(&mut hasher);
-    app.inline_widget_styled_lines().hash(&mut hasher);
+    // Use the render-time styled lines (which honor the reveal animation) so the
+    // text buffer cache key matches the content actually placed into the buffer.
+    // Hashing the pre-reveal lines here while the buffer is built from the
+    // reveal-aware lines causes a stale buffer: the picker chrome re-renders every
+    // frame but the glyph text is never re-prepared as the reveal progresses.
+    app.render_inline_widget_styled_lines().hash(&mut hasher);
+    // The inline-widget card grows via a reveal animation, and the glyph text is
+    // vertically clipped to the animating card bounds. Quantize the reveal
+    // progress into the cache key so the text buffer is re-prepared across the
+    // whole animation; otherwise the text is prepared once early (while the card
+    // is still small and clips everything but the first line) and never refreshed,
+    // leaving stale/partial text under fully-rendered chrome.
+    if app.render_inline_widget_kind().is_some() {
+        let reveal_bucket = (app.render_inline_widget_reveal_progress() * 32.0).round() as u32;
+        reveal_bucket.hash(&mut hasher);
+    }
     app.composer_text().hash(&mut hasher);
     hasher.finish()
 }
@@ -8754,10 +10642,13 @@ struct Canvas {
     primitive_vertices_cache_key: Option<u64>,
     primitive_vertices_cache: Vec<Vertex>,
     primitive_frame_vertices: Vec<Vertex>,
+    primitive_caret_vertices: Vec<Vertex>,
     primitive_workspace_vertices: Vec<Vertex>,
+    primitive_workspace_vertices_cache_key: Option<u64>,
     app_mode_transition: AppModeTransitionState,
     app_mode_transition_vertices: Vec<Vertex>,
     single_session_scroll_motion: SingleSessionScrollMotion,
+    streaming_follow_motion: StreamingFollowMotion,
     transcript_message_motion: TranscriptMessageMotionRegistry,
     needs_initial_frame: bool,
     boot_frame_presented: bool,
@@ -8775,12 +10666,16 @@ struct Canvas {
     single_session_streaming_response_len: usize,
     single_session_streaming_fade_started_at: Option<Instant>,
     single_session_streaming_handoff_started_at: Option<Instant>,
+    streaming_text_reveal: StreamingTextRevealMotion,
+    single_session_streaming_reveal_frame: StreamingTextRevealFrame,
+    single_session_streaming_revealed_bytes: usize,
     single_session_streaming_text_key: Option<u64>,
     single_session_streaming_text_start_line: Option<usize>,
     single_session_streaming_text_end_line: Option<usize>,
     single_session_streaming_text_opacity_bits: Option<u32>,
     single_session_streaming_text_buffer: Option<Buffer>,
     single_session_body_text_scroll_start: Option<usize>,
+    single_session_body_text_top_offset_bits: Option<u32>,
     single_session_body_text_window_start: Option<usize>,
     single_session_body_text_window_end: Option<usize>,
     welcome_hero_reveal_key: Option<String>,
@@ -8897,10 +10792,13 @@ impl Canvas {
             primitive_vertices_cache_key: None,
             primitive_vertices_cache: Vec::new(),
             primitive_frame_vertices: Vec::new(),
+            primitive_caret_vertices: Vec::new(),
             primitive_workspace_vertices: Vec::new(),
+            primitive_workspace_vertices_cache_key: None,
             app_mode_transition: AppModeTransitionState::default(),
             app_mode_transition_vertices: Vec::new(),
             single_session_scroll_motion: SingleSessionScrollMotion::default(),
+            streaming_follow_motion: StreamingFollowMotion::default(),
             transcript_message_motion: TranscriptMessageMotionRegistry::default(),
             needs_initial_frame: true,
             boot_frame_presented: false,
@@ -8918,12 +10816,16 @@ impl Canvas {
             single_session_streaming_response_len: 0,
             single_session_streaming_fade_started_at: None,
             single_session_streaming_handoff_started_at: None,
+            streaming_text_reveal: StreamingTextRevealMotion::default(),
+            single_session_streaming_reveal_frame: StreamingTextRevealFrame::default(),
+            single_session_streaming_revealed_bytes: 0,
             single_session_streaming_text_key: None,
             single_session_streaming_text_start_line: None,
             single_session_streaming_text_end_line: None,
             single_session_streaming_text_opacity_bits: None,
             single_session_streaming_text_buffer: None,
             single_session_body_text_scroll_start: None,
+            single_session_body_text_top_offset_bits: None,
             single_session_body_text_window_start: None,
             single_session_body_text_window_end: None,
             welcome_hero_reveal_key: None,
@@ -8965,6 +10867,7 @@ impl Canvas {
         self.primitive_vertices_cache_key = None;
         self.primitive_vertices_cache.clear();
         self.primitive_frame_vertices.clear();
+        self.primitive_caret_vertices.clear();
         self.workspace_text_pane_cache.clear();
         self.app_mode_transition.clear();
         self.app_mode_transition_vertices.clear();
@@ -9029,6 +10932,7 @@ impl Canvas {
                 self.single_session_text_key = None;
                 self.single_session_text_buffers.clear();
                 self.single_session_body_text_scroll_start = None;
+                self.single_session_body_text_top_offset_bits = None;
                 self.single_session_body_text_window_start = None;
                 self.single_session_body_text_window_end = None;
                 return;
@@ -9078,12 +10982,23 @@ impl Canvas {
             self.single_session_text_cache_key = Some(text_cache_key);
             if !can_reuse_body_buffer {
                 self.single_session_body_text_scroll_start = None;
+                self.single_session_body_text_top_offset_bits = None;
                 self.single_session_body_text_window_start = None;
                 self.single_session_body_text_window_end = None;
             }
             self.text_needs_prepare = true;
         }
         self.sync_single_session_body_text_window(app, render_size, &viewport);
+        self.sync_single_session_body_text_top_offset(viewport.top_offset_pixels);
+    }
+
+    fn sync_single_session_body_text_top_offset(&mut self, top_offset_pixels: f32) {
+        let bits = top_offset_pixels.to_bits();
+        if self.single_session_body_text_top_offset_bits == Some(bits) {
+            return;
+        }
+        self.single_session_body_text_top_offset_bits = Some(bits);
+        self.text_needs_prepare = true;
     }
 
     fn sync_single_session_body_text_window(
@@ -9121,6 +11036,7 @@ impl Canvas {
             self.single_session_body_text_window_start = Some(window_start);
             self.single_session_body_text_window_end = Some(window_end);
             self.single_session_body_text_scroll_start = None;
+            self.single_session_body_text_top_offset_bits = None;
             self.sync_single_session_body_text_scroll(viewport.start_line, window_start);
         }
         self.sync_single_session_streaming_text_buffer(app, render_size, viewport);
@@ -9193,11 +11109,15 @@ impl Canvas {
             return;
         };
 
+        let tail_fade_chars = self.single_session_streaming_reveal_frame.tail_fade_chars;
+        // Quantize so the cache key only changes when the fade visibly moves.
+        let tail_fade_quantized = (tail_fade_chars * 4.0).round() as u32;
         let mut hasher = DefaultHasher::new();
         (render_size.width, render_size.height).hash(&mut hasher);
         app.text_scale().to_bits().hash(&mut hasher);
         start_line.hash(&mut hasher);
         end_line.hash(&mut hasher);
+        tail_fade_quantized.hash(&mut hasher);
         self.single_session_body_lines[start_line..end_line].hash(&mut hasher);
         let key = hasher.finish();
         if self.single_session_streaming_text_key == Some(key) {
@@ -9206,14 +11126,16 @@ impl Canvas {
 
         if let Some(font_system) = self.font_system.as_mut() {
             let lines = self.single_session_body_lines[start_line..end_line].to_vec();
-            self.single_session_streaming_text_buffer =
-                Some(single_session_body_text_buffer_from_lines_with_opacity(
+            self.single_session_streaming_text_buffer = Some(
+                single_session_body_text_buffer_from_lines_with_opacity_and_tail_fade(
                     font_system,
                     &lines,
                     render_size,
                     app.text_scale(),
                     1.0,
-                ));
+                    tail_fade_quantized as f32 / 4.0,
+                ),
+            );
             self.single_session_streaming_text_key = Some(key);
             self.single_session_streaming_text_start_line = Some(start_line);
             self.single_session_streaming_text_end_line = Some(end_line);
@@ -9486,7 +11408,11 @@ impl Canvas {
         tick: u64,
     ) -> (u64, bool) {
         let body_layout_size = single_session_body_layout_cache_size(app, render_size);
-        let key = app.rendered_body_cache_key(body_layout_size);
+        let key = streaming_reveal_body_cache_key(
+            app.rendered_body_cache_key(body_layout_size),
+            app.streaming_response.is_empty(),
+            self.single_session_streaming_revealed_bytes,
+        );
         if self.single_session_body_key == Some(key) {
             return (key, false);
         }
@@ -9503,6 +11429,7 @@ impl Canvas {
                     self.single_session_streaming_base_len = self.single_session_body_lines.len();
                     self.single_session_streaming_base_key = Some(base_key);
                     self.single_session_body_text_scroll_start = None;
+                    self.single_session_body_text_top_offset_bits = None;
                     self.single_session_body_text_window_start = None;
                     self.single_session_body_text_window_end = None;
                 } else {
@@ -9512,6 +11439,7 @@ impl Canvas {
                     self.single_session_streaming_base_len = 0;
                     self.single_session_body_key = Some(key);
                     self.single_session_body_text_scroll_start = None;
+                    self.single_session_body_text_top_offset_bits = None;
                     self.single_session_body_text_window_start = None;
                     self.single_session_body_text_window_end = None;
                     return (key, true);
@@ -9520,10 +11448,11 @@ impl Canvas {
                 self.single_session_body_lines
                     .truncate(self.single_session_streaming_base_len);
             }
-            append_single_session_streaming_response_rendered_body_lines(
+            append_single_session_streaming_response_rendered_body_lines_with_reveal(
                 app,
                 render_size,
                 &mut self.single_session_body_lines,
+                self.single_session_streaming_revealed_bytes,
             );
         } else {
             let raw_key = app.rendered_body_cache_key((0, 0));
@@ -9770,6 +11699,7 @@ impl Canvas {
             }
         };
         let smooth_scroll_lines = smooth_scroll_lines + scroll_motion_frame.smooth_scroll_lines;
+        let mut smooth_scroll_lines = smooth_scroll_lines;
         frame_profile.checkpoint("scroll_motion");
 
         let (welcome_hero_reveal_progress, welcome_hero_reveal_active) =
@@ -9837,6 +11767,7 @@ impl Canvas {
         let mut body_text_window_line_count = 0usize;
         let mut streaming_text_line_count = 0usize;
         let mut inline_widget_line_count = 0usize;
+        let mut streaming_follow_active = false;
         let defer_text_this_frame = self.defer_initial_text_frame;
         if defer_text_this_frame {
             self.defer_initial_text_frame = false;
@@ -9853,6 +11784,11 @@ impl Canvas {
             self.single_session_body_text_window_start = None;
             self.single_session_body_text_window_end = None;
         } else if let DesktopApp::SingleSession(single_session) = app {
+            let reveal_frame = self
+                .streaming_text_reveal
+                .frame(&single_session.streaming_response, now);
+            self.single_session_streaming_reveal_frame = reveal_frame;
+            self.single_session_streaming_revealed_bytes = reveal_frame.revealed_bytes;
             let (rendered_body_key, rendered_body_changed) = self.cached_single_session_body_lines(
                 single_session,
                 single_session_render_size,
@@ -9860,6 +11796,20 @@ impl Canvas {
             );
             single_session_rendered_body_key = Some(rendered_body_key);
             body_line_count = self.single_session_body_lines.len();
+            // Smoothly follow streaming growth: hold the viewport a fraction of a
+            // line above the bottom as new wrapped lines append, then ease down,
+            // so the transcript slides instead of snapping a whole line per frame.
+            let streaming_follow = self.streaming_follow_motion.frame(
+                StreamingFollowInput {
+                    total_lines: body_line_count,
+                    anchored_to_bottom: single_session.body_scroll_lines
+                        <= SCROLL_FRACTIONAL_EPSILON,
+                    streaming_active: !single_session.streaming_response.is_empty(),
+                },
+                now,
+            );
+            smooth_scroll_lines += streaming_follow.offset_lines;
+            streaming_follow_active = streaming_follow.active;
             inline_widget_line_count = single_session.render_inline_widget_visible_line_count();
             frame_profile.checkpoint("body_lines_cache");
             self.ensure_font_system();
@@ -9884,6 +11834,10 @@ impl Canvas {
             self.single_session_streaming_text_opacity_bits = None;
             self.single_session_streaming_text_buffer = None;
             self.single_session_streaming_handoff_started_at = None;
+            self.streaming_text_reveal.clear();
+            self.streaming_follow_motion.clear();
+            self.single_session_streaming_reveal_frame = StreamingTextRevealFrame::default();
+            self.single_session_streaming_revealed_bytes = 0;
             self.streaming_text_needs_prepare = false;
             self.single_session_body_text_scroll_start = None;
             self.single_session_body_text_window_start = None;
@@ -10217,7 +12171,9 @@ impl Canvas {
                     || scrollbar_motion.is_active()
                     || scroll_motion_frame.active
                     || welcome_hero_reveal_active
-                    || streaming_text_arrival_style.active;
+                    || streaming_text_arrival_style.active
+                    || self.single_session_streaming_reveal_frame.active
+                    || streaming_follow_active;
                 let geometry_cache_key = if single_session_issue_layout_for_frame.visible() {
                     None
                 } else {
@@ -10348,26 +12304,78 @@ impl Canvas {
                 let status_color = workspace_status_color_for_frame
                     .unwrap_or_else(|| workspace_status_bar_target_color(workspace));
                 let status_text_frame = workspace_status_text_frame.as_ref();
-                build_vertices_into(
-                    WorkspaceVertexBuildParams {
+                // When nothing is animating, the assembled workspace vertex
+                // buffer is a pure function of the workspace content state, so
+                // we can reuse the previously built buffer and skip rebuilding
+                // ~100k vertices every redraw.
+                let workspace_geometry_cache_key = (!animation_active).then(|| {
+                    workspace_primitive_vertices_cache_key(
                         workspace,
-                        size: self.size,
+                        self.size,
                         render_layout,
                         focus_pulse,
-                        space_hold_progress: workspace_space_hold_progress,
-                        surface_frames: workspace_surface_frames_for_frame.as_ref(),
-                        exiting_surfaces: &self.workspace_surface_exit_cache,
-                        workspace_panel_cache: Some(&self.workspace_text_pane_cache),
+                        workspace_space_hold_progress,
                         status_color,
                         status_text_frame,
-                    },
-                    &mut self.primitive_workspace_vertices,
-                );
-                frame_profile.checkpoint("vertices_geometry");
-                (
-                    Cow::Borrowed(self.primitive_workspace_vertices.as_slice()),
-                    animation_active,
-                )
+                        &self.workspace_text_pane_cache,
+                    )
+                });
+                if let Some(cache_key) = workspace_geometry_cache_key {
+                    if self.primitive_workspace_vertices_cache_key == Some(cache_key)
+                        && !self.primitive_workspace_vertices.is_empty()
+                    {
+                        primitive_geometry_cache_hit = true;
+                        frame_profile.checkpoint("vertices_geometry");
+                        (
+                            Cow::Borrowed(self.primitive_workspace_vertices.as_slice()),
+                            animation_active,
+                        )
+                    } else {
+                        self.primitive_workspace_vertices_cache_key = Some(cache_key);
+                        build_vertices_into(
+                            WorkspaceVertexBuildParams {
+                                workspace,
+                                size: self.size,
+                                render_layout,
+                                focus_pulse,
+                                space_hold_progress: workspace_space_hold_progress,
+                                surface_frames: workspace_surface_frames_for_frame.as_ref(),
+                                exiting_surfaces: &self.workspace_surface_exit_cache,
+                                workspace_panel_cache: Some(&self.workspace_text_pane_cache),
+                                status_color,
+                                status_text_frame,
+                            },
+                            &mut self.primitive_workspace_vertices,
+                        );
+                        frame_profile.checkpoint("vertices_geometry");
+                        (
+                            Cow::Borrowed(self.primitive_workspace_vertices.as_slice()),
+                            animation_active,
+                        )
+                    }
+                } else {
+                    self.primitive_workspace_vertices_cache_key = None;
+                    build_vertices_into(
+                        WorkspaceVertexBuildParams {
+                            workspace,
+                            size: self.size,
+                            render_layout,
+                            focus_pulse,
+                            space_hold_progress: workspace_space_hold_progress,
+                            surface_frames: workspace_surface_frames_for_frame.as_ref(),
+                            exiting_surfaces: &self.workspace_surface_exit_cache,
+                            workspace_panel_cache: Some(&self.workspace_text_pane_cache),
+                            status_color,
+                            status_text_frame,
+                        },
+                        &mut self.primitive_workspace_vertices,
+                    );
+                    frame_profile.checkpoint("vertices_geometry");
+                    (
+                        Cow::Borrowed(self.primitive_workspace_vertices.as_slice()),
+                        animation_active,
+                    )
+                }
             }
         };
         frame_profile.checkpoint("vertices");
@@ -10375,16 +12383,16 @@ impl Canvas {
             && single_session_caret_visible_for_frame(single_session, spinner_tick)
         {
             if single_session_issue_layout_for_frame.visible() {
-                let mut caret_vertices = Vec::new();
+                self.primitive_caret_vertices.clear();
                 push_single_session_caret(
-                    &mut caret_vertices,
+                    &mut self.primitive_caret_vertices,
                     single_session,
                     single_session_render_size,
                     text_buffers.get(2),
                 );
                 append_child_vertices_to_parent_with_opacity(
                     vertices.to_mut(),
-                    &caret_vertices,
+                    &self.primitive_caret_vertices,
                     single_session_render_size,
                     single_session_issue_layout_for_frame.chat,
                     self.size,
@@ -10400,13 +12408,32 @@ impl Canvas {
             }
         }
         frame_profile.checkpoint("caret");
+        if let DesktopApp::SingleSession(single_session) = app
+            && self.single_session_streaming_text_buffer.is_some()
+            && let Some(viewport) = single_session_viewport.as_ref()
+        {
+            // The streaming tail cursor renders directly into the frame
+            // vertices (outside the primitive geometry cache) because it
+            // pulses continuously while text streams.
+            if !single_session_issue_layout_for_frame.visible() {
+                push_single_session_streaming_tail_cursor(
+                    vertices.to_mut(),
+                    single_session,
+                    single_session_render_size,
+                    viewport,
+                    self.single_session_streaming_text_buffer.as_ref(),
+                    self.single_session_streaming_text_start_line,
+                    desktop_pulse_seconds(),
+                );
+                animation_active = true;
+            }
+        }
+        frame_profile.checkpoint("streaming_tail_cursor");
         if let Some(mode_transition_frame) = self.app_mode_transition.frame(app.mode(), now) {
-            let previous_vertices = self.app_mode_transition.previous_vertices().to_vec();
-            let current_vertices = vertices.as_ref().to_vec();
             compose_app_mode_transition_vertices(
                 &mut self.app_mode_transition_vertices,
-                &previous_vertices,
-                &current_vertices,
+                self.app_mode_transition.previous_vertices(),
+                vertices.as_ref(),
                 mode_transition_frame,
             );
             vertices = Cow::Borrowed(self.app_mode_transition_vertices.as_slice());
@@ -11314,30 +13341,22 @@ fn build_hero_reveal_texture(
     }
 
     let mut values = vec![1.0_f32; (width * height) as usize];
-    let mut min_value = f32::INFINITY;
-    let mut max_value = 0.0_f32;
     let brush_delay_px = (alpha_bounds.height() * 0.10).max(5.0);
 
-    for y in 0..height {
-        for x in 0..width {
-            let pixel_index = (y * width + x) as usize;
-            let alpha = glyph_rgba[pixel_index * 4];
-            if alpha <= 2 {
-                continue;
-            }
-            let (path_progress, distance) = nearest_hero_stroke_progress(
-                x as f32 + 0.5,
-                y as f32 + 0.5,
-                alpha_bounds,
-                &segments,
-            );
-            let width_delay = (distance / brush_delay_px).min(1.0) * 0.045;
-            let value = (path_progress + width_delay).clamp(0.0, 1.0);
-            values[pixel_index] = value;
-            min_value = min_value.min(value);
-            max_value = max_value.max(value);
-        }
-    }
+    // This per-pixel nearest-stroke search dominates the one-time hero mask
+    // build (hundreds of ms on the UI thread). Each lit pixel is independent
+    // and only reads `glyph_rgba`/`segments`, so split the rows across worker
+    // threads. Output is bit-identical to the serial version; min/max are
+    // reduced afterward from the filled buffer.
+    let (min_value, max_value) = fill_hero_reveal_values(
+        &mut values,
+        width,
+        height,
+        glyph_rgba,
+        alpha_bounds,
+        &segments,
+        brush_delay_px,
+    );
 
     if !min_value.is_finite() || max_value <= min_value {
         return None;
@@ -11363,6 +13382,103 @@ fn build_hero_reveal_texture(
         }
     }
     Some(reveal_rgba)
+}
+
+/// Fill `values` with each lit pixel's reveal progress and return the
+/// `(min, max)` of the written values.
+///
+/// The work is split into horizontal row bands processed on separate threads
+/// when the image is large enough to amortize the spawn cost. Pixels are
+/// independent, so the result is identical to a serial fill.
+fn fill_hero_reveal_values(
+    values: &mut [f32],
+    width: u32,
+    height: u32,
+    glyph_rgba: &[u8],
+    alpha_bounds: HeroMaskPixelBounds,
+    segments: &[WelcomeHeroStrokeSegment],
+    brush_delay_px: f32,
+) -> (f32, f32) {
+    let row_stride = width as usize;
+    let compute_row = |row_index: u32, row_values: &mut [f32]| -> (f32, f32) {
+        let mut min_value = f32::INFINITY;
+        let mut max_value = 0.0_f32;
+        let row_offset = row_index as usize * row_stride;
+        for x in 0..width {
+            let pixel_index = row_offset + x as usize;
+            let alpha = glyph_rgba[pixel_index * 4];
+            if alpha <= 2 {
+                continue;
+            }
+            let (path_progress, distance) = nearest_hero_stroke_progress(
+                x as f32 + 0.5,
+                row_index as f32 + 0.5,
+                alpha_bounds,
+                segments,
+            );
+            let width_delay = (distance / brush_delay_px).min(1.0) * 0.045;
+            let value = (path_progress + width_delay).clamp(0.0, 1.0);
+            row_values[x as usize] = value;
+            min_value = min_value.min(value);
+            max_value = max_value.max(value);
+        }
+        (min_value, max_value)
+    };
+
+    let total_pixels = row_stride.saturating_mul(height as usize);
+    let worker_count = hero_reveal_worker_count(total_pixels);
+    if worker_count <= 1 || height < 2 {
+        let mut min_value = f32::INFINITY;
+        let mut max_value = 0.0_f32;
+        for (row_index, row_values) in values.chunks_mut(row_stride).enumerate() {
+            let (row_min, row_max) = compute_row(row_index as u32, row_values);
+            min_value = min_value.min(row_min);
+            max_value = max_value.max(row_max);
+        }
+        return (min_value, max_value);
+    }
+
+    let rows_per_band = (height as usize).div_ceil(worker_count).max(1);
+    let mut min_value = f32::INFINITY;
+    let mut max_value = 0.0_f32;
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (band_index, band) in values.chunks_mut(rows_per_band * row_stride).enumerate() {
+            let first_row = (band_index * rows_per_band) as u32;
+            let compute_row = &compute_row;
+            handles.push(scope.spawn(move || {
+                let mut band_min = f32::INFINITY;
+                let mut band_max = 0.0_f32;
+                for (offset, row_values) in band.chunks_mut(row_stride).enumerate() {
+                    let (row_min, row_max) = compute_row(first_row + offset as u32, row_values);
+                    band_min = band_min.min(row_min);
+                    band_max = band_max.max(row_max);
+                }
+                (band_min, band_max)
+            }));
+        }
+        for handle in handles {
+            if let Ok((band_min, band_max)) = handle.join() {
+                min_value = min_value.min(band_min);
+                max_value = max_value.max(band_max);
+            }
+        }
+    });
+    (min_value, max_value)
+}
+
+/// Number of worker threads to use for the hero reveal fill. Returns 1 for
+/// small images where threading overhead would dominate.
+fn hero_reveal_worker_count(total_pixels: usize) -> usize {
+    const MIN_PIXELS_PER_WORKER: usize = 32 * 1024;
+    if total_pixels < MIN_PIXELS_PER_WORKER * 2 {
+        return 1;
+    }
+    let available = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(1);
+    let by_work = total_pixels / MIN_PIXELS_PER_WORKER;
+    available.min(by_work).max(1)
 }
 
 fn nearest_hero_stroke_progress(
@@ -11401,32 +13517,6 @@ fn nearest_hero_stroke_progress(
     }
 
     (best_progress, best_distance_sq.sqrt())
-}
-
-fn build_vertices(
-    workspace: &Workspace,
-    size: PhysicalSize<u32>,
-    render_layout: WorkspaceRenderLayout,
-    focus_pulse: f32,
-    space_hold_progress: Option<f32>,
-) -> Vec<Vertex> {
-    let mut vertices = Vec::with_capacity(workspace_vertex_capacity_hint(workspace));
-    build_vertices_into(
-        WorkspaceVertexBuildParams {
-            workspace,
-            size,
-            render_layout,
-            focus_pulse,
-            space_hold_progress,
-            surface_frames: None,
-            exiting_surfaces: &HashMap::new(),
-            workspace_panel_cache: None,
-            status_color: workspace_status_bar_target_color(workspace),
-            status_text_frame: None,
-        },
-        &mut vertices,
-    );
-    vertices
 }
 
 fn reserve_workspace_vertex_capacity(vertices: &mut Vec<Vertex>, workspace: &Workspace) {
@@ -11585,6 +13675,80 @@ fn workspace_panel_size(rect: Rect) -> PhysicalSize<u32> {
     )
 }
 
+/// Identity key for the fully-assembled workspace primitive vertex buffer.
+///
+/// This is only meaningful (and only consulted) when no workspace animation is
+/// active, in which case the viewport layout, focus pulse, surface transitions
+/// and status transitions are all settled and therefore pure functions of the
+/// workspace content state. Hashing the inputs lets idle frames reuse the
+/// previously assembled vertex buffer instead of re-transforming ~100k vertices
+/// every redraw.
+#[allow(clippy::too_many_arguments)]
+fn workspace_primitive_vertices_cache_key(
+    workspace: &Workspace,
+    size: PhysicalSize<u32>,
+    render_layout: WorkspaceRenderLayout,
+    focus_pulse: f32,
+    space_hold_progress: Option<f32>,
+    status_color: [f32; 4],
+    status_text_frame: Option<&StatusTextTransitionFrame>,
+    panel_cache: &HashMap<u64, CachedWorkspaceSingleSessionTextPane>,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    size.width.hash(&mut hasher);
+    size.height.hash(&mut hasher);
+    render_layout.column_width.to_bits().hash(&mut hasher);
+    render_layout.scroll_offset.to_bits().hash(&mut hasher);
+    render_layout
+        .vertical_scroll_offset
+        .to_bits()
+        .hash(&mut hasher);
+    focus_pulse.to_bits().hash(&mut hasher);
+    space_hold_progress.map(f32::to_bits).hash(&mut hasher);
+    for channel in status_color {
+        channel.to_bits().hash(&mut hasher);
+    }
+    if let Some(frame) = status_text_frame {
+        frame.current.text.hash(&mut hasher);
+        frame.current.opacity.to_bits().hash(&mut hasher);
+        frame.current.y_offset_pixels.to_bits().hash(&mut hasher);
+        if let Some(previous) = &frame.previous {
+            previous.text.hash(&mut hasher);
+            previous.opacity.to_bits().hash(&mut hasher);
+            previous.y_offset_pixels.to_bits().hash(&mut hasher);
+        } else {
+            0u8.hash(&mut hasher);
+        }
+    }
+    workspace.zoomed.hash(&mut hasher);
+    (workspace.mode == InputMode::Insert).hash(&mut hasher);
+    workspace.focused_id.hash(&mut hasher);
+    workspace.detail_scroll.hash(&mut hasher);
+    workspace.current_workspace().hash(&mut hasher);
+    for surface in &workspace.surfaces {
+        surface.id.hash(&mut hasher);
+        workspace_surface_kind_key(surface.kind).hash(&mut hasher);
+        surface.lane.hash(&mut hasher);
+        surface.column.hash(&mut hasher);
+        surface.color_index.hash(&mut hasher);
+        surface.title.hash(&mut hasher);
+        surface.body_lines.hash(&mut hasher);
+        surface.detail_lines.hash(&mut hasher);
+        surface.session_id.hash(&mut hasher);
+        // Cached panel vertex generation differentiates rendered transcript
+        // content for session surfaces.
+        if let Some(entry) = panel_cache.get(&surface.id) {
+            entry.identity_key.hash(&mut hasher);
+        }
+    }
+    if workspace.mode == InputMode::Insert {
+        workspace.draft.hash(&mut hasher);
+        workspace.draft_cursor.hash(&mut hasher);
+        workspace.pending_images.len().hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn workspace_single_session_app_for_surface(
     workspace: &Workspace,
     surface: &workspace::Surface,
@@ -11718,7 +13882,7 @@ fn build_workspace_single_session_text_panes<'a>(
     if workspace.zoomed {
         if let Some(surface) = workspace.focused_surface()
             && surface.kind == workspace::SurfaceKind::Session
-            && let Some(app) = workspace_single_session_app_for_surface(workspace, surface)
+            && surface.session_id.is_some()
         {
             let target_rect = Rect {
                 x: OUTER_PADDING,
@@ -11728,16 +13892,17 @@ fn build_workspace_single_session_text_panes<'a>(
             };
             let rect = workspace_transitioned_surface_rect(surface_frames, surface.id, target_rect);
             let panel_size = workspace_panel_size(rect);
-            visible_surface_ids.push(surface.id);
-            refresh_workspace_text_pane_cache_entry(
+            if refresh_workspace_text_pane_cache_entry(
                 cache,
                 surface.id,
                 workspace_surface_text_pane_identity_key(workspace, surface, panel_size),
-                app,
                 rect,
                 panel_size,
                 font_system,
-            );
+                || workspace_single_session_app_for_surface(workspace, surface),
+            ) {
+                visible_surface_ids.push(surface.id);
+            }
         }
         retain_workspace_text_pane_cache_for_workspace(cache, workspace);
         return workspace_text_panes_from_cache(cache, &visible_surface_ids);
@@ -11752,21 +13917,22 @@ fn build_workspace_single_session_text_panes<'a>(
             if surface.kind != workspace::SurfaceKind::Session {
                 return;
             }
-            let Some(app) = workspace_single_session_app_for_surface(workspace, surface) else {
+            if surface.session_id.is_none() {
                 return;
-            };
+            }
             let rect = workspace_transitioned_surface_rect(surface_frames, surface.id, target_rect);
             let panel_size = workspace_panel_size(rect);
-            visible_surface_ids.push(surface.id);
-            refresh_workspace_text_pane_cache_entry(
+            if refresh_workspace_text_pane_cache_entry(
                 cache,
                 surface.id,
                 workspace_surface_text_pane_identity_key(workspace, surface, panel_size),
-                app,
                 rect,
                 panel_size,
                 font_system,
-            );
+                || workspace_single_session_app_for_surface(workspace, surface),
+            ) {
+                visible_surface_ids.push(surface.id);
+            }
         },
     );
 
@@ -11829,19 +13995,22 @@ fn refresh_workspace_text_pane_cache_entry(
     cache: &mut HashMap<u64, CachedWorkspaceSingleSessionTextPane>,
     surface_id: u64,
     identity_key: u64,
-    app: SingleSessionApp,
     rect: Rect,
     panel_size: PhysicalSize<u32>,
     font_system: &mut FontSystem,
-) {
+    build_app: impl FnOnce() -> Option<SingleSessionApp>,
+) -> bool {
     if let Some(entry) = cache.get_mut(&surface_id)
         && entry.identity_key == identity_key
     {
-        entry.app = app;
         entry.rect = rect;
         entry.size = panel_size;
-        return;
+        return true;
     }
+
+    let Some(app) = build_app() else {
+        return false;
+    };
 
     let rendered_body_lines = single_session_rendered_body_lines_for_tick(&app, panel_size, 0);
     let key = single_session_text_key_for_tick_with_rendered_body(
@@ -11858,7 +14027,7 @@ fn refresh_workspace_text_pane_cache_entry(
         entry.app = app;
         entry.rect = rect;
         entry.size = panel_size;
-        return;
+        return true;
     }
 
     let child_vertices = build_single_session_vertices_with_cached_body(
@@ -11884,6 +14053,7 @@ fn refresh_workspace_text_pane_cache_entry(
             child_vertices,
         },
     );
+    true
 }
 
 fn workspace_text_panes_from_cache<'a>(
@@ -12036,17 +14206,32 @@ fn build_vertices_into(params: WorkspaceVertexBuildParams<'_>, vertices: &mut Ve
             let rect = workspace_transitioned_surface_rect(surface_frames, surface.id, target_rect);
             let opacity = workspace_transitioned_surface_opacity(surface_frames, surface.id);
             let start_index = vertices.len();
-            if surface.kind == workspace::SurfaceKind::Session
-                && let Some(app) = workspace_single_session_app_for_surface(workspace, surface)
-            {
-                push_workspace_single_session_panel(
-                    vertices,
-                    &app,
-                    rect,
-                    size,
-                    focus_pulse,
-                    opacity,
-                );
+            if surface.kind == workspace::SurfaceKind::Session {
+                if let Some(entry) = workspace_panel_cache.and_then(|cache| cache.get(&surface.id))
+                {
+                    if focus_pulse > 0.001 {
+                        push_surface(vertices, rect, surface.color_index, true, focus_pulse, size);
+                    }
+                    append_child_vertices_to_parent_with_opacity(
+                        vertices,
+                        &entry.child_vertices,
+                        entry.size,
+                        rect,
+                        size,
+                        opacity,
+                    );
+                } else if let Some(app) =
+                    workspace_single_session_app_for_surface(workspace, surface)
+                {
+                    push_workspace_single_session_panel(
+                        vertices,
+                        &app,
+                        rect,
+                        size,
+                        focus_pulse,
+                        opacity,
+                    );
+                }
             } else {
                 push_surface(vertices, rect, surface.color_index, true, focus_pulse, size);
                 let draft = focused_panel_draft(workspace, surface.id);
@@ -12079,10 +14264,18 @@ fn build_vertices_into(params: WorkspaceVertexBuildParams<'_>, vertices: &mut Ve
             let opacity = workspace_transitioned_surface_opacity(surface_frames, surface.id);
             let start_index = vertices.len();
             if surface.kind == workspace::SurfaceKind::Session {
-                if surface_pulse <= 0.001
-                    && let Some(entry) =
-                        workspace_panel_cache.and_then(|cache| cache.get(&surface.id))
+                if let Some(entry) = workspace_panel_cache.and_then(|cache| cache.get(&surface.id))
                 {
+                    if surface_pulse > 0.001 {
+                        push_surface(
+                            vertices,
+                            rect,
+                            surface.color_index,
+                            focused,
+                            surface_pulse,
+                            size,
+                        );
+                    }
                     append_child_vertices_to_parent_with_opacity(
                         vertices,
                         &entry.child_vertices,

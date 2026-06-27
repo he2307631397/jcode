@@ -162,6 +162,7 @@ impl App {
                         transcript.push_str(&format!("[Result: {}]\n", preview));
                     }
                     ContentBlock::Reasoning { .. }
+                    | ContentBlock::ReasoningTrace { .. }
                     | ContentBlock::AnthropicThinking { .. }
                     | ContentBlock::OpenAIReasoning { .. } => {}
                     ContentBlock::Image { .. } => {
@@ -175,8 +176,8 @@ impl App {
             transcript.push('\n');
         }
 
-        if !crate::memory::memory_sidecar_enabled() {
-            crate::logging::info("Memory extraction skipped: memory sidecar disabled");
+        if !crate::memory::memory_llm_judge_available() {
+            crate::logging::info("Memory extraction skipped: LLM judge unavailable");
             return;
         }
 
@@ -225,24 +226,10 @@ impl App {
                     };
 
                     // Create memory entry
-                    let entry = crate::memory::MemoryEntry {
-                        id: format!("auto_{}", chrono::Utc::now().timestamp_millis()),
-                        category,
-                        content: memory.content,
-                        tags: Vec::new(),
-                        search_text: String::new(),
-                        created_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                        access_count: 0,
-                        trust,
-                        active: true,
-                        superseded_by: None,
-                        strength: 1,
-                        source: Some(self.session.id.clone()),
-                        reinforcements: Vec::new(),
-                        embedding: None, // Will be generated when stored
-                        confidence: 1.0,
-                    };
+                    let entry = crate::memory::MemoryEntry::new(category, memory.content)
+                        .with_id(format!("auto_{}", chrono::Utc::now().timestamp_millis()))
+                        .with_source(self.session.id.clone())
+                        .with_trust(trust);
 
                     // Store memory
                     if manager.remember_project(entry).is_ok() {

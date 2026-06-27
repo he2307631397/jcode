@@ -1,22 +1,31 @@
 pub mod anthropic;
+pub mod auth_mode;
 pub mod catalog_refresh;
 pub mod failover;
+pub mod fingerprint;
+pub mod model_id;
 pub mod models;
 pub mod openai_schema;
 pub mod pricing;
 pub mod selection;
 
 pub use anthropic::{
-    ANTHROPIC_OAUTH_BETA_HEADERS, ANTHROPIC_OAUTH_BETA_HEADERS_1M, anthropic_effectively_1m,
-    anthropic_is_1m_model, anthropic_map_tool_name_for_oauth, anthropic_map_tool_name_from_oauth,
+    ANTHROPIC_OAUTH_BETA_HEADERS, ANTHROPIC_OAUTH_BETA_HEADERS_1M, AnthropicContextMode,
+    anthropic_context_mode, anthropic_effectively_1m, anthropic_is_1m_model,
+    anthropic_map_tool_name_for_oauth, anthropic_map_tool_name_from_oauth,
     anthropic_oauth_beta_headers, anthropic_stainless_arch, anthropic_stainless_os,
     anthropic_strip_1m_suffix,
+};
+pub use auth_mode::{
+    AuthMode, AuthRoute, DualAuthProvider, pinned_mode_for, runtime_env_auth_route,
+    runtime_env_pinned_mode,
 };
 pub use catalog_refresh::{ModelCatalogRefreshSummary, summarize_model_catalog_refresh};
 pub use failover::{
     FailoverDecision, ProviderFailoverPrompt, classify_failover_error_message,
     parse_failover_prompt_message,
 };
+pub use fingerprint::{log_provider_canonical_input, stable_hash_json, stable_hash_str};
 pub use models::{
     ALL_CLAUDE_MODELS, ALL_OPENAI_MODELS, DEFAULT_CONTEXT_LIMIT, ModelCapabilities,
     context_limit_for_model, context_limit_for_model_with_provider,
@@ -25,9 +34,10 @@ pub use models::{
     provider_for_model_with_hint as core_provider_for_model_with_hint, provider_key_from_hint,
 };
 pub use selection::{
-    ActiveProvider, ProviderAvailability, auto_default_provider, dedupe_model_routes,
-    explicit_model_provider_prefix, fallback_sequence, model_name_for_provider,
-    parse_provider_hint, provider_from_model_key, provider_key, provider_label,
+    ActiveProvider, ProviderAvailability, auto_default_provider, cli_provider_arg_for_session_key,
+    dedupe_model_routes, explicit_model_provider_prefix, fallback_sequence,
+    model_name_for_provider, parse_provider_hint, provider_from_model_key, provider_key,
+    provider_label,
 };
 
 use anyhow::Result;
@@ -72,7 +82,24 @@ pub trait Provider: Send + Sync {
     }
 
     /// Get the provider name.
+    ///
+    /// This is the stable, machine-facing identifier (e.g. `"openrouter"`,
+    /// `"claude"`). Several surfaces key billing and routing decisions off this
+    /// value, so it must stay constant for a given provider class even when the
+    /// underlying runtime is a specific OpenAI-compatible profile. Use
+    /// [`Provider::display_name`] for anything shown to the user.
     fn name(&self) -> &str;
+
+    /// Human-facing provider label for the *current runtime selection*.
+    ///
+    /// Defaults to [`Provider::name`]. Provider orchestrators that multiplex
+    /// several backends behind one `name()` (notably the OpenRouter slot, which
+    /// also serves direct OpenAI-compatible profiles such as NVIDIA NIM or
+    /// DeepSeek) override this so the UI reflects the profile the user actually
+    /// selected at runtime instead of a fixed aggregator label.
+    fn display_name(&self) -> String {
+        self.name().to_string()
+    }
 
     /// Get the model identifier being used.
     fn model(&self) -> String {
@@ -85,6 +112,36 @@ pub trait Provider: Send + Sync {
     /// this to report the auth method accurately instead of inferring it from
     /// which credentials happen to be configured.
     fn active_auth_method_label(&self) -> Option<&'static str> {
+        self.active_resolved_credential()
+            .map(ResolvedCredential::auth_method_label)
+    }
+
+    /// The credential the active provider will actually use for the next
+    /// request, when the provider supports both OAuth and API-key auth
+    /// (currently Anthropic and OpenAI). Returns `None` for providers with no
+    /// OAuth-vs-API-key ambiguity.
+    ///
+    /// This is the authoritative, server-side answer to "subscription or
+    /// cost-based billing?". It is computed from the provider's live credential
+    /// mode rather than re-derived from credential probes or env strings, so
+    /// every surface (header tag, info-widget usage, model-switch line) and
+    /// every transport (local or remote) agrees. Remote clients receive the
+    /// resolved value over the wire instead of guessing from a provider name.
+    fn active_resolved_credential(&self) -> Option<ResolvedCredential> {
+        None
+    }
+
+    /// The credential the active dual-auth provider (Anthropic / OpenAI) will
+    /// use *when the user has explicitly pinned one* (OAuth or API key), without
+    /// resolving "auto".
+    ///
+    /// Unlike [`Provider::active_resolved_credential`], this never touches disk
+    /// or env to resolve an auto/default choice: it returns `Some` only for an
+    /// explicit in-memory pin and `None` for auto mode (or providers with no
+    /// OAuth-vs-API-key ambiguity). UI surfaces that rebuild every frame (the
+    /// info widget) use it to reflect an explicit OAuth<->API switch instantly
+    /// while leaving the cheap cached heuristic to handle the auto case.
+    fn active_explicit_credential(&self) -> Option<ResolvedCredential> {
         None
     }
 
@@ -98,6 +155,15 @@ pub trait Provider: Send + Sync {
         Err(anyhow::anyhow!(
             "This provider does not support model switching"
         ))
+    }
+
+    /// Select a structured model route.
+    ///
+    /// Most single-runtime providers can treat this as `set_model(model)`. Provider
+    /// orchestrators should override this to activate the exact runtime identified
+    /// by [`RouteSelection::runtime_key`] instead of reparsing a lossy model string.
+    fn set_route_selection(&self, selection: &RouteSelection) -> Result<()> {
+        self.set_model(&selection.routed_model_spec())
     }
 
     /// List available models for this provider.
@@ -399,6 +465,14 @@ pub fn shared_http_client() -> reqwest::Client {
                 .user_agent(JCODE_USER_AGENT)
                 .connect_timeout(Duration::from_secs(15))
                 .tcp_keepalive(Some(Duration::from_secs(30)))
+                // Proactively detect half-dead pooled HTTP/2 connections before we
+                // reuse them. Without keepalive pings, a stale multiplexed connection
+                // (common behind NAT/VPN/proxy or flaky Wi-Fi) surfaces as
+                // "http2 error: stream error received: unspecific protocol error".
+                // Pinging while idle lets reqwest drop the connection instead.
+                .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+                .http2_keep_alive_timeout(Duration::from_secs(15))
+                .http2_keep_alive_while_idle(true)
                 .pool_idle_timeout(Duration::from_secs(90))
                 .pool_max_idle_per_host(8)
                 .build()
@@ -421,6 +495,29 @@ pub fn shared_http_client() -> reqwest::Client {
         .clone()
 }
 
+/// Fresh HTTP client for transport-fault retries.
+///
+/// Retrying on the shared pooled client can reuse *other* idle connections
+/// established through the same broken network path (corrupting middlebox,
+/// flaky NAT/VPN) that produced a TLS fault like `BadRecordMac` - so the
+/// retry fails the same way. This client disables connection pooling, which
+/// guarantees the retry opens a brand-new TCP+TLS connection (the property
+/// that makes transport-fault retries actually succeed). Building a client
+/// costs ~10ms, which is fine on a retry path that already backs off >=1s.
+pub fn fresh_transport_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .user_agent(JCODE_USER_AGENT)
+        .connect_timeout(Duration::from_secs(15))
+        .tcp_keepalive(Some(Duration::from_secs(30)))
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
+        .http2_keep_alive_timeout(Duration::from_secs(15))
+        .http2_keep_alive_while_idle(true)
+        // No pooled reuse: every request gets a fresh connection.
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap_or_else(|_| shared_http_client())
+}
+
 #[derive(Debug, Clone)]
 pub struct NativeCompactionResult {
     pub summary_text: Option<String>,
@@ -437,6 +534,167 @@ pub struct ModelRoute {
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cheapness: Option<RouteCheapnessEstimate>,
+}
+
+/// Exact runtime identity for a selected model route.
+///
+/// A runtime key identifies the concrete endpoint/auth/account slot that will
+/// send requests. It is intentionally more precise than a display provider
+/// label: for example, OpenRouter and NVIDIA NIM both speak an OpenAI-compatible
+/// protocol, but they must have different runtime keys because they use
+/// different endpoints, auth, catalogs, and routing semantics.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum RuntimeKey {
+    ClaudeOAuth,
+    AnthropicApiKey,
+    OpenAIOAuth,
+    OpenAIApiKey,
+    OpenRouter,
+    OpenAiCompatible {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        profile_id: Option<String>,
+    },
+    Copilot,
+    Gemini,
+    Cursor,
+    Bedrock,
+    Antigravity,
+    CodeAssistOAuth,
+    RemoteCatalog,
+    Current,
+    Other(String),
+}
+
+impl RuntimeKey {
+    pub fn from_api_method(api_method: &ModelRouteApiMethod, _provider_label: &str) -> Self {
+        match api_method {
+            ModelRouteApiMethod::ClaudeOAuth => Self::ClaudeOAuth,
+            ModelRouteApiMethod::AnthropicApiKey => Self::AnthropicApiKey,
+            ModelRouteApiMethod::OpenAIOAuth => Self::OpenAIOAuth,
+            ModelRouteApiMethod::OpenAIApiKey => Self::OpenAIApiKey,
+            ModelRouteApiMethod::OpenRouter => Self::OpenRouter,
+            ModelRouteApiMethod::OpenAiCompatible { profile_id } => Self::OpenAiCompatible {
+                profile_id: profile_id.clone(),
+            },
+            ModelRouteApiMethod::Copilot => Self::Copilot,
+            ModelRouteApiMethod::Cursor => Self::Cursor,
+            ModelRouteApiMethod::Bedrock => Self::Bedrock,
+            ModelRouteApiMethod::CodeAssistOAuth => Self::CodeAssistOAuth,
+            ModelRouteApiMethod::AntigravityHttps => Self::Antigravity,
+            ModelRouteApiMethod::RemoteCatalog => Self::RemoteCatalog,
+            ModelRouteApiMethod::Current => Self::Current,
+            ModelRouteApiMethod::Other(method) => Self::Other(method.clone()),
+        }
+    }
+
+    pub fn stable_id(&self) -> String {
+        match self {
+            Self::ClaudeOAuth => "claude-oauth".to_string(),
+            Self::AnthropicApiKey => "anthropic-api-key".to_string(),
+            Self::OpenAIOAuth => "openai-oauth".to_string(),
+            Self::OpenAIApiKey => "openai-api-key".to_string(),
+            Self::OpenRouter => "openrouter".to_string(),
+            Self::OpenAiCompatible { profile_id } => profile_id
+                .as_deref()
+                .map(|profile_id| format!("openai-compatible:{profile_id}"))
+                .unwrap_or_else(|| "openai-compatible".to_string()),
+            Self::Copilot => "copilot".to_string(),
+            Self::Gemini => "gemini".to_string(),
+            Self::Cursor => "cursor".to_string(),
+            Self::Bedrock => "bedrock".to_string(),
+            Self::Antigravity => "antigravity".to_string(),
+            Self::CodeAssistOAuth => "code-assist-oauth".to_string(),
+            Self::RemoteCatalog => "remote-catalog".to_string(),
+            Self::Current => "current".to_string(),
+            Self::Other(value) => value.clone(),
+        }
+    }
+}
+
+/// Structured model route selection.
+///
+/// This is the internal source of truth for picker/RPC driven model selection.
+/// Human string specs such as `openai-api:gpt-5` should be parsed into this type
+/// at the command boundary instead of being used as the runtime identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RouteSelection {
+    pub model: String,
+    pub runtime_key: RuntimeKey,
+    pub api_method: String,
+    pub provider_label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub detail: String,
+}
+
+impl RouteSelection {
+    pub fn from_model_route(route: &ModelRoute) -> Self {
+        let api_method = route.api_method_kind();
+        Self {
+            model: route.model.clone(),
+            runtime_key: RuntimeKey::from_api_method(&api_method, &route.provider),
+            api_method: route.api_method.clone(),
+            provider_label: route.provider.clone(),
+            detail: route.detail.clone(),
+        }
+    }
+
+    /// The string model spec that applies this route selection, including any
+    /// provider routing prefix/suffix (`openai-oauth:`, `claude-api:`,
+    /// `openai/gpt-5@OpenAI`, `copilot:`, ...).
+    ///
+    /// This is the single source of truth for translating a structured
+    /// [`RouteSelection`] back into the `set_model` spec string. Both the
+    /// trait-default `set_route_selection` and `MultiProvider`'s override use
+    /// it so the routing-prefix policy is never duplicated or allowed to
+    /// drift between provider implementations.
+    pub fn routed_model_spec(&self) -> String {
+        let model = self.model.trim();
+        match &self.runtime_key {
+            RuntimeKey::ClaudeOAuth => format!("claude-oauth:{model}"),
+            RuntimeKey::AnthropicApiKey => format!("claude-api:{model}"),
+            RuntimeKey::OpenAIOAuth => format!("openai-oauth:{model}"),
+            RuntimeKey::OpenAIApiKey => format!("openai-api:{model}"),
+            RuntimeKey::OpenAiCompatible {
+                profile_id: Some(profile_id),
+            } => format!("{}:{model}", profile_id.trim()),
+            RuntimeKey::OpenAiCompatible { profile_id: None } => model.to_string(),
+            RuntimeKey::OpenRouter => {
+                let provider = self.provider_label.trim();
+                let catalog_id = openrouter_catalog_model_id(model);
+                if provider.is_empty()
+                    || provider.eq_ignore_ascii_case("auto")
+                    || model.contains('@')
+                {
+                    catalog_id
+                } else {
+                    format!("{catalog_id}@{provider}")
+                }
+            }
+            RuntimeKey::Copilot => format!("copilot:{model}"),
+            RuntimeKey::Cursor => format!("cursor:{model}"),
+            RuntimeKey::Bedrock => format!("bedrock:{model}"),
+            RuntimeKey::Antigravity => format!("antigravity:{model}"),
+            RuntimeKey::Gemini
+            | RuntimeKey::CodeAssistOAuth
+            | RuntimeKey::RemoteCatalog
+            | RuntimeKey::Current
+            | RuntimeKey::Other(_) => model.to_string(),
+        }
+    }
+}
+
+/// OpenRouter catalog id for a bare model: claude models gain an `anthropic/`
+/// prefix, OpenAI models an `openai/` prefix, already-qualified ids pass
+/// through. Mirrors `jcode_base::provider::openrouter_catalog_model_id` but
+/// lives here so [`RouteSelection::routed_model_spec`] has no upward dep.
+fn openrouter_catalog_model_id(model: &str) -> String {
+    let trimmed = model.trim();
+    match crate::models::provider_for_model(trimmed) {
+        Some("claude") => format!("anthropic/{trimmed}"),
+        Some("openai") => format!("openai/{trimmed}"),
+        _ => trimmed.to_string(),
+    }
 }
 
 /// Typed view of [`ModelRoute::api_method`].
@@ -463,14 +721,27 @@ pub enum ModelRouteApiMethod {
 }
 
 impl ModelRouteApiMethod {
+    /// The route-vocabulary api_method for a canonical dual-auth route.
+    pub fn from_auth_route(route: crate::auth_mode::AuthRoute) -> Self {
+        use crate::auth_mode::{AuthMode, DualAuthProvider};
+        match (route.provider, route.mode) {
+            (DualAuthProvider::Anthropic, AuthMode::Oauth) => Self::ClaudeOAuth,
+            (DualAuthProvider::Anthropic, AuthMode::ApiKey) => Self::AnthropicApiKey,
+            (DualAuthProvider::OpenAI, AuthMode::Oauth) => Self::OpenAIOAuth,
+            (DualAuthProvider::OpenAI, AuthMode::ApiKey) => Self::OpenAIApiKey,
+        }
+    }
+
     pub fn parse(value: &str) -> Self {
         let trimmed = value.trim();
         let lower = trimmed.to_ascii_lowercase();
+        // Dual-auth (Anthropic/OpenAI OAuth-vs-API) tokens share one canonical
+        // alias table so the route vocabulary never drifts from the runtime/CLI
+        // vocabularies. Anything else falls through to the route-only methods.
+        if let Some(route) = crate::auth_mode::AuthRoute::parse(&lower) {
+            return Self::from_auth_route(route);
+        }
         match lower.as_str() {
-            "claude" | "claude-oauth" => Self::ClaudeOAuth,
-            "api-key" | "claude-api" | "anthropic-api-key" => Self::AnthropicApiKey,
-            "openai" | "openai-oauth" => Self::OpenAIOAuth,
-            "openai-api" | "openai-api-key" => Self::OpenAIApiKey,
             "openrouter" => Self::OpenRouter,
             "openai-compatible" => Self::OpenAiCompatible { profile_id: None },
             "copilot" => Self::Copilot,
@@ -611,6 +882,33 @@ pub fn model_route_provider_matches_key(
     if desired_provider.is_empty() {
         return false;
     }
+    // Fold the dual-auth (Anthropic/OpenAI OAuth-vs-API) vocabularies onto their
+    // canonical session key first, so a config `default_provider =
+    // "anthropic-api"` matches a route whose key is `claude-api` -- while still
+    // keeping the API-vs-OAuth distinction (`claude-api` must NOT match
+    // `claude-oauth`/`claude`). Without this fold the two spellings of the same
+    // route normalize differently ("anthropicapi" != "claudeapi") and the model
+    // picker fails to mark the user's actual default route.
+    //
+    // Only the explicit-credential desired keys (`claude-api`, `openai-oauth`,
+    // ...) get this strict treatment. A bare desired alias (`claude`,
+    // `anthropic`, `openai`) pins no credential, so it keeps the historical
+    // auth-method-agnostic label match below and can light up either route.
+    let desired_pins_credential = AuthRoute::parse_explicit_credential_prefix(desired_provider);
+    if let Some(desired_route) = desired_pins_credential {
+        let desired_key = desired_route.session_provider_key();
+        if let Some(route_provider_key) = route_provider_key {
+            let route_folded = AuthRoute::parse(route_provider_key)
+                .map(|route| route.session_provider_key())
+                .unwrap_or(route_provider_key);
+            return normalize_model_route_provider_label(route_folded)
+                == normalize_model_route_provider_label(desired_key);
+        }
+        // No structured route key to compare against: the bare label cannot
+        // distinguish OAuth from API, so a credential-pinned default cannot be
+        // confirmed for this route.
+        return false;
+    }
     if let Some(route_provider_key) = route_provider_key
         && normalize_model_route_provider_label(route_provider_key)
             == normalize_model_route_provider_label(desired_provider)
@@ -692,7 +990,7 @@ impl ModelCatalogSnapshot {
 
     pub fn from_provider(provider: &dyn Provider) -> Self {
         Self::new(
-            Some(provider.name().to_string()),
+            Some(provider.display_name()),
             Some(provider.model()),
             provider.available_models_display(),
             provider.model_routes(),
@@ -706,6 +1004,36 @@ impl ModelCatalogSnapshot {
 
 pub const CHEAPNESS_REFERENCE_INPUT_TOKENS: u64 = 25_000;
 pub const CHEAPNESS_REFERENCE_OUTPUT_TOKENS: u64 = 5_000;
+
+/// The credential a dual-auth provider (Anthropic / OpenAI) will actually use
+/// for the next request. This is the authoritative billing identity: `Oauth`
+/// means subscription usage, `ApiKey` means cost-based usage. It is resolved
+/// once, server-side, from the provider's live credential mode and shipped to
+/// remote clients so they never have to re-derive it from a provider name.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ResolvedCredential {
+    /// OAuth / subscription login (Claude subscription, Codex login, ...).
+    Oauth,
+    /// Direct provider API key (cost-based billing).
+    ApiKey,
+}
+
+impl ResolvedCredential {
+    /// Human-readable label used by header/auth surfaces.
+    pub fn auth_method_label(self) -> &'static str {
+        match self {
+            Self::Oauth => "OAuth",
+            Self::ApiKey => "API key",
+        }
+    }
+
+    /// True when requests bill against a subscription (OAuth) rather than a
+    /// metered API key.
+    pub fn is_subscription(self) -> bool {
+        matches!(self, Self::Oauth)
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -724,6 +1052,8 @@ pub enum RouteCostSource {
     RuntimePlan,
     OpenRouterEndpoint,
     OpenRouterCatalog,
+    /// Live models.dev pricing catalog (https://models.dev/api.json).
+    ModelsDevCatalog,
     Heuristic,
 }
 
@@ -869,6 +1199,16 @@ mod tests {
     }
 
     #[test]
+    fn fresh_transport_client_builds_distinct_clients() {
+        // Each call must produce a brand-new client (new connection pool), not
+        // a cached one: the whole point is that a retry after a transport
+        // fault (e.g. TLS BadRecordMac) never reuses a possibly-poisoned
+        // pooled connection.
+        let _a = fresh_transport_client();
+        let _b = fresh_transport_client();
+    }
+
+    #[test]
     fn canonical_user_agent_identifies_jcode() {
         assert!(JCODE_USER_AGENT.starts_with("jcode/"));
     }
@@ -933,6 +1273,55 @@ mod tests {
     }
 
     #[test]
+    fn model_route_provider_key_matching_folds_dual_auth_vocabularies() {
+        // `default_provider = "anthropic-api"` and a route keyed `claude-api`
+        // are two spellings of the same Anthropic API-key route, so they must
+        // match even though their raw forms normalize differently.
+        assert!(model_route_provider_matches_key(
+            Some("claude-api"),
+            "Anthropic",
+            "anthropic-api",
+        ));
+        assert!(model_route_provider_matches_key(
+            Some("anthropic-api-key"),
+            "Anthropic",
+            "claude-api",
+        ));
+        assert!(model_route_provider_matches_key(
+            Some("openai-api"),
+            "OpenAI",
+            "openai-api-key",
+        ));
+
+        // The fold must NOT collapse the OAuth-vs-API distinction: an API-key
+        // default must not light up the OAuth route (and vice versa).
+        assert!(!model_route_provider_matches_key(
+            Some("claude-oauth"),
+            "Anthropic",
+            "anthropic-api",
+        ));
+        assert!(!model_route_provider_matches_key(
+            Some("openai-oauth"),
+            "OpenAI",
+            "openai-api",
+        ));
+
+        // A bare provider default pins no credential, so it keeps the historical
+        // auth-method-agnostic behavior: it matches either dual-auth route via
+        // the label fallback (model identity still narrows the picker default).
+        assert!(model_route_provider_matches_key(
+            Some("claude-oauth"),
+            "Anthropic",
+            "claude",
+        ));
+        assert!(model_route_provider_matches_key(
+            Some("claude-api"),
+            "Anthropic",
+            "claude",
+        ));
+    }
+
+    #[test]
     fn model_route_recommendation_policy_is_provider_aware() {
         assert!(model_route_metadata_is_recommended(
             "gpt-5.5",
@@ -954,6 +1343,18 @@ mod tests {
             "OpenAI",
             "openai-oauth",
             false
+        ));
+        assert!(model_route_metadata_is_recommended(
+            "claude-opus-4-8",
+            "Anthropic",
+            "claude-oauth",
+            true
+        ));
+        assert!(model_route_metadata_is_recommended(
+            "claude-opus-4-8",
+            "Anthropic",
+            "claude-api",
+            true
         ));
         assert!(model_route_metadata_is_recommended(
             "claude-opus-4-8",
@@ -1032,5 +1433,53 @@ mod tests {
         assert_eq!(snapshot.available_models, ["snapshot-model"]);
         assert!(snapshot.has_routes());
         assert_eq!(snapshot.model_routes[0].api_method, "snapshot-api");
+    }
+
+    #[test]
+    fn runtime_key_distinguishes_openrouter_from_direct_compatible_profile() {
+        assert_eq!(
+            RuntimeKey::from_api_method(&ModelRouteApiMethod::parse("openrouter"), "auto"),
+            RuntimeKey::OpenRouter
+        );
+        assert_eq!(
+            RuntimeKey::from_api_method(
+                &ModelRouteApiMethod::parse("openai-compatible:nvidia-nim"),
+                "NVIDIA NIM",
+            ),
+            RuntimeKey::OpenAiCompatible {
+                profile_id: Some("nvidia-nim".to_string())
+            }
+        );
+    }
+
+    #[test]
+    fn route_selection_preserves_runtime_identity_from_model_route() {
+        let selection = RouteSelection::from_model_route(&ModelRoute {
+            model: "openrouter/owl-alpha".to_string(),
+            provider: "OpenRouter".to_string(),
+            api_method: "openrouter".to_string(),
+            available: true,
+            detail: "https://openrouter.ai/api/v1".to_string(),
+            cheapness: None,
+        });
+        assert_eq!(selection.model, "openrouter/owl-alpha");
+        assert_eq!(selection.runtime_key, RuntimeKey::OpenRouter);
+        assert_eq!(selection.api_method, "openrouter");
+
+        let selection = RouteSelection::from_model_route(&ModelRoute {
+            model: "nvidia/example".to_string(),
+            provider: "NVIDIA NIM".to_string(),
+            api_method: "openai-compatible:nvidia-nim".to_string(),
+            available: true,
+            detail: "https://integrate.api.nvidia.com/v1".to_string(),
+            cheapness: None,
+        });
+        assert_eq!(
+            selection.runtime_key,
+            RuntimeKey::OpenAiCompatible {
+                profile_id: Some("nvidia-nim".to_string())
+            }
+        );
+        assert_eq!(selection.provider_label, "NVIDIA NIM");
     }
 }

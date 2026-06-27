@@ -51,6 +51,7 @@ fn test_usage_report_updates_display_only_card_without_system_message() {
         extra_info: vec![("plan".to_string(), "pro".to_string())],
         hard_limit_reached: false,
         error: None,
+        last_used_unix_secs: None,
     }]);
 
     assert!(!app.usage_report_refreshing);
@@ -81,6 +82,7 @@ fn test_usage_progress_updates_card_incrementally() {
             extra_info: Vec::new(),
             hard_limit_reached: false,
             error: None,
+            last_used_unix_secs: None,
         }],
         completed: 1,
         total: 2,
@@ -669,6 +671,7 @@ fn test_improve_status_summarizes_current_todos() {
             &app.session.id,
             &[
                 crate::todo::TodoItem {
+                    group: None,
                     id: "one".to_string(),
                     content: "Profile startup path".to_string(),
                     status: "in_progress".to_string(),
@@ -679,6 +682,7 @@ fn test_improve_status_summarizes_current_todos() {
                     completion_confidence: None,
                 },
                 crate::todo::TodoItem {
+                    group: None,
                     id: "two".to_string(),
                     content: "Add regression test".to_string(),
                     status: "completed".to_string(),
@@ -770,6 +774,7 @@ fn test_improve_resume_uses_saved_mode_and_current_todos() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "resume1".to_string(),
                 content: "Refactor command parsing".to_string(),
                 status: "in_progress".to_string(),

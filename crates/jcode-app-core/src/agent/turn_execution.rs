@@ -33,40 +33,6 @@ impl Agent {
         self.run_turn(false).await
     }
 
-    /// Run a single message with events streamed to a broadcast channel (for server mode)
-    pub async fn run_once_streaming(
-        &mut self,
-        user_message: &str,
-        event_tx: broadcast::Sender<ServerEvent>,
-    ) -> Result<()> {
-        // Inject any pending notifications before the user message
-        let alerts = self.take_alerts();
-        if !alerts.is_empty() {
-            let alert_text = format!(
-                "[NOTIFICATION]\nYou received {} notification(s) from other agents working in this codebase:\n\n{}\n\nUse the communicate tool (actions: list, read, message/broadcast, dm, channel, share) to coordinate with other agents.",
-                alerts.len(),
-                alerts.join("\n\n---\n\n")
-            );
-            self.add_message(
-                Role::User,
-                vec![ContentBlock::Text {
-                    text: alert_text,
-                    cache_control: None,
-                }],
-            );
-        }
-
-        self.add_message(
-            Role::User,
-            vec![ContentBlock::Text {
-                text: user_message.to_string(),
-                cache_control: None,
-            }],
-        );
-        self.session.save()?;
-        self.run_turn_streaming(event_tx).await
-    }
-
     /// Run one conversation turn with streaming events via mpsc channel (per-client)
     pub async fn run_once_streaming_mpsc(
         &mut self,
@@ -114,9 +80,45 @@ impl Agent {
         self.add_message(Role::User, blocks);
         crate::telemetry::record_turn();
         self.session.save()?;
+        let turn_started_at = Instant::now();
+        let start_message_index = self.message_count();
         let result = self.run_turn_streaming_mpsc(event_tx).await;
         self.current_turn_system_reminder = None;
+        self.fire_turn_end_hook(&result, turn_started_at, start_message_index);
         result
+    }
+
+    /// Fire the `turn_end` observer hook with turn outcome metadata.
+    /// No-op (without building the payload) when the hook is not configured.
+    fn fire_turn_end_hook(
+        &self,
+        result: &Result<()>,
+        started_at: Instant,
+        start_message_index: usize,
+    ) {
+        if !crate::hooks::hook_configured("turn_end") {
+            return;
+        }
+        let status = if result.is_ok() { "ok" } else { "error" };
+        let mut event = crate::hooks::HookEvent::new("turn_end")
+            .session_id(self.session.id.clone())
+            .field("STATUS", status)
+            .field("DURATION_MS", started_at.elapsed().as_millis().to_string())
+            .field("MODEL", self.provider_model());
+        if let Some(cwd) = self.working_dir() {
+            event = event.cwd(cwd);
+        }
+        if let Some(text) = self.latest_assistant_text_after(start_message_index) {
+            const LAST_TEXT_LIMIT: usize = 4000;
+            let snippet: String = text.chars().take(LAST_TEXT_LIMIT).collect();
+            event = event.field("LAST_ASSISTANT_TEXT", snippet);
+        }
+        if let Err(error) = result {
+            const ERROR_LIMIT: usize = 1000;
+            let message: String = error.to_string().chars().take(ERROR_LIMIT).collect();
+            event = event.field("ERROR", message);
+        }
+        crate::hooks::dispatch_observer(event);
     }
 
     /// Clear conversation history
@@ -214,6 +216,9 @@ impl Agent {
             self.locked_tools = None;
             self.cache_tracker.reset();
         }
+        // Allow the late-MCP-registration recheck to fire once for the next
+        // snapshot (e.g. after an explicit `mcp` reload).
+        self.mcp_late_register_resolved = false;
     }
 
     /// Unlock tools if a tool execution may have changed the registry
@@ -261,6 +266,18 @@ impl Agent {
         }
     }
 
+    /// Mark this session as an inline swarm worker. When enabled, the streaming
+    /// loop publishes a throttled output tail to the global bus so a
+    /// coordinator can render a live inline gallery viewport for it.
+    pub fn set_inline_output_tap(&mut self, enabled: bool) {
+        self.inline_output_tap = enabled;
+    }
+
+    /// Whether this session streams an inline output tail to the bus.
+    pub(crate) fn inline_output_tap(&self) -> bool {
+        self.inline_output_tap
+    }
+
     /// Check whether memory features are enabled for this session.
     pub fn memory_enabled(&self) -> bool {
         self.memory_enabled
@@ -280,27 +297,101 @@ impl Agent {
         }
 
         // Return locked tools if available (prevents cache invalidation from
-        // MCP tools arriving asynchronously after the first API request)
+        // tools arriving asynchronously after the first API request).
+        //
+        // Exception: MCP servers connect on a background task and register
+        // `mcp__*` tools seconds after the session starts — typically *after*
+        // the first turn has already locked the snapshot. We deliberately do
+        // NOT block the first turn on MCP connection: servers can be slow or
+        // hang, and we want the user to be able to talk to the agent the moment
+        // the session spawns. The price is that the first locked snapshot is
+        // missing MCP tools, and the only other unlock path fires when the model
+        // calls the `mcp` management tool — which it cannot do without first
+        // seeing MCP tools (#206).
+        //
+        // So, exactly once per locked snapshot, if MCP tools have since appeared
+        // in the registry, we rebuild. This is a single intentional provider
+        // prompt-cache miss (the turn MCP tools first appear). The
+        // `mcp_late_register_resolved` flag makes this a one-shot check so we do
+        // not rescan the registry on every subsequent turn.
         if let Some(ref locked) = self.locked_tools {
-            return locked.clone();
+            if self.mcp_late_register_resolved {
+                return locked.clone();
+            }
+            if self.registry_has_new_mcp_tools(locked).await {
+                logging::info(
+                    "MCP tools registered after first turn locked the tool snapshot — \
+                     rebuilding once to expose them. This is one intentional prompt-cache \
+                     miss; we accept it so the agent is reachable immediately at spawn \
+                     instead of blocking on MCP connection (#206).",
+                );
+                // Latch the one-shot guard and drop the stale snapshot directly.
+                // We intentionally do NOT call `unlock_tools()` here, because that
+                // re-arms the guard (it is the explicit-reload path) and would let
+                // the recheck fire again on every later turn.
+                self.mcp_late_register_resolved = true;
+                self.locked_tools = None;
+                self.cache_tracker.reset();
+            } else {
+                // No MCP tools have appeared. They may still be connecting, so
+                // leave the guard unset and re-check on the next turn. Once they
+                // appear (or never do, after the registry settles) we stop.
+                return locked.clone();
+            }
         }
 
-        let mut tools = self.registry.definitions(self.allowed_tools.as_ref()).await;
-        if !self.disabled_tools.is_empty() {
-            tools.retain(|tool| !self.disabled_tools.contains(&tool.name));
-        }
-        if !self.session.is_canary {
-            tools.retain(|tool| tool.name != "selfdev");
-        }
+        let tools = self.build_filtered_tool_definitions().await;
 
-        // Lock the tool list on first call to prevent cache invalidation
-        // when MCP tools arrive asynchronously mid-session
+        // Lock the tool list to prevent cache invalidation when more tools
+        // arrive asynchronously mid-session.
         logging::info(&format!(
             "Locking tool list at {} tools for cache stability",
             tools.len()
         ));
         self.locked_tools = Some(tools.clone());
         tools
+    }
+
+    /// Build the agent's tool definitions from the registry, applying the
+    /// session's `allowed_tools`, `disabled_tools`, and self-dev filters.
+    async fn build_filtered_tool_definitions(&self) -> Vec<ToolDefinition> {
+        let mut tools = self.registry.definitions(self.allowed_tools.as_ref()).await;
+        if !self.disabled_tools.is_empty() {
+            tools.retain(|tool| !self.disabled_tools.contains(&tool.name));
+        }
+        Self::apply_selfdev_tool_surface(&mut tools, self.session.is_canary);
+        tools
+    }
+
+    /// Tailor the `selfdev` tool definition to the session mode.
+    ///
+    /// The registry stores a single shared `selfdev` tool with a default
+    /// (non-self-dev) schema. Self-dev sessions get the full build/test/reload
+    /// surface; every other session keeps the lightweight on-ramp surface
+    /// (`enter`, `setup`, `reload`, `status`, `find-config`). The tool stays
+    /// available in all sessions so the agent can always enter self-dev mode.
+    fn apply_selfdev_tool_surface(tools: &mut [ToolDefinition], is_canary: bool) {
+        for tool in tools.iter_mut() {
+            if tool.name == "selfdev" {
+                tool.description =
+                    crate::tool::selfdev::SelfDevTool::description_for(is_canary).to_string();
+                tool.input_schema = crate::tool::selfdev::SelfDevTool::schema_for(is_canary);
+            }
+        }
+    }
+
+    /// Returns true if the registry contains `mcp__*` tools (subject to the
+    /// session's `allowed_tools` filter) that are not present in the currently
+    /// locked snapshot. Used to detect the async MCP-registration race (#206).
+    async fn registry_has_new_mcp_tools(&self, locked: &[ToolDefinition]) -> bool {
+        let registry_names = self.registry.tool_names().await;
+        let allowed = self.allowed_tools.as_ref();
+        registry_names.iter().any(|name| {
+            name.starts_with("mcp__")
+                && allowed.map(|set| set.contains(name)).unwrap_or(true)
+                && !self.disabled_tools.contains(name)
+                && !locked.iter().any(|t| &t.name == name)
+        })
     }
 
     pub async fn tool_names(&self) -> Vec<String> {
@@ -320,9 +411,7 @@ impl Agent {
         if !self.disabled_tools.is_empty() {
             tools.retain(|tool| !self.disabled_tools.contains(&tool.name));
         }
-        if !self.session.is_canary {
-            tools.retain(|tool| tool.name != "selfdev");
-        }
+        Self::apply_selfdev_tool_surface(&mut tools, self.session.is_canary);
         tools
     }
 
@@ -361,6 +450,7 @@ impl Agent {
                 id: tool_call_id,
                 name: tool_name,
                 input,
+                thought_signature: None,
             }],
         );
         self.session.save()?;
@@ -446,9 +536,10 @@ impl Agent {
         let model_start = Instant::now();
         if let Some(model) = self.session.model.clone() {
             let model_request =
-                crate::provider::MultiProvider::model_switch_request_for_session_model(
+                crate::provider::MultiProvider::model_switch_request_for_session_route(
                     &model,
                     self.session.provider_key.as_deref(),
+                    self.session.route_api_method.as_deref(),
                 );
             if let Err(e) =
                 crate::provider::set_model_with_auth_refresh(self.provider.as_ref(), &model_request)
@@ -481,6 +572,7 @@ impl Agent {
         let env_snapshot_start = Instant::now();
         self.log_env_snapshot("resume");
         let env_snapshot_ms = env_snapshot_start.elapsed().as_millis();
+        self.fire_session_lifecycle_hook("session_start", "resume");
 
         let save_start = Instant::now();
         if let Err(err) = self.session.save() {
@@ -703,6 +795,7 @@ impl Agent {
                         transcript.push_str(&format!("[Result: {}]\n", preview));
                     }
                     ContentBlock::Reasoning { .. }
+                    | ContentBlock::ReasoningTrace { .. }
                     | ContentBlock::AnthropicThinking { .. }
                     | ContentBlock::OpenAIReasoning { .. } => {}
                     ContentBlock::Image { .. } => {
@@ -716,8 +809,8 @@ impl Agent {
             transcript.push('\n');
         }
 
-        if !crate::memory::memory_sidecar_enabled() {
-            logging::info("Memory extraction skipped: memory sidecar disabled");
+        if !crate::memory::memory_llm_judge_available() {
+            logging::info("Memory extraction skipped: LLM judge unavailable");
             return 0;
         }
 

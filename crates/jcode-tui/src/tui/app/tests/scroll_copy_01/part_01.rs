@@ -56,7 +56,7 @@ fn create_scroll_test_app(
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     // Set deterministic session name for snapshot stability
     app.session.short_name = Some("test".to_string());
@@ -90,7 +90,7 @@ fn create_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend::TestBacke
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -109,7 +109,7 @@ fn create_error_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend::Tes
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -128,15 +128,14 @@ fn create_tool_error_copy_test_app() -> (App, ratatui::Terminal<ratatui::backend
                 id: "tool_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat /root/secret"}),
-                intent: None,
-            },
+                intent: None, thought_signature: None, },
         ),
     ];
     app.bump_display_messages_version();
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -156,15 +155,14 @@ fn create_tool_failed_output_copy_test_app()
                 id: "tool_1".to_string(),
                 name: "bash".to_string(),
                 input: serde_json::json!({"command": "cat /root/secret"}),
-                intent: None,
-            },
+                intent: None, thought_signature: None, },
         ),
     ];
     app.bump_display_messages_version();
     app.scroll_offset = 0;
     app.auto_scroll_paused = false;
     app.is_processing = false;
-    app.streaming_text.clear();
+    app.streaming.streaming_text.clear();
     app.status = ProcessingStatus::Idle;
     app.session.short_name = Some("test".to_string());
 
@@ -339,10 +337,10 @@ fn test_streaming_repaint_does_not_leave_bracket_artifact() {
 
     app.is_processing = true;
     app.status = ProcessingStatus::Streaming;
-    app.streaming_text = "[".to_string();
+    app.streaming.streaming_text = "[".to_string();
     let _ = render_and_snap(&app, &mut terminal);
 
-    app.streaming_text = "Process A: |██████████|".to_string();
+    app.streaming.streaming_text = "Process A: |██████████|".to_string();
     let text = render_and_snap(&app, &mut terminal);
 
     assert!(
@@ -525,12 +523,23 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         lines.push(format!("filler line {idx:02}"));
     }
 
-    app.display_messages = vec![DisplayMessage::assistant(lines.join("\n"))];
+    // Join as separate markdown paragraphs: the repro depends on the file
+    // activity line owning its row with trailing blank cells (so a blank->blank
+    // diff skips repainting the injected ghost). Single newlines now soft-wrap
+    // into one flowing paragraph, which would repaint over the ghost cells.
+    app.display_messages = vec![DisplayMessage::assistant(lines.join("\n\n"))];
     app.bump_display_messages_version();
     app.auto_scroll_paused = true;
     app.scroll_offset = 0;
 
-    let clean = render_and_snap(&app, &mut terminal);
+    // The transcript begins with the persistent header, which can be taller
+    // than this 12-row viewport. Scroll until the file activity line is
+    // actually on screen instead of assuming it sits at the top.
+    let mut clean = render_and_snap(&app, &mut terminal);
+    while !clean.contains("read lines") && app.scroll_offset < 200 {
+        app.scroll_offset += 1;
+        clean = render_and_snap(&app, &mut terminal);
+    }
     assert!(
         !clean.contains('Z'),
         "ghost marker must not be present before injection:\n{clean}"
@@ -556,7 +565,7 @@ fn test_file_activity_scroll_reproduces_trailing_ghost_after_native_scroll_like_
         .draw(updates)
         .expect("inject trailing nines after file activity line");
 
-    app.scroll_offset = 1;
+    app.scroll_offset += 1;
     let scrolled = render_and_snap(&app, &mut terminal);
 
     assert!(
@@ -704,7 +713,10 @@ fn test_local_alt_m_falls_back_to_diagram_pane_when_side_panel_is_empty() {
 }
 
 #[test]
-fn test_local_alt_m_toggles_image_side_panel_visibility() {
+fn test_images_do_not_drive_side_panel_visibility() {
+    // Images now render inline in the transcript flow, so they must not flip the
+    // side panel on, arm an auto-hide timer, or otherwise behave like the old
+    // pinned-image side pane.
     let mut app = create_test_app();
     app.is_remote = true;
     app.side_panel = crate::side_panel::SidePanelSnapshot::default();
@@ -713,48 +725,13 @@ fn test_local_alt_m_toggles_image_side_panel_visibility() {
         data: "image-data".to_string(),
         label: Some("preview.png".to_string()),
         source: crate::session::RenderedImageSource::UserInput,
+        anchor: None,
     });
 
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(app.side_panel_user_hidden);
-    assert_eq!(app.status_notice(), Some("Image side panel: OFF".to_string()));
-
-    app.handle_key(KeyCode::Char('m'), KeyModifiers::ALT)
-        .unwrap();
-    assert!(!app.side_panel_user_hidden);
-    assert_eq!(app.status_notice(), Some("Image side panel: ON".to_string()));
-}
-
-#[test]
-fn test_pinned_image_side_panel_auto_hides_and_mentions_alt_m() {
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.side_panel = crate::side_panel::SidePanelSnapshot::default();
-    app.remote_side_pane_images.push(crate::session::RenderedImage {
-        media_type: "image/png".to_string(),
-        data: "image-data".to_string(),
-        label: Some("preview.png".to_string()),
-        source: crate::session::RenderedImageSource::UserInput,
-    });
-
-    assert!(app.update_pinned_images_auto_hide());
-    assert!(!app.side_panel_user_hidden);
-    assert!(app.pinned_images_auto_hide_deadline.is_some());
-
-    app.pinned_images_auto_hide_deadline =
-        Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
-    assert!(app.update_pinned_images_auto_hide());
-
-    assert!(app.side_panel_user_hidden);
+    // Auto-hide bookkeeping is now a no-op for images.
+    assert!(!app.update_pinned_images_auto_hide());
     assert!(app.pinned_images_auto_hide_deadline.is_none());
-    let notice = app
-        .display_messages
-        .last()
-        .map(|message| message.content.clone())
-        .unwrap_or_default();
-    assert!(notice.contains("Pinned image side panel hidden automatically"));
-    assert!(notice.contains(crate::tui::keybind::side_panel_toggle_key_label()));
+    assert!(!app.side_panel_user_hidden);
 }
 
 #[test]
@@ -960,4 +937,58 @@ fn test_ctrl_digit_side_panel_preset_in_app() {
     app.handle_key(KeyCode::Char('4'), KeyModifiers::CONTROL)
         .unwrap();
     assert_eq!(app.diagram_pane_ratio_target, 100);
+}
+
+#[test]
+fn test_chat_overscroll_reveals_status_line_then_rebounds() {
+    let _lock = scroll_render_test_lock();
+
+    let (mut app, mut terminal) = create_scroll_test_app(80, 14, 0, 36);
+
+    // Give the app some context so the overscroll line has a percentage to show.
+    app.context_info = crate::prompt::ContextInfo {
+        total_chars: 40_000,
+        ..Default::default()
+    };
+    app.context_limit = 200_000;
+
+    // Pinned to the bottom: no overscroll line yet. (The idle status line now
+    // renders its own short ▰▱ context bar, so the overscroll-specific
+    // affordance to assert on is the `(overscroll x.x)` countdown, not the
+    // glyphs alone.)
+    let pinned = render_and_snap(&app, &mut terminal);
+    assert!(!app.chat_overscroll_active(), "should start without overscroll");
+    assert!(
+        !pinned.contains("(overscroll"),
+        "overscroll countdown should be hidden while pinned: {pinned:?}"
+    );
+
+    // Scroll down at the bottom => overscroll registered, line revealed.
+    app.handle_mouse_event(MouseEvent {
+        kind: MouseEventKind::ScrollDown,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(
+        app.chat_overscroll_active(),
+        "overscroll should be active after scrolling down at the bottom"
+    );
+    let revealed = render_and_snap(&app, &mut terminal);
+    assert!(
+        revealed.contains("(overscroll"),
+        "overscroll status line should show the countdown affordance: {revealed:?}"
+    );
+
+    // Scrolling up cancels the overscroll line immediately.
+    app.handle_mouse_event(MouseEvent {
+        kind: MouseEventKind::ScrollUp,
+        column: 10,
+        row: 5,
+        modifiers: KeyModifiers::empty(),
+    });
+    assert!(
+        !app.chat_overscroll_active(),
+        "scrolling up should cancel the overscroll line"
+    );
 }

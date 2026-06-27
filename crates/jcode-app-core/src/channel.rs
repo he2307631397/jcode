@@ -650,7 +650,12 @@ impl MessageChannel for JadeRelayChannel {
     }
 
     fn is_reply_enabled(&self) -> bool {
-        self.reply_enabled
+        // Inbound Jade relay prompts are delivered by server::jade_relay so they
+        // work even when ambient mode is disabled and target the configured live
+        // Jcode session directly. Keep this channel for outbound notifications
+        // only; otherwise ambient mode would start a second poller.
+        let _configured_for_server_listener = self.reply_enabled;
+        false
     }
 
     async fn send(&self, text: &str) -> anyhow::Result<()> {
@@ -879,7 +884,10 @@ mod tests {
         eprintln!("baseline: {} events, next_after={}", events.len(), after);
 
         // 3) simulate a cloud client posting a prompt by POSTing a prompt event
-        let prompt_text = format!("hello from rust live test {}", chrono::Utc::now().timestamp());
+        let prompt_text = format!(
+            "hello from rust live test {}",
+            chrono::Utc::now().timestamp()
+        );
         let prompt_body = serde_json::json!({
             "user_id": user_id,
             "type": "prompt",
@@ -898,7 +906,11 @@ mod tests {
             .send()
             .await
             .expect("post prompt");
-        assert!(resp.status().is_success(), "post prompt status {}", resp.status());
+        assert!(
+            resp.status().is_success(),
+            "post prompt status {}",
+            resp.status()
+        );
 
         // 4) the channel polls and sees the prompt
         let (events, after2) = ch.poll_prompts(after, 5).await.expect("poll after prompt");
@@ -930,7 +942,10 @@ mod tests {
             .await
             .expect("verify json");
         assert!(
-            verify.events.iter().any(|e| e.text.as_deref() == Some(reply.as_str())),
+            verify
+                .events
+                .iter()
+                .any(|e| e.text.as_deref() == Some(reply.as_str())),
             "response event should be readable back from the relay"
         );
         eprintln!("LIVE ROUNDTRIP OK: prompt -> poll -> response verified");

@@ -218,6 +218,8 @@ pub use model::{
 mod cache_render;
 #[path = "mermaid_content.rs"]
 mod content_render;
+#[path = "mermaid_inline.rs"]
+mod inline_image;
 #[path = "mermaid_runtime.rs"]
 mod runtime;
 #[path = "mermaid_viewport.rs"]
@@ -234,8 +236,12 @@ pub use cache_render::{
 pub use content_render::terminal_theme;
 pub use content_render::{
     MermaidContent, diagram_placeholder_lines, error_to_lines, estimate_image_height,
-    image_widget_placeholder_markdown, parse_image_placeholder, result_to_content, result_to_lines,
-    write_video_export_marker,
+    image_widget_placeholder_markdown, inline_image_placeholder_lines, parse_image_placeholder,
+    parse_inline_image_placeholder, result_to_content, result_to_lines, write_video_export_marker,
+};
+pub use inline_image::{
+    inline_image_dims, inline_image_id, inline_image_is_materialized, materialize_inline_image,
+    materialize_inline_image_by_id,
 };
 pub use runtime::{
     error_lines_for, get_cached_png, get_font_size, image_protocol_available, init_picker,
@@ -243,7 +249,9 @@ pub use runtime::{
     set_video_export_mode,
 };
 pub use viewport_render::{
-    invalidate_render_state, render_image_widget_viewport, render_image_widget_viewport_precise,
+    InlineFitReadiness, inline_fit_readiness, invalidate_render_state, prewarm_inline_fit_state,
+    render_image_widget_fit_stable, render_image_widget_viewport,
+    render_image_widget_viewport_precise,
 };
 pub use widget_render::{render_image_widget, render_image_widget_fit, render_image_widget_scale};
 
@@ -422,7 +430,11 @@ static SVG_FONT_DB: LazyLock<Arc<usvg::fontdb::Database>> = LazyLock::new(|| {
 /// several MB of RAM (e.g. a 1440×1080 RGBA image ≈ 6 MB, plus protocol
 /// encoding overhead).  Keeping this bounded prevents unbounded memory
 /// growth over long sessions with many diagrams.
-const IMAGE_STATE_MAX: usize = 12;
+///
+/// Sized to comfortably cover the viewport plus the look-ahead prefetch band
+/// (see `ui_inline_image::prefetch`) so scrolling back through a transcript of
+/// inline screenshots reuses warm protocol state instead of re-encoding.
+const IMAGE_STATE_MAX: usize = 24;
 
 /// Image state cache - holds StatefulProtocol for each rendered image
 /// Keyed by content hash; source_path guards prevent stale reuse when
@@ -548,8 +560,12 @@ enum ResizeMode {
     Viewport,
 }
 
-/// Cache decoded source images for fast viewport cropping
-const SOURCE_CACHE_MAX: usize = 8;
+/// Cache decoded source images for fast viewport cropping.
+///
+/// Sized to cover the viewport plus the inline-image look-ahead prefetch band
+/// so scrolling back over recently seen screenshots reuses the decoded pixels
+/// instead of re-opening and re-decoding the cached PNG from disk.
+const SOURCE_CACHE_MAX: usize = 16;
 
 struct SourceImageEntry {
     path: PathBuf,
@@ -569,6 +585,11 @@ struct KittyViewportState {
     full_cols: u16,
     full_rows: u16,
     pending_transmit: Option<String>,
+    /// `Some((cols, rows))` when this entry was built by the inline fit path
+    /// (image pre-scaled to fit a placeholder region); `None` for the zoomable
+    /// diagram viewport path. Keeps the two users of this cache from
+    /// mistaking each other's transmitted pixels.
+    fit_target: Option<(u16, u16)>,
 }
 
 struct KittyViewportCache {

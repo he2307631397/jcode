@@ -1,61 +1,29 @@
 use super::{EventStream, Provider};
 use crate::auth::copilot as copilot_auth;
-use crate::message::{
-    ContentBlock, Message as ChatMessage, Role, StreamEvent, TOOL_OUTPUT_MISSING_TEXT,
-    ToolDefinition,
-};
+use crate::message::{ContentBlock, Message as ChatMessage, Role, StreamEvent, ToolDefinition};
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
+#[cfg(test)]
+use jcode_provider_copilot::max_token_parameter_for_model as copilot_max_token_parameter_for_model;
+use jcode_provider_copilot::{
+    COPILOT_API_VERSION, PersistedCatalog,
+    add_max_token_parameter as add_copilot_max_token_parameter,
+    build_messages as build_copilot_messages, build_tools as build_copilot_tools,
+};
+pub(crate) use jcode_provider_copilot::{DEFAULT_MODEL, FALLBACK_MODELS, is_known_display_model};
 pub use jcode_provider_core::PremiumMode;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::sync::{Arc, RwLock};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-const COPILOT_API_VERSION: &str = "2025-04-01";
-
-const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
-
-const FALLBACK_MODELS: &[&str] = &[
-    "claude-sonnet-4.6",
-    "claude-sonnet-4.5",
-    "claude-haiku-4.5",
-    "claude-opus-4.6",
-    "claude-opus-4.6-fast",
-    "claude-opus-4.5",
-    "claude-sonnet-4",
-    "gemini-3-pro-preview",
-    "gpt-5.4",
-    "gpt-5.4-pro",
-    "gpt-5.3-codex",
-    "gpt-5.2-codex",
-    "gpt-5.2",
-    "gpt-5.1-codex-max",
-    "gpt-5.1-codex",
-    "gpt-5.1",
-    "gpt-5.1-codex-mini",
-    "gpt-5-mini",
-    "gpt-4.1",
-];
-
-pub(crate) fn is_known_display_model(model: &str) -> bool {
-    FALLBACK_MODELS.contains(&model)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CatalogSource {
     None,
     Cached,
     Live,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PersistedCatalog {
-    models: Vec<String>,
-    fetched_at_rfc3339: String,
 }
 
 /// Copilot API provider - uses GitHub Copilot's OpenAI-compatible API.
@@ -78,17 +46,13 @@ pub struct CopilotApiProvider {
 }
 
 impl CopilotApiProvider {
+    #[cfg(test)]
     fn max_token_parameter_for_model(model: &str) -> &'static str {
-        let normalized = model.trim().to_ascii_lowercase();
-        if normalized.starts_with("gpt-5") {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        }
+        copilot_max_token_parameter_for_model(model)
     }
 
     fn add_max_token_parameter(body: &mut Value, model: &str, max_tokens: u32) {
-        body[Self::max_token_parameter_for_model(model)] = json!(max_tokens);
+        add_copilot_max_token_parameter(body, model, max_tokens);
     }
 
     fn persisted_catalog_path() -> Result<std::path::PathBuf> {
@@ -427,183 +391,13 @@ impl CopilotApiProvider {
     }
 
     /// Build OpenAI-compatible messages array from our message format.
-    ///
-    /// Properly pairs tool_use blocks (in assistant messages) with their
-    /// corresponding tool_result blocks (in user messages), handling
-    /// out-of-order results and missing outputs.
     fn build_messages(system: &str, messages: &[ChatMessage]) -> Vec<Value> {
-        use std::collections::{HashMap, HashSet};
-
-        let mut result = Vec::new();
-        let missing_output = format!("[Error] {}", TOOL_OUTPUT_MISSING_TEXT);
-
-        if !system.is_empty() {
-            result.push(json!({
-                "role": "system",
-                "content": system,
-            }));
-        }
-
-        let mut tool_result_last_pos: HashMap<String, usize> = HashMap::new();
-        for (idx, msg) in messages.iter().enumerate() {
-            if let Role::User = msg.role {
-                for block in &msg.content {
-                    if let ContentBlock::ToolResult { tool_use_id, .. } = block {
-                        tool_result_last_pos.insert(tool_use_id.clone(), idx);
-                    }
-                }
-            }
-        }
-
-        let mut tool_calls_seen: HashSet<String> = HashSet::new();
-        let mut pending_tool_results: HashMap<String, String> = HashMap::new();
-        let mut used_tool_results: HashSet<String> = HashSet::new();
-
-        for (idx, msg) in messages.iter().enumerate() {
-            match msg.role {
-                Role::User => {
-                    let mut text_parts: Vec<&str> = Vec::new();
-                    for block in &msg.content {
-                        match block {
-                            ContentBlock::Text { text, .. } => {
-                                text_parts.push(text.as_str());
-                            }
-                            ContentBlock::ToolResult {
-                                tool_use_id,
-                                content,
-                                is_error,
-                            } => {
-                                if used_tool_results.contains(tool_use_id) {
-                                    continue;
-                                }
-                                let output = if is_error == &Some(true) {
-                                    format!("[Error] {}", content)
-                                } else if content.is_empty() {
-                                    TOOL_OUTPUT_MISSING_TEXT.to_string()
-                                } else {
-                                    content.clone()
-                                };
-                                if tool_calls_seen.contains(tool_use_id) {
-                                    result.push(json!({
-                                        "role": "tool",
-                                        "tool_call_id": crate::message::sanitize_tool_id(tool_use_id),
-                                        "content": output,
-                                    }));
-                                    used_tool_results.insert(tool_use_id.clone());
-                                } else if !pending_tool_results.contains_key(tool_use_id) {
-                                    pending_tool_results.insert(tool_use_id.clone(), output);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    let text = text_parts.join("\n");
-                    if !text.is_empty() {
-                        result.push(json!({
-                            "role": "user",
-                            "content": text,
-                        }));
-                    }
-                }
-                Role::Assistant => {
-                    let mut content_text = String::new();
-                    let mut tool_calls = Vec::new();
-                    let mut post_tool_outputs: Vec<(String, String)> = Vec::new();
-                    let mut missing_tool_outputs: Vec<String> = Vec::new();
-
-                    for block in &msg.content {
-                        match block {
-                            ContentBlock::Text { text, .. } => {
-                                content_text.push_str(text);
-                            }
-                            ContentBlock::ToolUse { id, name, input } => {
-                                let args = if input.is_object() {
-                                    input.to_string()
-                                } else {
-                                    "{}".to_string()
-                                };
-                                tool_calls.push(json!({
-                                    "id": crate::message::sanitize_tool_id(id),
-                                    "type": "function",
-                                    "function": {
-                                        "name": name,
-                                        "arguments": args,
-                                    }
-                                }));
-                                tool_calls_seen.insert(id.clone());
-                                if let Some(output) = pending_tool_results.remove(id) {
-                                    post_tool_outputs.push((id.clone(), output));
-                                    used_tool_results.insert(id.clone());
-                                } else {
-                                    let has_future_output = tool_result_last_pos
-                                        .get(id)
-                                        .map(|pos| *pos > idx)
-                                        .unwrap_or(false);
-                                    if !has_future_output {
-                                        missing_tool_outputs.push(id.clone());
-                                        used_tool_results.insert(id.clone());
-                                    }
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-
-                    let mut assistant_msg = json!({
-                        "role": "assistant",
-                    });
-
-                    if !content_text.is_empty() {
-                        assistant_msg["content"] = json!(content_text);
-                    }
-                    if !tool_calls.is_empty() {
-                        assistant_msg["tool_calls"] = json!(tool_calls);
-                    }
-
-                    if !content_text.is_empty() || !tool_calls.is_empty() {
-                        result.push(assistant_msg);
-
-                        for (tool_call_id, output) in post_tool_outputs {
-                            result.push(json!({
-                                "role": "tool",
-                                "tool_call_id": crate::message::sanitize_tool_id(&tool_call_id),
-                                "content": output,
-                            }));
-                        }
-
-                        for missing_id in missing_tool_outputs {
-                            result.push(json!({
-                                "role": "tool",
-                                "tool_call_id": crate::message::sanitize_tool_id(&missing_id),
-                                "content": missing_output.clone(),
-                            }));
-                        }
-                    }
-                }
-            }
-        }
-
-        result
+        build_copilot_messages(system, messages)
     }
 
-    /// Build OpenAI-compatible tools array
+    /// Build OpenAI-compatible tools array.
     fn build_tools(tools: &[ToolDefinition]) -> Vec<Value> {
-        tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        // Prompt-visible. Approximate token cost for this field:
-                        // t.description_token_estimate().
-                        "description": t.description,
-                        "parameters": t.input_schema,
-                    }
-                })
-            })
-            .collect()
+        build_copilot_tools(tools)
     }
 
     /// Send a streaming request to Copilot API with retry logic
@@ -632,12 +426,15 @@ impl CopilotApiProvider {
 
         for attempt in 0..MAX_RETRIES {
             if attempt > 0 {
-                let delay = RETRY_BASE_DELAY_MS * (1 << (attempt - 1));
+                let delay = crate::provider::attempt_tracker::retry_backoff_delay(
+                    attempt,
+                    RETRY_BASE_DELAY_MS,
+                );
                 crate::logging::info(&format!(
                     "Retrying Copilot API request (attempt {}/{}) after {}ms",
                     attempt + 1,
                     MAX_RETRIES,
-                    delay
+                    delay.as_millis()
                 ));
                 let _ = tx
                     .send(Ok(StreamEvent::ConnectionPhase {
@@ -647,7 +444,7 @@ impl CopilotApiProvider {
                         },
                     }))
                     .await;
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                tokio::time::sleep(delay).await;
             }
 
             crate::logging::info(&format!(
@@ -676,8 +473,18 @@ impl CopilotApiProvider {
 
             let request_id = Uuid::new_v4().to_string();
 
-            let resp = self
-                .client
+            // Retries use a fresh unpooled client: the fault that broke
+            // attempt N (e.g. TLS BadRecordMac from a corrupting middlebox)
+            // may also have poisoned other idle pooled connections opened
+            // through the same path, so reusing the shared pool can fail
+            // identically. A fresh client guarantees a new TCP+TLS connection.
+            let attempt_client = if attempt == 0 {
+                self.client.clone()
+            } else {
+                crate::provider::fresh_transport_client()
+            };
+
+            let resp = attempt_client
                 .post(format!(
                     "{}/chat/completions",
                     copilot_auth::COPILOT_API_BASE
@@ -704,7 +511,10 @@ impl CopilotApiProvider {
             let resp = match resp {
                 Ok(r) => r,
                 Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
+                    // Full anyhow chain ({:#}) so a `.context(...)`-wrapped
+                    // transport cause (e.g. TLS BadRecordMac) is visible to the
+                    // retry classifier.
+                    let error_str = format!("{e:#}").to_lowercase();
                     if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
                         crate::logging::info(&format!(
                             "Transient Copilot error, will retry: {}",
@@ -761,18 +571,49 @@ impl CopilotApiProvider {
                 }))
                 .await;
 
+            // Track whether this attempt streams replay-visible output so a
+            // mid-stream transport fault can roll the partial output back on
+            // the consumer before the retry replays the response from the top.
+            let (attempt_tx, attempt_guard) =
+                crate::provider::attempt_tracker::track_attempt_output(tx.clone());
+
             // Process SSE stream - returns Err on timeout/stream errors
-            match self.process_sse_stream(resp, tx.clone()).await {
-                Ok(()) => return,
+            match self.process_sse_stream(resp, attempt_tx).await {
+                Ok(()) => {
+                    let _ = attempt_guard.finish().await;
+                    return;
+                }
                 Err(e) => {
-                    let error_str = e.to_string().to_lowercase();
+                    let saw_output = attempt_guard.finish().await;
+                    // Full anyhow chain ({:#}) so a `.context(...)`-wrapped
+                    // transport cause (e.g. TLS BadRecordMac) is visible to the
+                    // retry classifier.
+                    let error_str = format!("{e:#}").to_lowercase();
                     if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
-                        crate::logging::info(&format!(
-                            "Copilot stream failed (attempt {}/{}), will retry: {}",
-                            attempt + 1,
-                            MAX_RETRIES,
-                            e
-                        ));
+                        if saw_output {
+                            // Partial output already reached the consumer; tell
+                            // it to discard the partial attempt so the retried
+                            // response replays cleanly instead of duplicating.
+                            crate::logging::warn(&format!(
+                                "Copilot stream failed after partial output (attempt {}/{}); rolling back partial attempt and retrying: {}",
+                                attempt + 1,
+                                MAX_RETRIES,
+                                e
+                            ));
+                            let _ = tx
+                                .send(Ok(StreamEvent::RetryRollback {
+                                    attempt: attempt + 2,
+                                    max: MAX_RETRIES,
+                                }))
+                                .await;
+                        } else {
+                            crate::logging::info(&format!(
+                                "Copilot stream failed (attempt {}/{}), will retry: {}",
+                                attempt + 1,
+                                MAX_RETRIES,
+                                e
+                            ));
+                        }
                         last_error = Some(e);
                         continue;
                     }

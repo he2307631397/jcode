@@ -5,6 +5,7 @@ mod auth_account_picker;
 #[path = "auth_types.rs"]
 mod auth_types;
 pub(crate) use self::auth_account_commands::{
+    account_command_from_picker, execute_account_command_local, execute_account_command_remote,
     handle_account_command_remote, handle_auth_command, resolve_account_provider_descriptor,
     save_openai_fast_setting_local,
 };
@@ -16,7 +17,11 @@ use std::sync::Arc;
 
 impl App {
     fn open_auth_browser(url: &str) -> bool {
-        open::that_detached(url).is_ok()
+        // Honors --no-browser/NO_BROWSER/JCODE_NO_BROWSER and never opens real
+        // browser windows from test binaries (login flows are exercised by TUI
+        // tests; without this guard a test run pops OAuth pages on the
+        // developer's desktop).
+        super::helpers::open_path_or_url_detached(url).is_ok()
     }
 
     fn record_oauth_preflight(
@@ -201,13 +206,70 @@ impl App {
         use crate::provider_catalog::LoginProviderTarget;
 
         let result: anyhow::Result<String> = (|| match provider.target {
-            LoginProviderTarget::Claude | LoginProviderTarget::ClaudeApiKey => {
+            LoginProviderTarget::Jcode => {
+                Self::clear_api_key_login(
+                    crate::subscription_catalog::JCODE_API_KEY_ENV,
+                    crate::subscription_catalog::JCODE_ENV_FILE,
+                )?;
+                crate::provider_catalog::save_env_value_to_env_file(
+                    crate::subscription_catalog::JCODE_API_BASE_ENV,
+                    crate::subscription_catalog::JCODE_ENV_FILE,
+                    None,
+                )?;
+                Ok("Logged out of jcode subscription API key.".to_string())
+            }
+            LoginProviderTarget::Claude => {
                 let removed = crate::auth::claude::clear_accounts()?;
                 Ok(format!("Logged out of {} Anthropic account(s).", removed))
             }
-            LoginProviderTarget::OpenAi | LoginProviderTarget::OpenAiApiKey => {
+            LoginProviderTarget::ClaudeApiKey => {
+                Self::clear_api_key_login("ANTHROPIC_API_KEY", "anthropic.env")?;
+                Ok("Logged out of Anthropic API key.".to_string())
+            }
+            LoginProviderTarget::OpenAi => {
                 let removed = crate::auth::codex::clear_accounts()?;
                 Ok(format!("Logged out of {} OpenAI account(s).", removed))
+            }
+            LoginProviderTarget::OpenAiApiKey => {
+                Self::clear_api_key_login("OPENAI_API_KEY", "openai.env")?;
+                Ok("Logged out of OpenAI API key.".to_string())
+            }
+            LoginProviderTarget::OpenRouter => {
+                Self::clear_api_key_login("OPENROUTER_API_KEY", "openrouter.env")?;
+                Ok("Logged out of OpenRouter API key.".to_string())
+            }
+            LoginProviderTarget::Bedrock => {
+                Self::clear_api_key_login(
+                    crate::provider::bedrock::API_KEY_ENV,
+                    crate::provider::bedrock::ENV_FILE,
+                )?;
+                Ok("Logged out of Bedrock API key.".to_string())
+            }
+            LoginProviderTarget::Azure => {
+                Self::clear_api_key_login(
+                    crate::auth::azure::API_KEY_ENV,
+                    crate::auth::azure::ENV_FILE,
+                )?;
+                crate::provider_catalog::save_env_value_to_env_file(
+                    crate::auth::azure::USE_ENTRA_ENV,
+                    crate::auth::azure::ENV_FILE,
+                    None,
+                )?;
+                Ok("Logged out of Azure OpenAI API key / Entra configuration.".to_string())
+            }
+            LoginProviderTarget::OpenAiCompatible(profile) => {
+                let resolved = crate::provider_catalog::resolve_openai_compatible_profile(profile);
+                Self::clear_api_key_login(&resolved.api_key_env, &resolved.env_file)?;
+                crate::provider_catalog::save_env_value_to_env_file(
+                    crate::provider_catalog::OPENAI_COMPAT_LOCAL_ENABLED_ENV,
+                    &resolved.env_file,
+                    None,
+                )?;
+                Ok(format!("Logged out of {} API key.", resolved.display_name))
+            }
+            LoginProviderTarget::Cursor => {
+                crate::auth::cursor::clear_api_key()?;
+                Ok("Logged out of Cursor API key.".to_string())
             }
             LoginProviderTarget::Gemini => {
                 crate::auth::gemini::clear_tokens()?;
@@ -240,9 +302,7 @@ impl App {
         let mut errors: Vec<String> = Vec::new();
 
         match crate::auth::claude::clear_accounts() {
-            Ok(removed) if removed > 0 => {
-                summary.push(format!("{} Anthropic account(s)", removed))
-            }
+            Ok(removed) if removed > 0 => summary.push(format!("{} Anthropic account(s)", removed)),
             Ok(_) => {}
             Err(err) => errors.push(format!("Anthropic: {}", err)),
         }
@@ -250,6 +310,90 @@ impl App {
             Ok(removed) if removed > 0 => summary.push(format!("{} OpenAI account(s)", removed)),
             Ok(_) => {}
             Err(err) => errors.push(format!("OpenAI: {}", err)),
+        }
+
+        Self::clear_api_key_logout_summary(
+            &mut summary,
+            &mut errors,
+            "jcode subscription API key",
+            crate::subscription_catalog::JCODE_API_KEY_ENV,
+            crate::subscription_catalog::JCODE_ENV_FILE,
+        );
+        if let Err(err) = crate::provider_catalog::save_env_value_to_env_file(
+            crate::subscription_catalog::JCODE_API_BASE_ENV,
+            crate::subscription_catalog::JCODE_ENV_FILE,
+            None,
+        ) {
+            errors.push(format!("jcode subscription API base: {}", err));
+        }
+
+        Self::clear_api_key_logout_summary(
+            &mut summary,
+            &mut errors,
+            "Anthropic API key",
+            "ANTHROPIC_API_KEY",
+            "anthropic.env",
+        );
+        Self::clear_api_key_logout_summary(
+            &mut summary,
+            &mut errors,
+            "OpenAI API key",
+            "OPENAI_API_KEY",
+            "openai.env",
+        );
+        Self::clear_api_key_logout_summary(
+            &mut summary,
+            &mut errors,
+            "OpenRouter API key",
+            "OPENROUTER_API_KEY",
+            "openrouter.env",
+        );
+        Self::clear_api_key_logout_summary(
+            &mut summary,
+            &mut errors,
+            "Bedrock API key",
+            crate::provider::bedrock::API_KEY_ENV,
+            crate::provider::bedrock::ENV_FILE,
+        );
+        Self::clear_api_key_logout_summary(
+            &mut summary,
+            &mut errors,
+            "Azure OpenAI API key",
+            crate::auth::azure::API_KEY_ENV,
+            crate::auth::azure::ENV_FILE,
+        );
+        if let Err(err) = crate::provider_catalog::save_env_value_to_env_file(
+            crate::auth::azure::USE_ENTRA_ENV,
+            crate::auth::azure::ENV_FILE,
+            None,
+        ) {
+            errors.push(format!("Azure OpenAI Entra config: {}", err));
+        }
+        for profile in crate::provider_catalog::openai_compatible_profiles() {
+            let resolved = crate::provider_catalog::resolve_openai_compatible_profile(*profile);
+            Self::clear_api_key_logout_summary(
+                &mut summary,
+                &mut errors,
+                &format!("{} API key", resolved.display_name),
+                &resolved.api_key_env,
+                &resolved.env_file,
+            );
+            if let Err(err) = crate::provider_catalog::save_env_value_to_env_file(
+                crate::provider_catalog::OPENAI_COMPAT_LOCAL_ENABLED_ENV,
+                &resolved.env_file,
+                None,
+            ) {
+                errors.push(format!(
+                    "{} local endpoint config: {}",
+                    resolved.display_name, err
+                ));
+            }
+        }
+        let cursor_configured = crate::auth::cursor::load_api_key().is_ok();
+        match crate::auth::cursor::clear_api_key() {
+            Ok(()) if cursor_configured => summary.push("Cursor API key".to_string()),
+            Ok(()) => {}
+            Err(err) => errors.push(format!("Cursor API key: {}", err)),
         }
         match crate::auth::gemini::clear_tokens() {
             Ok(()) => summary.push("Gemini".to_string()),
@@ -276,11 +420,38 @@ impl App {
         }
     }
 
+    fn clear_api_key_login(env_key: &str, env_file: &str) -> anyhow::Result<()> {
+        crate::provider_catalog::save_env_value_to_env_file(env_key, env_file, None)
+    }
+
+    fn clear_api_key_logout_summary(
+        summary: &mut Vec<String>,
+        errors: &mut Vec<String>,
+        label: &str,
+        env_key: &str,
+        env_file: &str,
+    ) {
+        let configured =
+            crate::provider_catalog::load_env_value_from_env_or_config(env_key, env_file).is_some();
+        match Self::clear_api_key_login(env_key, env_file) {
+            Ok(()) if configured => summary.push(label.to_string()),
+            Ok(()) => {}
+            Err(err) => errors.push(format!("{}: {}", label, err)),
+        }
+    }
+
     pub(super) fn start_login_provider(
         &mut self,
         provider: crate::provider_catalog::LoginProviderDescriptor,
     ) {
         crate::telemetry::record_provider_selected(provider.id);
+        crate::logging::event_info(
+            "login_started",
+            vec![
+                ("provider_id", provider.id.to_string()),
+                ("auth_kind", provider.auth_kind.label().to_string()),
+            ],
+        );
         match provider.target {
             crate::provider_catalog::LoginProviderTarget::AutoImport => {
                 match crate::external_auth::pending_external_auth_review_candidates() {
@@ -1242,7 +1413,7 @@ impl App {
             }));
 
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-            let _ = open::that_detached(&verification_uri);
+            let _ = Self::open_auth_browser(&verification_uri);
 
             let token = match crate::auth::copilot::poll_for_access_token(
                 &client,
@@ -1700,6 +1871,28 @@ impl App {
                 let resolved_openai_compatible = openai_compatible_profile
                     .map(crate::provider_catalog::resolve_openai_compatible_profile);
 
+                // Record the key-save attempt before touching disk. This is the
+                // single most important breadcrumb for issue #312 ("paste API
+                // key for OpenAI-compatible/opencode silently returns to menu"):
+                // it proves the input was received and which env var/file jcode
+                // tried to write, without logging the key itself.
+                crate::logging::event_info(
+                    "login_api_key_save_attempt",
+                    vec![
+                        ("provider_id", provider_id.clone()),
+                        ("provider", provider.clone()),
+                        ("auth_method", auth_method.clone()),
+                        ("env_var", key_name.clone()),
+                        ("env_file", env_file.clone()),
+                        ("input_len", key.len().to_string()),
+                        ("optional", api_key_optional.to_string()),
+                        (
+                            "openai_compatible",
+                            openai_compatible_profile.is_some().to_string(),
+                        ),
+                    ],
+                );
+
                 let save_result: anyhow::Result<()> =
                     if let Some(resolved) = resolved_openai_compatible.as_ref() {
                         (|| {
@@ -1768,6 +1961,19 @@ impl App {
                 match save_result {
                     Ok(()) => {
                         crate::auth::AuthStatus::invalidate_cache();
+                        crate::logging::event_info(
+                            "login_api_key_saved",
+                            vec![
+                                ("provider_id", provider_id.clone()),
+                                ("provider", provider.clone()),
+                                ("env_var", key_name.clone()),
+                                ("env_file", env_file.clone()),
+                                (
+                                    "openai_compatible",
+                                    openai_compatible_profile.is_some().to_string(),
+                                ),
+                            ],
+                        );
                         if key_name == crate::provider::bedrock::API_KEY_ENV {
                             crate::provider::activation::lock_runtime_provider_key("bedrock");
                             if let Some(default_model) = default_model.as_deref() {
@@ -1841,6 +2047,17 @@ impl App {
                     Err(e) => {
                         let reason = crate::auth::login_diagnostics::classify_auth_failure_message(
                             &e.to_string(),
+                        );
+                        crate::logging::event_error(
+                            "login_api_key_save_failed",
+                            vec![
+                                ("provider_id", provider_id.clone()),
+                                ("provider", provider.clone()),
+                                ("env_var", key_name.clone()),
+                                ("env_file", env_file.clone()),
+                                ("reason", reason.label().to_string()),
+                                ("error", e.to_string()),
+                            ],
                         );
                         crate::telemetry::record_auth_failed_reason(
                             &provider_id,
@@ -2069,6 +2286,13 @@ impl App {
                     .await
                     {
                         Ok(outcome) => {
+                            // Auto-import bypasses the manual `pending_login`
+                            // telemetry path, so record `auth_success` for each
+                            // imported provider to keep the activation funnel
+                            // accurate.
+                            for (provider, method) in &outcome.imported_auth_labels {
+                                crate::telemetry::record_auth_success(provider, method);
+                            }
                             Bus::global().publish(BusEvent::LoginCompleted(LoginCompleted {
                                 provider: "auto-import".to_string(),
                                 success: outcome.imported > 0,
@@ -2155,20 +2379,7 @@ impl App {
 
         match self.provider.set_model(&model_request) {
             Ok(()) => {
-                self.provider_session_id = None;
-                self.session.provider_session_id = None;
-                self.upstream_provider = None;
-                let active_model = self.provider.model();
-                self.update_context_limit_for_model(&active_model);
-                self.session.provider_key =
-                    crate::provider::MultiProvider::session_provider_key_after_model_switch(
-                        &model_request,
-                        self.provider.name(),
-                        self.session.provider_key.as_deref(),
-                    );
-                self.session.model = Some(active_model.clone());
-                let _ = self.session.save();
-                self.invalidate_model_picker_cache();
+                let active_model = self.finalize_model_switch(&model_request);
                 crate::bus::Bus::global().publish_models_updated();
                 crate::logging::auth_event(
                     "auth_changed_runtime_model_applied",
@@ -2194,6 +2405,14 @@ impl App {
         provider_id: String,
         provider_label: String,
     ) {
+        crate::logging::event_info(
+            "login_post_activation_started",
+            vec![
+                ("provider_id", provider_id.clone()),
+                ("provider", provider_label.clone()),
+                ("session_id", self.session.id.clone()),
+            ],
+        );
         crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
             crate::bus::UiActivity::catalog(
                 Some(self.session.id.clone()),
@@ -2270,11 +2489,32 @@ impl App {
 
                         if let Some(model) = selected {
                             let model_request = format!("{}:{}", provider_id, model);
+                            crate::logging::event_info(
+                                "login_post_activation_route_selected",
+                                vec![
+                                    ("provider_id", provider_id.clone()),
+                                    ("model", model.clone()),
+                                    ("provider_routes", provider_routes.len().to_string()),
+                                    ("models_added", summary.models_added.to_string()),
+                                    ("routes_added", summary.routes_added.to_string()),
+                                ],
+                            );
                             match provider.set_model(&model_request) {
                                 Ok(()) => {
                                     let provider_key = crate::provider::MultiProvider::session_provider_key_for_model_request(
                                         &model_request,
                                         provider.name(),
+                                    );
+                                    crate::logging::event_info(
+                                        "login_post_activation_model_applied",
+                                        vec![
+                                            ("provider_id", provider_id.clone()),
+                                            ("model", model.clone()),
+                                            (
+                                                "session_provider",
+                                                provider_key.clone().unwrap_or_default(),
+                                            ),
+                                        ],
                                     );
                                     crate::bus::Bus::global().publish_models_updated();
                                     crate::bus::Bus::global().publish(
@@ -2300,6 +2540,14 @@ impl App {
                                     );
                                 }
                                 Err(error) => {
+                                    crate::logging::event_error(
+                                        "login_post_activation_model_failed",
+                                        vec![
+                                            ("provider_id", provider_id.clone()),
+                                            ("model", model.clone()),
+                                            ("error", error.to_string()),
+                                        ],
+                                    );
                                     crate::bus::Bus::global().publish(
                                         crate::bus::BusEvent::LoginCompleted(
                                             crate::bus::LoginCompleted {
@@ -2315,6 +2563,13 @@ impl App {
                                 }
                             }
                         } else {
+                            crate::logging::event_warn(
+                                "login_post_activation_no_route",
+                                vec![
+                                    ("provider_id", provider_id.clone()),
+                                    ("provider_routes", provider_routes.len().to_string()),
+                                ],
+                            );
                             crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
                                 crate::bus::UiActivity::catalog(
                                     Some(session_id),
@@ -2331,6 +2586,13 @@ impl App {
                         }
                     }
                     Err(error) => {
+                        crate::logging::event_error(
+                            "login_post_activation_refresh_failed",
+                            vec![
+                                ("provider_id", provider_id.clone()),
+                                ("error", error.to_string()),
+                            ],
+                        );
                         crate::bus::Bus::global().publish(crate::bus::BusEvent::UiActivity(
                             crate::bus::UiActivity::catalog(
                                 Some(session_id),
@@ -2364,6 +2626,13 @@ impl App {
             return;
         }
         crate::auth::AuthStatus::invalidate_cache();
+        crate::logging::event_info(
+            "login_completed",
+            vec![
+                ("provider", login.provider.clone()),
+                ("success", login.success.to_string()),
+            ],
+        );
         if let Some((provider, method)) = self
             .pending_login
             .as_ref()
@@ -2380,7 +2649,11 @@ impl App {
         if login.success {
             self.recent_authenticated_provider = Some((login.provider.clone(), Instant::now()));
             self.invalidate_model_picker_cache();
-            self.push_display_message(DisplayMessage::system(login.message));
+            let suppress_first_run_login_noise =
+                self.onboarding_flow_active() && !matches!(login.provider.as_str(), "copilot_code");
+            if !suppress_first_run_login_noise {
+                self.push_display_message(DisplayMessage::system(login.message));
+            }
             self.set_status_notice(format!("Login: {} ready", login.provider));
             if Self::login_provider_is_azure(&login.provider) {
                 self.activate_azure_runtime_model_after_login();
@@ -2395,13 +2668,16 @@ impl App {
                 &login.provider,
                 &login.message,
             );
-            self.push_display_message(DisplayMessage::error(message));
-            self.set_status_notice(format!("Login: {} failed", login.provider));
-            // If onboarding is driving the Login phase, a failed auto-import
-            // would otherwise leave the welcome card up forever (fighting the
-            // error message and the spinning donut). Clear the onboarding
-            // takeover so the normal chat view + manual login prompt take over.
-            self.onboarding_handle_login_failed();
+            // During onboarding we route the failure to the recovery screen
+            // (which explains next steps) instead of dumping a raw error message
+            // and a status notice the user can miss.
+            if self.onboarding_flow_active() {
+                self.onboarding_handle_login_failed(Some(message));
+            } else {
+                self.push_display_message(DisplayMessage::error(message));
+                self.set_status_notice(format!("Login: {} failed", login.provider));
+                self.onboarding_handle_login_failed(None);
+            }
         }
         if self.pending_login.is_some() {
             self.pending_login = None;

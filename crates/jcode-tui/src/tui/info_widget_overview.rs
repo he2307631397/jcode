@@ -118,7 +118,7 @@ fn compact_todos_height(data: &InfoWidgetData) -> u16 {
 
 fn compact_memory_height(data: &InfoWidgetData) -> u16 {
     if let Some(info) = &data.memory_info
-        && (info.total_count > 0 || info.activity.is_some() || info.sidecar_model.is_some())
+        && (info.total_count > 0 || info.activity.is_some())
     {
         return 1;
     }
@@ -203,9 +203,9 @@ fn expanded_todos_height(data: &InfoWidgetData) -> u16 {
         return 0;
     }
 
-    let available_lines = MAX_TODO_LINES.saturating_sub(2);
+    let available_lines = MAX_TODO_LINES.saturating_sub(1);
     let todo_lines = data.todos.len().min(available_lines);
-    let mut height = 2 + u16::try_from(todo_lines).unwrap_or(u16::MAX);
+    let mut height = 1 + u16::try_from(todo_lines).unwrap_or(u16::MAX);
     if data.todos.len() > available_lines {
         height += 1;
     }
@@ -214,14 +214,11 @@ fn expanded_todos_height(data: &InfoWidgetData) -> u16 {
 
 fn expanded_memory_height(data: &InfoWidgetData) -> u16 {
     if let Some(info) = &data.memory_info
-        && (info.total_count > 0 || info.activity.is_some() || info.sidecar_model.is_some())
+        && (info.total_count > 0 || info.activity.is_some())
     {
         let mut height = 1u16;
         if info.activity.is_some() {
             height += 1 + 4;
-        }
-        if info.sidecar_model.is_some() {
-            height += 1;
         }
         if let Some(activity) = &info.activity
             && activity
@@ -262,6 +259,7 @@ mod tests {
     fn compute_page_layout_keeps_multiple_expanded_pages_when_height_allows() {
         let data = InfoWidgetData {
             todos: vec![TodoItem {
+                group: None,
                 content: "ship refactor".to_string(),
                 status: "pending".to_string(),
                 priority: "high".to_string(),

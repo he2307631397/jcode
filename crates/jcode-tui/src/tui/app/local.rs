@@ -30,10 +30,18 @@ pub(super) async fn process_turn_with_input(
     {
         Ok(()) => {
             app.last_stream_error = None;
+            app.last_submitted_input = None;
         }
         Err(error) => {
             let err_str = crate::util::format_error_chain(&error);
-            if is_context_limit_error(&err_str) {
+            if super::is_request_payload_too_large_error(&err_str) {
+                if !app
+                    .try_recover_payload_too_large_and_retry(terminal, event_stream)
+                    .await
+                {
+                    app.handle_turn_error(err_str);
+                }
+            } else if is_context_limit_error(&err_str) {
                 if !app.try_auto_compact_and_retry(terminal, event_stream).await {
                     app.handle_turn_error(err_str);
                 }
@@ -55,15 +63,22 @@ pub(super) async fn process_turn_with_input(
 pub(super) fn handle_tick(app: &mut App) -> bool {
     let mut needs_redraw = crate::tui::periodic_redraw_required(app);
     app.maybe_capture_runtime_memory_heartbeat();
+    needs_redraw |= app.progress_copy_selection_edge_autoscroll();
     app.progress_mouse_scroll_animation();
+    needs_redraw |= app.update_chat_overscroll();
     needs_redraw |= app.update_pinned_images_auto_hide();
+    // Dissolve stale (off-screen) reasoning traces with zero visible motion.
+    needs_redraw |= app.gc_offscreen_reasoning_traces();
+    // Adopt the resolved scroll position once a frame containing newly loaded
+    // older history has rendered, so manual scrolling resumes seamlessly.
+    needs_redraw |= app.reconcile_history_anchor();
     if app.submit_input_on_startup && !app.is_processing {
         app.submit_input_on_startup = false;
         app.submit_input();
         needs_redraw = true;
     }
-    if let Some(chunk) = app.stream_buffer.flush() {
-        app.append_streaming_text(&chunk);
+    let ops = app.stream_buffer.flush();
+    if app.apply_stream_ops(ops) {
         needs_redraw = true;
     }
     needs_redraw |= app.refresh_todos_view_if_needed();
@@ -148,6 +163,10 @@ pub(super) fn handle_bus_event(
             super::commands::handle_git_status_completed(app, result);
             true
         }
+        Ok(BusEvent::ProductivityReportReady(event)) => {
+            app.handle_productivity_report_ready(event);
+            true
+        }
         Ok(BusEvent::MermaidRenderCompleted) => true,
         Ok(BusEvent::UsageReport(results)) => {
             app.handle_usage_report(results);
@@ -160,6 +179,9 @@ pub(super) fn handle_bus_event(
         Ok(BusEvent::LoginCompleted(login)) => {
             app.handle_login_completed(login);
             true
+        }
+        Ok(BusEvent::OnboardingModelValidated(result)) => {
+            app.handle_onboarding_model_validated(result)
         }
         Ok(BusEvent::ModelsUpdated) => {
             app.invalidate_model_picker_cache();
@@ -336,7 +358,12 @@ fn apply_terminal_event(
 ) -> Result<bool> {
     match event {
         Some(Ok(Event::FocusGained)) => {
+            let redraw = app.set_client_focused(true);
             app.note_client_focus(true);
+            Ok(redraw)
+        }
+        Some(Ok(Event::FocusLost)) => {
+            app.set_client_focused(false);
             Ok(false)
         }
         Some(Ok(Event::Key(key))) => {
@@ -449,8 +476,9 @@ fn handle_input_shell_completed(app: &mut App, shell: InputShellCompleted) {
 }
 
 pub(super) fn finish_turn(app: &mut App) {
-    app.total_input_tokens += app.streaming_input_tokens;
-    app.total_output_tokens += app.streaming_output_tokens;
+    let turn_duration_secs = app.display_turn_duration_secs();
+    app.token_accounting.total_input_tokens += app.streaming.streaming_input_tokens;
+    app.token_accounting.total_output_tokens += app.streaming.streaming_output_tokens;
     app.update_cost_impl();
     app.is_processing = false;
     app.status = ProcessingStatus::Idle;
@@ -463,10 +491,13 @@ pub(super) fn finish_turn(app: &mut App) {
     app.thinking_prefix_emitted = false;
     app.thinking_buffer.clear();
     app.note_runtime_memory_event_force("turn_completed", "local_turn_finished");
-    if !app.schedule_auto_poke_followup_if_needed()
-        && !app.schedule_overnight_poke_followup_if_needed()
-    {
+    let followup_scheduled = app.schedule_auto_poke_followup_if_needed()
+        || app.schedule_overnight_poke_followup_if_needed();
+    if !followup_scheduled {
         app.clear_visible_turn_started();
+        if !app.pending_queued_dispatch && app.queued_messages.is_empty() {
+            app.maybe_notify_turn_complete(turn_duration_secs);
+        }
     }
     let _ = super::commands::maybe_begin_pending_local_transfer(app);
 }

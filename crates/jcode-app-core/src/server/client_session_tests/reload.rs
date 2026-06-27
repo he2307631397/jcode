@@ -329,6 +329,7 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
                     joined_at: now,
                     last_status_change: now,
                     is_headless: false,
+                    output_tail: None,
                 },
             ),
             (
@@ -349,11 +350,12 @@ fn handle_reload_queues_signal_for_canary_session() -> Result<()> {
                     joined_at: now,
                     last_status_change: now,
                     is_headless: false,
+                    output_tail: None,
                 },
             ),
         ])));
 
-        handle_reload(7, "session_test_reload", &agent, &swarm_members, &tx).await;
+        handle_reload(7, true, "session_test_reload", &agent, &swarm_members, &tx).await;
 
         let reloading = events
             .recv()
@@ -417,7 +419,14 @@ async fn handle_reload_does_not_wait_for_busy_agent_lock() -> Result<()> {
 
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        handle_reload(11, "session_fallback_reload", &agent, &swarm_members, &tx),
+        handle_reload(
+            11,
+            true,
+            "session_fallback_reload",
+            &agent,
+            &swarm_members,
+            &tx,
+        ),
     )
     .await
     .map_err(|_| anyhow!("handle_reload waited for a busy agent lock"))?;

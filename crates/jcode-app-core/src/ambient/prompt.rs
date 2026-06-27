@@ -181,50 +181,91 @@ pub fn gather_recent_sessions(since: Option<DateTime<Utc>>) -> Vec<RecentSession
 
     let cutoff = since.unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24));
 
-    let mut recent = Vec::new();
+    // Pre-filter candidate session files by filesystem mtime BEFORE loading and
+    // parsing them. The sessions directory can hold tens of thousands of files;
+    // fully parsing every one via Session::load just to drop those older than
+    // the cutoff is O(all_sessions * parse). A session updated after the cutoff
+    // has a recent mtime, so we keep only files whose mtime is at or after the
+    // cutoff (minus a small margin for clock/write skew), then load newest-first
+    // and stop once we have enough recent sessions.
+    const RECENT_SESSION_LIMIT: usize = 20;
+    let mtime_cutoff = cutoff - chrono::Duration::hours(1);
+
+    let mut candidates: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&sessions_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false)
-                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
-                && let Ok(session) = crate::session::Session::load(stem)
-            {
-                // Skip debug sessions
-                if session.is_debug {
-                    continue;
-                }
-                // Only include sessions updated after cutoff
-                if session.updated_at < cutoff {
-                    continue;
-                }
-                let duration = (session.updated_at - session.created_at)
-                    .num_seconds()
-                    .max(0);
-                let extraction = if session.messages.is_empty() {
-                    "no messages"
-                } else {
-                    // Heuristic: if session closed normally, assume extracted
-                    match &session.status {
-                        crate::session::SessionStatus::Closed => "extracted",
-                        crate::session::SessionStatus::Crashed { .. } => "missed",
-                        crate::session::SessionStatus::Active => "in progress",
-                        _ => "unknown",
-                    }
-                };
-                recent.push(RecentSessionInfo {
-                    id: session.id.clone(),
-                    status: session.status.display().to_string(),
-                    topic: session.display_title().map(ToOwned::to_owned),
-                    duration_secs: duration,
-                    extraction_status: extraction.to_string(),
-                });
+            if !path.extension().map(|e| e == "json").unwrap_or(false) {
+                continue;
             }
+            let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+                // If we can't read mtime, keep the file as a candidate so we
+                // don't silently drop a possibly-recent session.
+                candidates.push((path, std::time::SystemTime::UNIX_EPOCH));
+                continue;
+            };
+            let modified_dt: DateTime<Utc> = modified.into();
+            if modified_dt < mtime_cutoff {
+                continue;
+            }
+            candidates.push((path, modified));
+        }
+    }
+    // Newest files first so we can stop early once we have enough.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+    let mut recent = Vec::new();
+    // Load somewhat more than the final limit by mtime so the subsequent
+    // id-based sort/truncate picks the true most-recent set even when file
+    // mtime order and id (timestamp) order disagree near the boundary, while
+    // still bounding work far below "load every session file".
+    let load_budget = RECENT_SESSION_LIMIT
+        .saturating_mul(4)
+        .max(RECENT_SESSION_LIMIT);
+    let mut loaded = 0usize;
+    for (path, _modified) in candidates {
+        if loaded >= load_budget {
+            break;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+            && let Ok(session) = crate::session::Session::load(stem)
+        {
+            loaded += 1;
+            // Skip debug sessions
+            if session.is_debug {
+                continue;
+            }
+            // Only include sessions updated after cutoff
+            if session.updated_at < cutoff {
+                continue;
+            }
+            let duration = (session.updated_at - session.created_at)
+                .num_seconds()
+                .max(0);
+            let extraction = if session.messages.is_empty() {
+                "no messages"
+            } else {
+                // Heuristic: if session closed normally, assume extracted
+                match &session.status {
+                    crate::session::SessionStatus::Closed => "extracted",
+                    crate::session::SessionStatus::Crashed { .. } => "missed",
+                    crate::session::SessionStatus::Active => "in progress",
+                    _ => "unknown",
+                }
+            };
+            recent.push(RecentSessionInfo {
+                id: session.id.clone(),
+                status: session.status.display().to_string(),
+                topic: session.display_title().map(ToOwned::to_owned),
+                duration_secs: duration,
+                extraction_status: extraction.to_string(),
+            });
         }
     }
 
-    // Sort by most recent first (we don't have created_at easily, sort by id which embeds timestamp)
+    // Sort by most recent first (id embeds a timestamp).
     recent.sort_by(|a, b| b.id.cmp(&a.id));
-    recent.truncate(20); // Cap at 20 to keep prompt reasonable
+    recent.truncate(RECENT_SESSION_LIMIT);
     recent
 }
 
@@ -425,7 +466,18 @@ pub fn build_ambient_system_prompt(
     // --- Instructions ---
     prompt.push_str(
         "## Instructions\n\n\
-         Start by using the todos tool to plan what you'll do this cycle.\n\n\
+         Use the tools that are already available to you in this session. Do \
+         not search for tools — there is no tool-search/discovery tool, and \
+         the tools you need are listed below and in your tool definitions.\n\n\
+         Key tools for this cycle (use these exact names):\n\
+         - `todo` — plan and track what you'll do this cycle.\n\
+         - `end_ambient_cycle` — REQUIRED to finish the cycle (see below).\n\
+         - `schedule_ambient` — schedule your next wake time.\n\
+         - `request_permission` — get approval before any code change.\n\
+         - `send_message` — keep the user informed.\n\
+         Standard tools (`bash`, `read`, `write`, `edit`, `memory`, etc.) are \
+         also available.\n\n\
+         Start by using the `todo` tool to plan what you'll do this cycle.\n\n\
          Priority order:\n\
          1. Execute any scheduled queue items first.\n\
          2. Garden the memory graph -- consolidate duplicates, resolve \

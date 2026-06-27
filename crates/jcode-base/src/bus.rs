@@ -112,11 +112,41 @@ pub struct FileTouch {
     pub detail: Option<String>,
 }
 
+/// Streaming output tail for a swarm worker session, used to render the inline
+/// swarm gallery's live viewports. The text is a short, already-truncated tail
+/// of the worker's in-progress assistant output (not the full transcript).
+#[derive(Clone, Debug)]
+pub struct SwarmOutputTail {
+    /// Session id of the worker producing output.
+    pub session_id: String,
+    /// Recent output tail (capped to a handful of lines by the producer).
+    pub tail: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct LoginCompleted {
     pub provider: String,
     pub success: bool,
     pub message: String,
+}
+
+/// Result of the first-run onboarding default-model validation ping. Published
+/// after the new-session screen runs a lightweight live check of the
+/// auto-selected default model so the UI can show a single "ready"/"failed"
+/// validation line instead of the usual login/import chatter.
+#[derive(Clone, Debug)]
+pub struct OnboardingModelValidated {
+    /// Session the validation was started for; the UI ignores stale results.
+    pub session_id: String,
+    /// Friendly model label shown to the user (e.g. "GPT-5.5 (low)").
+    pub model_label: String,
+    /// Provider key backing the default model (e.g. "anthropic", "openai") so
+    /// the readiness summary can avoid listing the default provider twice.
+    pub provider_key: Option<String>,
+    /// Whether the live validation ping succeeded.
+    pub ok: bool,
+    /// Optional short detail (failure reason) shown after a failed check.
+    pub detail: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -239,6 +269,27 @@ pub struct GitStatusCompleted {
     pub result: std::result::Result<String, String>,
 }
 
+/// Result of a `/productivity` report generation run.
+///
+/// Carries already-rendered outputs (markdown + PNG bytes) so the TUI layer can
+/// display/copy them without depending on the productivity crate's types here in
+/// `jcode-base`.
+#[derive(Clone, Debug)]
+pub struct ProductivityReportReady {
+    pub session_id: String,
+    pub result: std::result::Result<ProductivityReportPayload, String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProductivityReportPayload {
+    /// Rendered Markdown report for the transcript.
+    pub markdown: String,
+    /// PNG dashboard bytes.
+    pub png: Vec<u8>,
+    /// Filesystem path the PNG was saved to.
+    pub png_path: std::path::PathBuf,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SidePanelUpdated {
     pub session_id: String,
@@ -311,6 +362,8 @@ pub enum BusEvent {
     BatchProgress(BatchProgress),
     /// File was touched by an agent (for swarm conflict detection)
     FileTouch(FileTouch),
+    /// Streaming output tail from a swarm worker, for inline gallery viewports.
+    SwarmOutputTail(SwarmOutputTail),
     /// Background task completed
     BackgroundTaskCompleted(BackgroundTaskCompleted),
     /// Background task reported progress
@@ -321,6 +374,8 @@ pub enum BusEvent {
     UsageReportProgress(jcode_usage_types::ProviderUsageProgress),
     /// OAuth/login flow completed in the background
     LoginCompleted(LoginCompleted),
+    /// First-run onboarding finished validating the auto-selected default model.
+    OnboardingModelValidated(OnboardingModelValidated),
     /// Local `!cmd` shell command completed from the input line
     InputShellCompleted(InputShellCompleted),
     /// Clipboard paste/image URL work completed off the UI thread
@@ -364,10 +419,16 @@ pub enum BusEvent {
     SidePanelUpdated(SidePanelUpdated),
     /// Deferred Mermaid rendering completed and cached content may now be visible
     MermaidRenderCompleted,
+    /// Productivity report finished generating off the UI thread
+    ProductivityReportReady(ProductivityReportReady),
 }
 
 pub struct Bus {
     sender: broadcast::Sender<BusEvent>,
+    /// Debounce state for [`Bus::publish_models_updated`]. Per-instance (not a
+    /// global static) so tests can exercise coalescing on a private bus
+    /// without racing other tests that publish to the global bus.
+    models_updated_state: std::sync::Arc<Mutex<ModelsUpdatedPublishState>>,
 }
 
 const MODELS_UPDATED_DEBOUNCE: Duration = Duration::from_millis(750);
@@ -383,14 +444,10 @@ struct ModelsUpdatedPublishState {
     publish_pending: bool,
 }
 
-fn models_updated_publish_state() -> &'static Mutex<ModelsUpdatedPublishState> {
-    static STATE: OnceLock<Mutex<ModelsUpdatedPublishState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(ModelsUpdatedPublishState::default()))
-}
-
 #[cfg(any(test, feature = "test-support"))]
 pub fn reset_models_updated_publish_state_for_tests() {
-    let mut state = models_updated_publish_state()
+    let mut state = Bus::global()
+        .models_updated_state
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     *state = ModelsUpdatedPublishState::default();
@@ -399,10 +456,24 @@ pub fn reset_models_updated_publish_state_for_tests() {
 impl Bus {
     pub fn global() -> &'static Bus {
         static INSTANCE: OnceLock<Bus> = OnceLock::new();
-        INSTANCE.get_or_init(|| {
-            let (sender, _) = broadcast::channel(256);
-            Bus { sender }
-        })
+        INSTANCE.get_or_init(Bus::new)
+    }
+
+    /// A standalone bus with its own subscribers and debounce state. Used by
+    /// tests; production code shares [`Bus::global`].
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_isolated_for_tests() -> std::sync::Arc<Bus> {
+        std::sync::Arc::new(Bus::new())
+    }
+
+    fn new() -> Bus {
+        let (sender, _) = broadcast::channel(256);
+        Bus {
+            sender,
+            models_updated_state: std::sync::Arc::new(Mutex::new(
+                ModelsUpdatedPublishState::default(),
+            )),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<BusEvent> {
@@ -429,7 +500,8 @@ impl Bus {
     pub fn publish_models_updated(&self) {
         let delay = {
             let now = Instant::now();
-            let mut state = models_updated_publish_state()
+            let mut state = self
+                .models_updated_state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             match state.last_published_at {
@@ -454,7 +526,8 @@ impl Bus {
 
         if let Some(delay) = delay {
             let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                let mut state = models_updated_publish_state()
+                let mut state = self
+                    .models_updated_state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.publish_pending = false;
@@ -463,15 +536,21 @@ impl Bus {
                 self.publish(BusEvent::ModelsUpdated);
                 return;
             };
+            // The delayed publish must flow through *this* bus instance (its
+            // sender and its debounce state), not Bus::global(): an isolated
+            // test bus would otherwise leak its coalesced event onto the
+            // global bus and clear the wrong pending flag.
+            let state = std::sync::Arc::clone(&self.models_updated_state);
+            let sender = self.sender.clone();
             handle.spawn(async move {
                 tokio::time::sleep(delay).await;
-                let mut state = models_updated_publish_state()
+                let mut state = state
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 state.publish_pending = false;
                 state.last_published_at = Some(Instant::now());
                 drop(state);
-                Bus::global().publish(BusEvent::ModelsUpdated);
+                let _ = sender.send(BusEvent::ModelsUpdated);
             });
             return;
         }
@@ -482,19 +561,20 @@ impl Bus {
 
 #[cfg(test)]
 mod tests {
-    use super::{Bus, BusEvent, reset_models_updated_publish_state_for_tests};
+    use super::{Bus, BusEvent};
     use tokio::time::{Duration, timeout};
 
     #[tokio::test]
     async fn models_updated_publishes_are_coalesced() {
-        let mut rx = Bus::global().subscribe();
-        while rx.try_recv().is_ok() {}
+        // An isolated bus: subscribing to Bus::global() here used to race
+        // other tests that publish ModelsUpdated (or any event) to the global
+        // bus, making the "exactly two events" assertions flaky.
+        let bus = Bus::new_isolated_for_tests();
+        let mut rx = bus.subscribe();
 
-        reset_models_updated_publish_state_for_tests();
-
-        Bus::global().publish_models_updated();
-        Bus::global().publish_models_updated();
-        Bus::global().publish_models_updated();
+        bus.publish_models_updated();
+        bus.publish_models_updated();
+        bus.publish_models_updated();
 
         match timeout(Duration::from_secs(1), rx.recv()).await {
             Ok(Ok(BusEvent::ModelsUpdated)) => {}

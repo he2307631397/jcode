@@ -3,7 +3,7 @@ use crate::protocol::ServerEvent;
 use crate::provider::Provider;
 use crate::server::{
     SessionInterruptQueues, SwarmMember, VersionedPlan, broadcast_swarm_status,
-    register_session_interrupt_queue, swarm_id_for_dir,
+    register_background_tool_signal, register_session_interrupt_queue, swarm_id_for_dir,
 };
 use crate::tool::Registry;
 use anyhow::Result;
@@ -31,6 +31,7 @@ pub(super) async fn create_headless_session(
     selfdev_requested: bool,
     model_override: Option<String>,
     provider_key_override: Option<String>,
+    route_api_method_override: Option<String>,
     mcp_pool: Option<Arc<crate::mcp::SharedMcpPool>>,
     report_back_to_session_id: Option<String>,
 ) -> Result<String> {
@@ -63,18 +64,36 @@ pub(super) async fn create_headless_session(
 
     let mut new_agent = Agent::new(Arc::clone(&provider), registry);
     new_agent.set_memory_enabled(memory_enabled);
+    // Inline swarm mode renders a live gallery of worker viewports in the
+    // coordinator TUI; enable the per-agent output tap so this worker streams a
+    // throttled output tail onto the bus.
+    if matches!(
+        crate::config::config().agents.swarm_spawn_mode,
+        crate::config::SwarmSpawnMode::Inline
+    ) {
+        new_agent.set_inline_output_tap(true);
+    }
     if provider_key_override.is_some() {
-        new_agent.set_session_provider_key(provider_key_override);
+        new_agent.set_session_provider_key(provider_key_override.clone());
     }
     let client_session_id = new_agent.session_id().to_string();
 
-    if let Some(model) = model_override
-        && let Err(e) = new_agent.set_model(&model)
-    {
-        crate::logging::warn(&format!(
-            "Failed to set headless session model override '{}': {}",
-            model, e
-        ));
+    if let Some(model) = model_override {
+        // Build a model-switch request that preserves the coordinator's auth
+        // route (e.g. claude-api vs claude-oauth, or an openai-compatible
+        // profile) so the spawned headless agent reconstructs the exact
+        // provider/auth the coordinator was using instead of a config default.
+        let model_request = crate::provider::MultiProvider::model_switch_request_for_session_route(
+            &model,
+            provider_key_override.as_deref(),
+            route_api_method_override.as_deref(),
+        );
+        if let Err(e) = new_agent.set_model(&model_request) {
+            crate::logging::warn(&format!(
+                "Failed to set headless session model override '{}' (request '{}'): {}",
+                model, model_request, e
+            ));
+        }
     }
 
     if let Some(ref dir) = working_dir
@@ -117,6 +136,7 @@ pub(super) async fn create_headless_session(
             agent_guard.soft_interrupt_queue(),
         )
         .await;
+        register_background_tool_signal(&client_session_id, agent_guard.background_tool_signal());
     }
 
     let swarm_id = if swarm_enabled {
@@ -156,6 +176,7 @@ pub(super) async fn create_headless_session(
                 joined_at: now,
                 last_status_change: now,
                 is_headless: true,
+                output_tail: None,
             },
         );
     }

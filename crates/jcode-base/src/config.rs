@@ -6,10 +6,12 @@
 pub use jcode_config_types::{
     AgentsConfig, AmbientConfig, AuthConfig, AutoJudgeConfig, AutoReviewConfig, CompactionConfig,
     CompactionMode, CrossProviderFailoverMode, DiagramDisplayMode, DiagramPanePosition,
-    DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, KeybindingsConfig,
-    MarkdownSpacingMode, NamedProviderAuth, NamedProviderConfig, NamedProviderModelConfig,
-    NamedProviderType, NativeScrollbarConfig, ProviderConfig, SafetyConfig,
-    SessionPickerResumeAction, SwarmSpawnMode, UpdateChannel, WebSearchConfig, WebSearchEngine,
+    DiffDisplayMode, DisplayConfig, FeatureConfig, GatewayConfig, HooksConfig, KeybindingsConfig,
+    LaunchHotkeyEntry, LaunchHotkeysConfig, MarkdownSpacingMode, NamedProviderAuth,
+    NamedProviderConfig, NamedProviderModelConfig, NamedProviderType, NativeScrollbarConfig,
+    NotificationsConfig, PowerConfig, ProviderConfig, ReasoningDisplayMode, SafetyConfig,
+    SessionPickerResumeAction, SwarmSpawnMode, TerminalConfig, UpdateChannel, WebSearchConfig,
+    WebSearchEngine,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -26,6 +28,8 @@ const CONFIG_CACHE_CHECK_INTERVAL: Duration = if cfg!(test) {
 
 const CONFIG_ENV_KEYS: &[&str] = &[
     "HOME",
+    "JCODE_ACP_PROFILE",
+    "JCODE_ACP_TOOL_PROFILE",
     "JCODE_AMBIENT_ENABLED",
     "JCODE_AMBIENT_MAX_INTERVAL",
     "JCODE_AMBIENT_MIN_INTERVAL",
@@ -44,7 +48,9 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_BING_MARKET",
     "JCODE_CENTERED_TOGGLE_KEY",
     "JCODE_CHAT_NATIVE_SCROLLBAR",
+    "JCODE_COMPACT_NOTIFICATIONS",
     "JCODE_COPY_BADGE_ALT_LABEL",
+    "JCODE_COPY_SELECTION_TOGGLE_KEY",
     "JCODE_COPILOT_PREMIUM",
     "JCODE_CROSS_PROVIDER_FAILOVER",
     "JCODE_DEBUG_SOCKET",
@@ -54,6 +60,8 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_DICTATION_TIMEOUT_SECS",
     "JCODE_DIFF_LINE_WRAP",
     "JCODE_DIFF_MODE",
+    "JCODE_DIFF_MODE_CYCLE_KEY",
+    "JCODE_DIAGRAM_PANE_TOGGLE_KEY",
     "JCODE_DISABLE_BASE_TOOLS",
     "JCODE_DISABLED_ANIMATIONS",
     "JCODE_DISABLED_TOOLS",
@@ -66,20 +74,45 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_EFFORT_INCREASE_KEY",
     "JCODE_EMAIL_REPLY_ENABLED",
     "JCODE_EMAIL_TO",
+    "JCODE_FOCUS_HOOK",
     "JCODE_GATEWAY_BIND_ADDR",
     "JCODE_GATEWAY_ENABLED",
     "JCODE_GATEWAY_PORT",
     "JCODE_HOME",
+    "JCODE_HOOK_PRE_TOOL",
+    "JCODE_HOOK_PRE_TOOL_TIMEOUT_MS",
+    "JCODE_HOOK_POST_TOOL",
+    "JCODE_HOOK_SESSION_END",
+    "JCODE_HOOK_SESSION_START",
+    "JCODE_HOOK_TURN_END",
     "JCODE_IDLE_ANIMATION",
     "JCODE_IMAP_HOST",
+    "JCODE_INFO_WIDGET_TOGGLE_KEY",
+    "JCODE_JADE_RELAY_API_BASE",
+    "JCODE_JADE_RELAY_ENABLED",
+    "JCODE_JADE_RELAY_LAUNCH_ENABLED",
+    "JCODE_JADE_RELAY_LAUNCH_WORKING_DIR",
+    "JCODE_JADE_RELAY_REPLY_ENABLED",
+    "JCODE_JADE_RELAY_SESSION_ID",
+    "JCODE_JADE_RELAY_TOKEN",
+    "JCODE_JADE_RELAY_TOKEN_ID",
+    "JCODE_JADE_RELAY_USER_ID",
+    "JCODE_KV_CACHE_MISS_NOTICES",
     "JCODE_MARKDOWN_SPACING",
+    "JCODE_MEMORY_EMBEDDING_BACKEND",
+    "JCODE_MEMORY_EMBEDDING_BASE_URL",
+    "JCODE_MEMORY_EMBEDDING_DIM",
+    "JCODE_MEMORY_EMBEDDING_MODEL",
     "JCODE_MEMORY_ENABLED",
+    "JCODE_MEMORY_MODEL",
+    "JCODE_MEMORY_SIDECAR_ENABLED",
     "JCODE_PERSIST_MEMORY_INJECTIONS",
     "JCODE_MESSAGE_TIMESTAMPS",
     "JCODE_MODEL",
     "JCODE_MODEL_SWITCH_KEY",
     "JCODE_MODEL_SWITCH_PREV_KEY",
     "JCODE_MOUSE_CAPTURE",
+    "JCODE_NEW_TERMINAL_KEY",
     "JCODE_NTFY_SERVER",
     "JCODE_NTFY_TOPIC",
     "JCODE_OPENAI_NATIVE_COMPACTION_MODE",
@@ -91,9 +124,11 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_PRESERVE_REASONING_CONTEXT",
     "JCODE_PERFORMANCE",
     "JCODE_PIN_IMAGES",
+    "JCODE_PREVENT_SLEEP_WHILE_STREAMING",
     "JCODE_PROVIDER",
     "JCODE_PROMPT_ENTRY_ANIMATION",
     "JCODE_QUEUE_MODE",
+    "JCODE_REASONING_DISPLAY",
     "JCODE_REDRAW_FPS",
     "JCODE_SAME_PROVIDER_ACCOUNT_FAILOVER",
     "JCODE_SCROLL_BOOKMARK_KEY",
@@ -105,17 +140,24 @@ const CONFIG_ENV_KEYS: &[&str] = &[
     "JCODE_SCROLL_PROMPT_UP_KEY",
     "JCODE_SCROLL_UP_FALLBACK_KEY",
     "JCODE_SCROLL_UP_KEY",
+    "JCODE_SEARXNG_URL",
     "JCODE_SHOW_DIFFS",
     "JCODE_SHOW_THINKING",
+    "JCODE_SIDE_PANEL_TOGGLE_KEY",
     "JCODE_SIDE_PANEL_NATIVE_SCROLLBAR",
     "JCODE_SMTP_PASSWORD",
+    "JCODE_SPAWN_HOOK",
+    "JCODE_STREAM_IDLE_TIMEOUT_SECS",
     "JCODE_SWARM_ENABLED",
+    "JCODE_SWARM_MODEL",
+    "JCODE_SWARM_SPAWN_MODE",
     "JCODE_TELEGRAM_BOT_TOKEN",
     "JCODE_TELEGRAM_CHAT_ID",
     "JCODE_TELEGRAM_REPLY_ENABLED",
     "JCODE_TOOL_PROFILE",
     "JCODE_TOOLS",
     "JCODE_TRUSTED_EXTERNAL_AUTH_SOURCES",
+    "JCODE_TYPING_SCROLL_LOCK_TOGGLE_KEY",
     "JCODE_UPDATE_CHANNEL",
     "JCODE_WEBSEARCH_ENGINE",
     "JCODE_WEBSEARCH_FALLBACK_ENGINES",
@@ -158,8 +200,15 @@ struct ConfigCache {
 
 static CONFIG_CACHE: LazyLock<RwLock<ConfigCache>> = LazyLock::new(|| {
     let fingerprint = ConfigCacheFingerprint::current();
+    let config = leak_config(Config::load());
+    // Seed the global context-limit cache from named provider configs on first
+    // load so every codepath (TUI info widget, compaction budget, model
+    // switching) sees user-configured `context_window` values from the start.
+    // Read from the loaded config directly to avoid recursing into config(),
+    // which would deadlock on the still-initializing CONFIG_CACHE.
+    populate_context_limits_from_config_ref(config);
     RwLock::new(ConfigCache {
-        config: leak_config(Config::load()),
+        config,
         fingerprint,
         last_checked: Instant::now(),
         force_reload: false,
@@ -168,6 +217,29 @@ static CONFIG_CACHE: LazyLock<RwLock<ConfigCache>> = LazyLock::new(|| {
 
 fn leak_config(config: Config) -> &'static Config {
     Box::leak(Box::new(config))
+}
+
+/// Seed the global context-limit cache from a config reference directly.
+///
+/// Used during CONFIG_CACHE initialization (where calling config() would
+/// deadlock) and shares its logic with
+/// `crate::provider::populate_context_limits_from_config`.
+fn populate_context_limits_from_config_ref(cfg: &Config) {
+    let mut limits = std::collections::HashMap::new();
+    for provider_cfg in cfg.providers.values() {
+        for model in &provider_cfg.models {
+            let id = model.id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(limit) = model.context_window {
+                limits.insert(id.to_ascii_lowercase(), limit);
+            }
+        }
+    }
+    if !limits.is_empty() {
+        crate::provider::populate_context_limits(limits);
+    }
 }
 
 /// Get the global config instance.
@@ -217,6 +289,9 @@ pub fn config() -> &'static Config {
     if let Some(reason) = reload_reason {
         crate::logging::info(&format!("CONFIG_RELOAD {}", reason));
         notify_config_reloaded();
+        // Re-seed the global context-limit cache so user edits to named
+        // provider `context_window` values take effect without a restart.
+        crate::provider::populate_context_limits_from_config();
     }
 
     config
@@ -335,7 +410,10 @@ fn notify_config_reloaded() {
 /// subsystems (auth cache, event bus) on reload, those subsystems register a
 /// reaction here at startup. This keeps config free of upward dependencies and
 /// breaks the config -> auth / config -> bus cycle edges.
-static CONFIG_RELOAD_LISTENERS: LazyLock<RwLock<Vec<fn()>>> =
+/// Type of a config reload listener callback.
+type ConfigReloadListener = fn();
+
+static CONFIG_RELOAD_LISTENERS: LazyLock<RwLock<Vec<ConfigReloadListener>>> =
     LazyLock::new(|| RwLock::new(Vec::new()));
 
 /// Register a callback to run after the config cache reloads.
@@ -393,11 +471,20 @@ pub struct Config {
     /// Agent-specific model defaults
     pub agents: AgentsConfig,
 
+    /// Terminal window/pane spawning configuration
+    pub terminal: TerminalConfig,
+
+    /// Lifecycle hooks (external commands at turn/session/tool boundaries)
+    pub hooks: HooksConfig,
+
     /// Ambient mode configuration
     pub ambient: AmbientConfig,
 
     /// Safety / notification configuration
     pub safety: SafetyConfig,
+
+    /// Desktop notifications for interactive sessions (e.g. turn completion)
+    pub notifications: NotificationsConfig,
 
     /// WebSocket gateway configuration (for iOS/web clients)
     pub gateway: GatewayConfig,
@@ -405,11 +492,17 @@ pub struct Config {
     /// Compaction configuration
     pub compaction: CompactionConfig,
 
+    /// Power-management configuration (prevent sleep while streaming)
+    pub power: PowerConfig,
+
     /// Auto-review configuration
     pub autoreview: AutoReviewConfig,
 
     /// Auto-judge configuration
     pub autojudge: AutoJudgeConfig,
+
+    /// Global "launch a new jcode" hotkeys (macOS). Baked once by auto-import.
+    pub launch_hotkeys: LaunchHotkeysConfig,
 }
 
 /// Agent Client Protocol adapter configuration.

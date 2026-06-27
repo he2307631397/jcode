@@ -68,6 +68,25 @@ impl Agent {
         )
     }
 
+    pub fn set_route_selection(
+        &mut self,
+        selection: &crate::provider::RouteSelection,
+    ) -> Result<()> {
+        self.provider.set_route_selection(selection)?;
+        let resolved_model = self.provider.model();
+        self.session.provider_key = Some(selection.runtime_key.stable_id());
+        self.session.route_api_method = Some(selection.api_method.clone());
+        self.session.model = Some(resolved_model.clone());
+        let event = crate::provider::ProviderStateEvent::selected_model(
+            crate::provider::ProviderModelSelectionSource::User,
+            resolved_model,
+        );
+        self.provider_runtime_state.apply(event);
+        self.persist_session_best_effort("route selection");
+        self.log_env_snapshot("set_route_selection");
+        Ok(())
+    }
+
     pub(crate) fn set_model_from_auth(&mut self, model: &str) -> Result<()> {
         self.set_model_from_provider_state_event(
             model,
@@ -139,6 +158,22 @@ impl Agent {
 
     pub fn session_provider_key(&self) -> Option<String> {
         self.session.provider_key.clone()
+    }
+
+    /// API method/runtime route used to select the active model (e.g.
+    /// "openai-api", "claude-oauth", "openai-compatible:nvidia-nim"). Spawned
+    /// swarm agents inherit this so they reconstruct the coordinator's exact
+    /// auth route instead of falling back to the config default.
+    pub fn session_route_api_method(&self) -> Option<String> {
+        self.session.route_api_method.clone()
+    }
+
+    /// The credential the active provider will use for the next request, when
+    /// the provider distinguishes OAuth (subscription) from API key (cost).
+    /// Resolved authoritatively here so remote clients can render billing/usage
+    /// without re-deriving it from the provider name.
+    pub fn active_resolved_credential(&self) -> Option<jcode_provider_core::ResolvedCredential> {
+        self.provider.active_resolved_credential()
     }
 
     pub fn set_session_provider_key(&mut self, provider_key: Option<String>) {

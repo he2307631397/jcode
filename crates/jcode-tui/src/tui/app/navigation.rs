@@ -1,9 +1,6 @@
 use super::*;
 use crate::tui::ui::input_ui;
 use ratatui::layout::Rect;
-use std::time::Duration;
-
-const PINNED_IMAGES_AUTO_HIDE_AFTER: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MouseScrollTraceState {
@@ -74,7 +71,18 @@ fn is_mouse_scroll_kind(kind: MouseEventKind) -> bool {
 
 impl App {
     const MOUSE_SCROLL_INTENT_LINES: i16 = 3;
-    const MOUSE_SCROLL_MAX_QUEUE: i16 = 24;
+    /// Upper bound on lines enqueued per wheel notch after velocity
+    /// acceleration. Kept close to the base intent so the boost is only a subtle
+    /// nudge on fast flicks rather than a large jump.
+    const MOUSE_SCROLL_MAX_INTENT_LINES: i16 = 5;
+    /// Maximum accumulated scroll momentum. Slightly above the original so a fast
+    /// flick still glides a touch, without long runaway momentum.
+    const MOUSE_SCROLL_MAX_QUEUE: i16 = 30;
+    /// How long the overscroll status line stays revealed after the last
+    /// downward overscroll tick before it rebounds away. Long enough that the
+    /// depleting countdown indicator is perceivable and the line reads as a
+    /// temporary, pull-to-reveal panel.
+    const OVERSCROLL_DWELL: std::time::Duration = std::time::Duration::from_millis(1500);
 
     fn log_mouse_scroll_trace(
         &self,
@@ -169,8 +177,22 @@ impl App {
         self.last_visible_diagram_hash = self.current_visible_diagram_hash();
     }
 
+    /// If a left-click landed on an inline image's `expand` badge, cycle that
+    /// image's size and return `true`. Returns `false` (so the click can fall
+    /// through to link/selection handling) when no badge was hit.
+    pub(super) fn try_cycle_image_expand_at(&mut self, column: u16, row: u16) -> bool {
+        let Some(image_id) = super::super::ui::inline_image_expand_target_from_screen(column, row)
+        else {
+            return false;
+        };
+        self.cycle_image_expand(image_id);
+        true
+    }
+
     pub(super) fn try_open_link_at(&mut self, column: u16, row: u16) -> bool {
-        self.try_open_link_at_with(column, row, |url| open::that_detached(url))
+        self.try_open_link_at_with(column, row, |url| {
+            super::helpers::open_path_or_url_detached(url)
+        })
     }
 
     pub(super) fn try_open_link_at_with<F, E>(
@@ -201,7 +223,7 @@ impl App {
                 self.display_messages
                     .len()
                     .saturating_mul(100)
-                    .saturating_add(self.streaming_text.len()),
+                    .saturating_add(self.streaming.streaming_text.len()),
             );
         };
 
@@ -210,7 +232,7 @@ impl App {
         // measuring every message on each scroll input, which is noticeable in
         // very long sessions. The estimate below is only needed while streaming
         // can make LAST_MAX_SCROLL stale between frames.
-        if renderer_max > 0 && !self.is_processing && self.streaming_text.is_empty() {
+        if renderer_max > 0 && !self.is_processing && self.streaming.streaming_text.is_empty() {
             return renderer_max;
         }
 
@@ -265,7 +287,7 @@ impl App {
             lines
         });
 
-        message_lines.saturating_add(wrapped_text_lines(&self.streaming_text, width))
+        message_lines.saturating_add(wrapped_text_lines(&self.streaming.streaming_text, width))
     }
 
     pub(super) fn diagram_available(&self) -> bool {
@@ -481,63 +503,17 @@ impl App {
     }
 
     fn side_pane_has_visual_images_ignoring_user_hidden(&self) -> bool {
-        if !self.pin_images || self.side_panel.focused_page().is_some() || self.diff_mode.is_file()
-        {
-            return false;
-        }
-
-        if self.is_remote {
-            !self.remote_side_pane_images.is_empty()
-        } else {
-            crate::session::has_rendered_images(&self.session)
-        }
+        // Images now render inline in the transcript flow, not in the side
+        // panel, so they no longer drive the side-panel visibility heuristics.
+        false
     }
 
     pub(super) fn update_pinned_images_auto_hide(&mut self) -> bool {
-        if !self.pin_images || self.side_panel.focused_page().is_some() || self.diff_mode.is_file()
-        {
-            self.pinned_images_auto_hide_deadline = None;
-            self.pinned_images_seen_count = 0;
-            return false;
-        }
-
-        let image_count = if self.is_remote {
-            self.remote_side_pane_images.len()
-        } else {
-            crate::session::render_images(&self.session).len()
-        };
-        if image_count == 0 {
-            self.pinned_images_auto_hide_deadline = None;
-            self.pinned_images_seen_count = 0;
-            return false;
-        }
-
-        let now = Instant::now();
-        let mut needs_redraw = false;
-        if image_count > self.pinned_images_seen_count {
-            self.pinned_images_seen_count = image_count;
-            self.side_panel_user_hidden = false;
-            self.pinned_images_auto_hide_deadline = Some(now + PINNED_IMAGES_AUTO_HIDE_AFTER);
-            needs_redraw = true;
-        }
-
-        if let Some(deadline) = self.pinned_images_auto_hide_deadline
-            && now >= deadline
-        {
-            self.pinned_images_auto_hide_deadline = None;
-            if !self.side_panel_user_hidden && self.side_pane_has_visual_images() {
-                self.side_panel_user_hidden = true;
-                self.set_diff_pane_focus(false);
-                self.sync_diagram_fit_context();
-                self.push_display_message(DisplayMessage::system(format!(
-                    "Pinned image side panel hidden automatically. Press {} to show it again.",
-                    crate::tui::keybind::side_panel_toggle_key_label()
-                )));
-                needs_redraw = true;
-            }
-        }
-
-        needs_redraw
+        // Images render inline in the transcript now, so there is no longer a
+        // pinned-image side panel to auto-reveal or auto-hide.
+        self.pinned_images_auto_hide_deadline = None;
+        self.pinned_images_seen_count = 0;
+        false
     }
 
     fn side_pane_line_scroll_amount(&self) -> usize {
@@ -569,8 +545,20 @@ impl App {
             self.mouse_scroll_queue = 0;
         }
 
-        self.last_mouse_scroll = Some(Instant::now());
-        let delta = direction * Self::MOUSE_SCROLL_INTENT_LINES;
+        // Velocity-based acceleration: infer how hard the wheel was flicked from
+        // the gap since the previous wheel event (the terminal does not report a
+        // physical force). Rapid consecutive notches (a fast flick) advance more
+        // lines per notch; deliberate single notches stay at the base intent so
+        // fine positioning is still precise. Shared by the chat viewport and the
+        // /resume preview since both enqueue here.
+        let now = Instant::now();
+        let multiplier = self
+            .last_mouse_scroll
+            .map(|last| Self::scroll_acceleration_multiplier(now.saturating_duration_since(last)))
+            .unwrap_or(1);
+        self.last_mouse_scroll = Some(now);
+        let intent = Self::scroll_intent_lines(multiplier);
+        let delta = direction * intent;
         self.mouse_scroll_queue = self
             .mouse_scroll_queue
             .saturating_add(delta)
@@ -582,6 +570,7 @@ impl App {
                     ("target", format!("{:?}", target)),
                     ("direction", direction.to_string()),
                     ("delta", delta.to_string()),
+                    ("multiplier", multiplier.to_string()),
                     ("before_queue", before_queue.to_string()),
                     ("before_target", format!("{:?}", before_target)),
                     ("after_queue", self.mouse_scroll_queue.to_string()),
@@ -592,7 +581,26 @@ impl App {
         self.drain_mouse_scroll_animation(Self::MOUSE_SCROLL_INTENT_LINES as usize);
     }
 
-    fn mouse_scroll_drain_amount(&self) -> usize {
+    /// Map the gap between consecutive wheel events to an intent multiplier. A
+    /// shorter gap means a faster flick (more "force"), so the wheel covers a
+    /// little more ground. The boost is intentionally subtle: at most a modest
+    /// bump on rapid flicks, with deliberate notches staying at 1x for precise
+    /// positioning.
+    pub(super) fn scroll_acceleration_multiplier(gap: std::time::Duration) -> i16 {
+        let ms = gap.as_millis();
+        if ms <= 30 { 2 } else { 1 }
+    }
+
+    /// Lines enqueued per wheel notch for a given velocity multiplier, capped so
+    /// even the hardest flick stays controllable.
+    pub(super) fn scroll_intent_lines(multiplier: i16) -> i16 {
+        (Self::MOUSE_SCROLL_INTENT_LINES * multiplier).min(Self::MOUSE_SCROLL_MAX_INTENT_LINES)
+    }
+
+    pub(super) fn mouse_scroll_drain_amount(&self) -> usize {
+        // Gentle ease-out: drain a few lines per frame for a fresh flick,
+        // decelerating to one line as the queue empties. Kept close to the
+        // original feel so momentum does not glide far.
         let queued = self.mouse_scroll_queue.unsigned_abs() as usize;
 
         if queued >= 6 {
@@ -669,11 +677,10 @@ impl App {
         match target {
             MouseScrollTarget::Chat => {
                 if direction < 0 {
-                    self.scroll_up(1);
+                    self.scroll_up(1)
                 } else {
-                    self.scroll_down(1);
+                    self.scroll_down(1)
                 }
-                true
             }
             MouseScrollTarget::SidePane => {
                 let current = if self.diff_pane_scroll == usize::MAX {
@@ -721,6 +728,14 @@ impl App {
                     current.saturating_add(1)
                 });
                 true
+            }
+            MouseScrollTarget::SessionPickerPreview => {
+                let Some(picker_cell) = self.session_picker_overlay.as_ref() else {
+                    return false;
+                };
+                picker_cell
+                    .borrow_mut()
+                    .apply_preview_scroll_step(direction)
             }
         }
     }
@@ -808,10 +823,12 @@ impl App {
 
     pub(super) fn adjust_diagram_pane_ratio(&mut self, delta: i8) {
         let next = self.diagram_pane_ratio_target as i16 + delta as i16;
+        self.diagram_pane_ratio_user_adjusted = true;
         self.set_diagram_pane_ratio(next, true, true);
     }
 
     pub(super) fn set_diagram_pane_ratio_immediate(&mut self, next: u8) {
+        self.diagram_pane_ratio_user_adjusted = true;
         self.set_diagram_pane_ratio(next as i16, false, false);
     }
 
@@ -820,9 +837,53 @@ impl App {
         self.set_status_notice(format!("Side panel: {}%", self.diagram_pane_ratio_target));
     }
 
+    /// Toggle whether inline transcript images render expanded or as
+    /// collapsed label stubs. Persisted so the choice survives restarts and
+    /// session resumes.
+    pub(super) fn toggle_inline_images(&mut self) {
+        self.inline_images_visible = !self.inline_images_visible;
+        super::ui_prefs::save_inline_images_visible(self.inline_images_visible);
+        let status = if self.inline_images_visible {
+            "Inline images: ON"
+        } else {
+            "Inline images: hidden (Alt+Shift+I to show)"
+        };
+        self.set_status_notice(status);
+    }
+
+    /// Cycle the per-image inline expand level (Fit -> Large -> Huge -> Fit)
+    /// for `image_id`. Bumps `expanded_images_version` so the body/full-prep
+    /// caches rebuild with the new placeholder geometry. Returns the new level.
+    pub(super) fn cycle_image_expand(
+        &mut self,
+        image_id: u64,
+    ) -> crate::tui::ui::inline_image_ui::ImageExpandLevel {
+        use crate::tui::ui::inline_image_ui::ImageExpandLevel;
+        let current = self
+            .expanded_images
+            .get(&image_id)
+            .copied()
+            .unwrap_or_default();
+        let next = current.next();
+        if matches!(next, ImageExpandLevel::Fit) {
+            self.expanded_images.remove(&image_id);
+        } else {
+            self.expanded_images.insert(image_id, next);
+        }
+        self.expanded_images_version = self.expanded_images_version.wrapping_add(1);
+        let status = match next {
+            ImageExpandLevel::Fit => "Image size: fit",
+            ImageExpandLevel::Large => "Image size: large",
+            ImageExpandLevel::Huge => "Image size: huge",
+        };
+        self.set_status_notice(status);
+        next
+    }
+
     pub(super) fn toggle_side_panel(&mut self) {
         if self.side_panel_user_hidden {
             self.side_panel_user_hidden = false;
+            self.side_panel_explicit_hidden = false;
             self.pinned_images_auto_hide_deadline = None;
             if self.side_panel.pages.is_empty() {
                 if self.side_pane_has_visual_images_ignoring_user_hidden() {
@@ -837,6 +898,7 @@ impl App {
 
         if self.side_pane_has_visual_images() {
             self.side_panel_user_hidden = true;
+            self.side_panel_explicit_hidden = true;
             self.pinned_images_auto_hide_deadline = None;
             self.set_diff_pane_focus(false);
             self.sync_diagram_fit_context();
@@ -853,6 +915,7 @@ impl App {
             self.last_side_panel_focus_id = self.side_panel.focused_page_id.clone();
             self.side_panel.focused_page_id = None;
             self.side_panel_user_hidden = true;
+            self.side_panel_explicit_hidden = true;
             if !self.diff_pane_visible() {
                 self.set_diff_pane_focus(false);
             }
@@ -876,6 +939,7 @@ impl App {
         self.side_panel.focused_page_id = Some(restore_id.clone());
         self.last_side_panel_focus_id = Some(restore_id);
         self.side_panel_user_hidden = false;
+        self.side_panel_explicit_hidden = false;
         self.sync_diagram_fit_context();
         let status = self
             .side_panel
@@ -940,7 +1004,7 @@ impl App {
         let diagram = &diagrams[index];
         if let Some(path) = super::super::mermaid::get_cached_path(diagram.hash) {
             if path.exists() {
-                match open::that_detached(&path) {
+                match super::helpers::open_path_or_url_detached(&path) {
                     Ok(_) => self.set_status_notice(format!(
                         "Opened diagram {}/{} in viewer",
                         index + 1,
@@ -1097,7 +1161,16 @@ impl App {
                     self.enqueue_mouse_scroll(MouseScrollTarget::ChangelogOverlay, 1);
                     finish_mouse_event!(true, "changelog_overlay_scroll_down");
                 }
-                _ => finish_mouse_event!(false, "changelog_overlay_non_scroll"),
+                _ => {
+                    // Let the shared copy-selection machinery handle press/drag/
+                    // release so text in the overlay can be selected and copied,
+                    // just like the chat viewport. Mouse capture otherwise blocks
+                    // native terminal selection here.
+                    if let Some(scroll_only) = self.handle_copy_selection_mouse(mouse) {
+                        finish_mouse_event!(scroll_only, "changelog_overlay_copy_selection");
+                    }
+                    finish_mouse_event!(false, "changelog_overlay_non_scroll");
+                }
             }
         }
 
@@ -1130,7 +1203,31 @@ impl App {
         }
 
         if let Some(ref picker_cell) = self.session_picker_overlay {
-            picker_cell.borrow_mut().handle_overlay_mouse(mouse);
+            // Route wheel events over the preview pane through the shared
+            // scroll-momentum queue so the picker scrolls with the same smooth
+            // easing as the main chat viewport. List-pane wheels step the
+            // (discrete) selection immediately; other mouse events are ignored.
+            let direction = match mouse.kind {
+                MouseEventKind::ScrollUp => Some(-1i16),
+                MouseEventKind::ScrollDown => Some(1i16),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                let (over_preview, over_list) = {
+                    let picker = picker_cell.borrow();
+                    (
+                        picker.mouse_over_preview(mouse.column, mouse.row),
+                        picker.mouse_over_list(mouse.column, mouse.row),
+                    )
+                };
+                if over_preview {
+                    self.enqueue_mouse_scroll(MouseScrollTarget::SessionPickerPreview, direction);
+                    finish_mouse_event!(true, "session_picker_preview_scroll");
+                } else if over_list {
+                    picker_cell.borrow_mut().step_list_selection(direction);
+                    finish_mouse_event!(false, "session_picker_list_step");
+                }
+            }
             finish_mouse_event!(false, "session_picker_overlay");
         }
         if let Some(ref picker_cell) = self.login_picker_overlay {
@@ -1349,6 +1446,12 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
+            && self.try_cycle_image_expand_at(mouse.column, mouse.row)
+        {
+            finish_mouse_event!(false, "cycle_image_expand");
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left))
             && self.try_open_link_at(mouse.column, mouse.row)
         {
             finish_mouse_event!(false, "open_link");
@@ -1369,7 +1472,35 @@ impl App {
         }
     }
 
-    pub(super) fn scroll_up(&mut self, amount: usize) {
+    /// Scroll the chat transcript up by `amount` lines.
+    ///
+    /// Returns `true` if the stored scroll position actually changed. Callers
+    /// (e.g. the mouse-wheel queue) rely on this to avoid accumulating
+    /// "phantom" scroll once the viewport is already pinned to the top.
+    pub(super) fn scroll_up(&mut self, amount: usize) -> bool {
+        // Scrolling up cancels any pending overscroll rebound line immediately.
+        self.chat_overscroll_last = None;
+        // While older compacted history is still settling on screen, the renderer
+        // is anchored to a distance-from-bottom rather than `scroll_offset`. Keep
+        // scrolling continuous by moving the anchor itself instead of a stale
+        // offset the renderer is currently ignoring.
+        if let Some(mut anchor) = self.pending_history_anchor {
+            let total = super::super::ui::last_total_wrapped_lines();
+            anchor.lines_from_bottom = anchor
+                .lines_from_bottom
+                .saturating_add(amount)
+                .min(total.max(anchor.lines_from_bottom));
+            self.pending_history_anchor = Some(anchor);
+            self.auto_scroll_paused = true;
+            self.maybe_queue_compacted_history_load();
+            // Force a full repaint: ratatui's diff does not re-emit the trailing
+            // cell after a wide grapheme (emoji/CJK) when the symbol is unchanged,
+            // so terminals like kitty/foot leave a stale "ghost" char from the
+            // previous frame. See ratatui issue #2357. A clean redraw avoids it.
+            self.force_full_redraw = true;
+            return true;
+        }
+        let before = (self.scroll_offset, self.auto_scroll_paused);
         let max = self.scroll_max_estimate();
         if !self.auto_scroll_paused {
             let rendered_max = super::super::ui::last_max_scroll();
@@ -1382,7 +1513,18 @@ impl App {
             self.scroll_offset = self.scroll_offset.saturating_sub(amount);
         }
         self.auto_scroll_paused = true;
-        self.maybe_queue_compacted_history_load();
+        // If the upward scroll bottomed out against the top of the currently
+        // loaded content, fold the unsatisfied intent into the prefetch as
+        // overshoot so the newly loaded history scrolls into view smoothly.
+        let overshoot = if self.scroll_offset == 0 { amount } else { 0 };
+        self.maybe_queue_compacted_history_load_with_overshoot(overshoot);
+        let changed = before != (self.scroll_offset, self.auto_scroll_paused);
+        if changed {
+            // See note above (ratatui #2357): force a clean repaint on scroll so
+            // wide-grapheme trailing cells cannot leave a ghost character.
+            self.force_full_redraw = true;
+        }
+        changed
     }
 
     pub(super) fn pause_chat_auto_scroll(&mut self) {
@@ -1396,28 +1538,109 @@ impl App {
         self.auto_scroll_paused = true;
     }
 
-    pub(super) fn scroll_down(&mut self, amount: usize) {
-        if !self.auto_scroll_paused {
-            return;
+    /// Scroll the chat transcript down by `amount` lines.
+    ///
+    /// Returns `true` if the stored scroll position actually changed. When the
+    /// view is already following the bottom this is a no-op and returns
+    /// `false`, so the mouse-wheel queue does not accumulate phantom scroll
+    /// that would later have to be undone before scrolling up moves the view.
+    pub(super) fn scroll_down(&mut self, amount: usize) -> bool {
+        // Mirror `scroll_up`: while an older-history prepend is still settling,
+        // the renderer is anchored to distance-from-bottom, so move the anchor
+        // toward the bottom instead of a stale `scroll_offset`.
+        if let Some(mut anchor) = self.pending_history_anchor {
+            if anchor.lines_from_bottom == 0 {
+                self.register_chat_overscroll();
+                return false;
+            }
+            anchor.lines_from_bottom = anchor.lines_from_bottom.saturating_sub(amount);
+            self.pending_history_anchor = Some(anchor);
+            // ratatui #2357: clean repaint on scroll to avoid wide-grapheme ghosts.
+            self.force_full_redraw = true;
+            return true;
         }
+        if !self.auto_scroll_paused {
+            // Already pinned to the bottom: a further downward scroll is an
+            // "overscroll". Reveal the elastic status line and keep it dwelling.
+            self.register_chat_overscroll();
+            return false;
+        }
+        let before = self.scroll_offset;
         let max = self.scroll_max_estimate();
         let rendered_max = super::super::ui::last_max_scroll();
+        // The renderer's exact extent is the authoritative ceiling. Only fall
+        // back to the (possibly inflated) estimate while streaming can leave
+        // `rendered_max` stale at 0 even though there is content to scroll.
         let bottom_threshold = if rendered_max > 0 {
             rendered_max.min(max)
-        } else {
+        } else if self.is_processing || !self.streaming.streaming_text.is_empty() {
             max
+        } else {
+            // Not streaming and nothing to scroll: we are already at the bottom.
+            0
         };
         self.scroll_offset = self.scroll_offset.saturating_add(amount);
-        if self.scroll_offset >= bottom_threshold {
+        let changed = if self.scroll_offset >= bottom_threshold {
             self.follow_chat_bottom();
+            true
         } else {
-            self.scroll_offset = self.scroll_offset.min(max);
+            // Never let the stored offset grow past the largest offset that
+            // still moves the rendered viewport. Otherwise scrolling down at
+            // (or near) the bottom silently accumulates "phantom" offset that
+            // later has to be undone before scrolling up moves the view again.
+            self.scroll_offset = self.scroll_offset.min(bottom_threshold);
+            self.scroll_offset != before
+        };
+        if changed {
+            // ratatui #2357: clean repaint on scroll to avoid wide-grapheme ghosts.
+            self.force_full_redraw = true;
         }
+        changed
     }
 
     pub(super) fn follow_chat_bottom(&mut self) {
+        self.pending_history_anchor = None;
         self.scroll_offset = 0;
         self.auto_scroll_paused = false;
+    }
+
+    /// Record an overscroll tick (downward scroll while already pinned to the
+    /// bottom). Reveals the elastic status line below the input and (re)starts
+    /// the dwell window after which it rebounds away.
+    pub(super) fn register_chat_overscroll(&mut self) {
+        self.chat_overscroll_last = Some(Instant::now());
+    }
+
+    /// Whether the overscroll status line is currently revealed.
+    pub(super) fn chat_overscroll_active(&self) -> bool {
+        self.chat_overscroll_last
+            .map(|t| t.elapsed() < Self::OVERSCROLL_DWELL)
+            .unwrap_or(false)
+    }
+
+    /// Seconds remaining in the overscroll dwell window before the line
+    /// rebounds away. Returns `None` when the overscroll line is not currently
+    /// shown. Drives the visible `(overscroll x.x)` countdown so users can see
+    /// the line is temporary.
+    pub(super) fn chat_overscroll_remaining(&self) -> Option<f32> {
+        let last = self.chat_overscroll_last?;
+        let elapsed = last.elapsed();
+        if elapsed >= Self::OVERSCROLL_DWELL {
+            return None;
+        }
+        Some(Self::OVERSCROLL_DWELL.saturating_sub(elapsed).as_secs_f32())
+    }
+
+    /// Drive the overscroll dwell timer. Returns `true` when the revealed state
+    /// changed (so the caller can request a redraw). Called every tick.
+    pub(super) fn update_chat_overscroll(&mut self) -> bool {
+        if let Some(t) = self.chat_overscroll_last
+            && t.elapsed() >= Self::OVERSCROLL_DWELL
+        {
+            self.chat_overscroll_last = None;
+            return true;
+        }
+        false
     }
 
     pub(super) fn debug_scroll_up(&mut self, amount: usize) {

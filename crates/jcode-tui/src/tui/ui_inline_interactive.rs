@@ -161,8 +161,18 @@ fn selected_route_notice_text(
 }
 
 fn model_picker_keybind_hint(picker: &crate::tui::InlineInteractiveState) -> Option<&'static str> {
-    if picker.kind == crate::tui::PickerKind::Model && !picker.preview {
-        Some(" keys: Ctrl+D default · Ctrl+F favorite · Shift+Tab next favorite")
+    // The favorite/default hotkeys now work in both the focused picker and the
+    // as-you-type preview, so the hint is shown whenever this is a runtime model
+    // picker (i.e. it has selectable model rows).
+    let is_runtime_model_picker = picker.kind == crate::tui::PickerKind::Model
+        && picker
+            .entries
+            .iter()
+            .any(|entry| matches!(entry.action, crate::tui::PickerAction::Model));
+    if is_runtime_model_picker {
+        Some(
+            " keys: Ctrl+B set default · Ctrl+F toggle favorite · Shift+Tab switch active model to next favorite",
+        )
     } else {
         None
     }
@@ -533,7 +543,7 @@ pub(super) fn draw_inline_interactive(frame: &mut Frame, app: &dyn TuiState, are
         ));
         if picker.shows_default_shortcut_hint() {
             header_spans.push(Span::styled(
-                "  Ctrl-D=set default",
+                "  Ctrl-B=set default",
                 Style::default().fg(rgb(60, 60, 80)).italic(),
             ));
         }
@@ -1138,8 +1148,8 @@ mod tests {
         let hint =
             model_picker_keybind_hint(&picker).expect("active model picker should show hint");
 
-        assert!(hint.contains("Ctrl+D default"));
-        assert!(hint.contains("Ctrl+F favorite"));
+        assert!(hint.contains("Ctrl+B set default"));
+        assert!(hint.contains("Ctrl+F toggle favorite"));
     }
 
     #[test]

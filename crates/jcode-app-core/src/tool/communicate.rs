@@ -593,7 +593,7 @@ impl Tool for CommunicateTool {
     }
 
     fn description(&self) -> &str {
-        "Coordinate agents. For spawn, prefer providing a prompt so the new agent starts with a concrete task instead of idling. Spawned/assigned agents automatically report their final response back to the owning coordinator."
+        "Coordinate agents. Any agent can spawn child agents, and those children can spawn their own, forming a recursive spawn tree capped at depth 5. For spawn, prefer providing a prompt so the new agent starts with a concrete task instead of idling. Spawned/assigned agents automatically report their final response back to the agent that spawned them; you can stop any agent in the subtree you spawned."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -619,7 +619,7 @@ impl Tool for CommunicateTool {
                 },
                 "message": {
                     "type": "string",
-                    "description": "Message body. For action=report, this is the completion report body."
+                    "description": "Message body. For action=message, routes by fields provided: with to_session it is a DM, with channel it posts to that channel, with neither it broadcasts to the whole swarm. For action=broadcast it always goes to the whole swarm. For action=report, this is the completion report body."
                 },
                 "status": {
                     "type": "string",
@@ -637,7 +637,10 @@ impl Tool for CommunicateTool {
                     "type": "string",
                     "description": "Target session for actions that address one agent (dm, and as an alias for target_session). Accepts an exact session ID or a unique friendly name within the swarm. Interchangeable with target_session. If a friendly name is ambiguous, run swarm list and use the exact session ID."
                 },
-                "channel": { "type": "string" },
+                "channel": {
+                    "type": "string",
+                    "description": "Channel name. For action=channel (or action=message with a channel) the message goes to subscribers of this channel. Also used by subscribe_channel/unsubscribe_channel/channel_members."
+                },
                 "proposer_session": { "type": "string" },
                 "reason": { "type": "string" },
                 "target_session": {
@@ -679,8 +682,8 @@ impl Tool for CommunicateTool {
                 },
                 "spawn_mode": {
                     "type": "string",
-                    "enum": ["visible", "headless", "auto"],
-                    "description": "Per-call spawn mode for swarm-created agents. Overrides agents.swarm_spawn_mode config when set. Defaults to visible/headed behavior."
+                    "enum": ["visible", "headless", "inline", "auto"],
+                    "description": "Per-call spawn mode for swarm-created agents. Overrides agents.swarm_spawn_mode config when set. 'visible' opens a terminal window, 'headless' runs in-process with no UI, 'inline' runs in-process and renders a live gallery viewport in the coordinator, 'auto' tries visible then falls back to headless. Defaults to visible/headed behavior."
                 },
                 "session_ids": {
                     "type": "array",
@@ -803,10 +806,54 @@ impl Tool for CommunicateTool {
                 }
             }
 
-            "message" | "broadcast" => {
+            "message" => {
+                // `message` is the general-purpose send: it routes by the fields
+                // provided. With `to_session` it acts as a DM, with `channel` it
+                // posts to that channel, and with neither it broadcasts to the
+                // whole swarm. `broadcast` is the explicit group-only send.
                 let message = params
                     .message
                     .ok_or_else(|| anyhow::anyhow!("'message' is required for message action"))?;
+                let to_session = params.to_session.clone();
+                let channel = params.channel.clone();
+
+                let request = Request::CommMessage {
+                    id: REQUEST_ID,
+                    from_session: ctx.session_id.clone(),
+                    message: message.clone(),
+                    to_session: to_session.clone(),
+                    channel: channel.clone(),
+                    wake: params.wake,
+                    delivery: params.delivery,
+                };
+
+                match send_request(request).await {
+                    Ok(response) => {
+                        ensure_success(&response)?;
+                        let confirmation = match (to_session, channel) {
+                            (Some(target), _) => {
+                                format!("Direct message sent to {}: {}", target, message)
+                            }
+                            (None, Some(channel)) => {
+                                format!("Channel message sent to #{}: {}", channel, message)
+                            }
+                            (None, None) => {
+                                format!("Broadcast sent to all agents: {}", message)
+                            }
+                        };
+                        Ok(ToolOutput::new(confirmation))
+                    }
+                    Err(e) => Err(anyhow::anyhow!("Failed to send message: {}", e)),
+                }
+            }
+
+            "broadcast" => {
+                // `broadcast` always targets the whole swarm. Any `to_session`/
+                // `channel` is intentionally ignored so the action stays an
+                // unambiguous group send; use `message`/`dm`/`channel` to target.
+                let message = params
+                    .message
+                    .ok_or_else(|| anyhow::anyhow!("'message' is required for broadcast action"))?;
 
                 let request = Request::CommMessage {
                     id: REQUEST_ID,
@@ -815,18 +862,18 @@ impl Tool for CommunicateTool {
                     to_session: None,
                     channel: None,
                     wake: params.wake,
-                    delivery: None,
+                    delivery: params.delivery,
                 };
 
                 match send_request(request).await {
                     Ok(response) => {
                         ensure_success(&response)?;
                         Ok(ToolOutput::new(format!(
-                            "Message sent to other agents: {}",
+                            "Broadcast sent to all agents: {}",
                             message
                         )))
                     }
-                    Err(e) => Err(anyhow::anyhow!("Failed to send message: {}", e)),
+                    Err(e) => Err(anyhow::anyhow!("Failed to broadcast message: {}", e)),
                 }
             }
 

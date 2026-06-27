@@ -3,6 +3,44 @@ use jcode_message_types::{ContentBlock, Message, Role, ToolCall};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// Identifies a session to resume, across the agent backends jcode can import
+/// from. This is pure data (only ids/paths) with no UI dependency; it lives in
+/// `jcode-session-types` so the foundation/import layer can match on it without
+/// depending on any `jcode-tui-*` crate. The session-picker UI re-exports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResumeTarget {
+    JcodeSession {
+        session_id: String,
+    },
+    ClaudeCodeSession {
+        session_id: String,
+        session_path: String,
+    },
+    CodexSession {
+        session_id: String,
+        session_path: String,
+    },
+    PiSession {
+        session_path: String,
+    },
+    OpenCodeSession {
+        session_id: String,
+        session_path: String,
+    },
+}
+
+impl ResumeTarget {
+    pub fn stable_id(&self) -> &str {
+        match self {
+            Self::JcodeSession { session_id } => session_id,
+            Self::ClaudeCodeSession { session_id, .. } => session_id,
+            Self::CodexSession { session_id, .. } => session_id,
+            Self::PiSession { session_path } => session_path,
+            Self::OpenCodeSession { session_id, .. } => session_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderedMessage {
     pub role: String,
@@ -35,12 +73,31 @@ pub enum RenderedImageSource {
     Other { role: String },
 }
 
+/// Where an image belongs in the transcript flow. Used by UIs to render the
+/// image inline at the message that produced it instead of appending it at the
+/// bottom of the transcript.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RenderedImageAnchor {
+    /// The image came from the tool result for this tool call id.
+    ToolCall { id: String },
+    /// The image was attached to the nth (0-based) user prompt in the rendered
+    /// transcript.
+    UserPrompt { ordinal: usize },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RenderedImage {
     pub media_type: String,
     pub data: String,
     pub label: Option<String>,
     pub source: RenderedImageSource,
+    /// Transcript anchor identifying the message this image belongs to, so the
+    /// UI can render it inline at that spot. `None` when the producer cannot
+    /// anchor it (e.g. older servers); unanchored images fall back to the
+    /// bottom of the transcript.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<RenderedImageAnchor>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

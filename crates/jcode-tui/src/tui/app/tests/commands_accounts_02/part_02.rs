@@ -127,6 +127,7 @@ fn test_refactor_status_summarizes_current_todos() {
             &app.session.id,
             &[
                 crate::todo::TodoItem {
+                    group: None,
                     id: "one".to_string(),
                     content: "Split giant module".to_string(),
                     status: "in_progress".to_string(),
@@ -137,6 +138,7 @@ fn test_refactor_status_summarizes_current_todos() {
                     completion_confidence: None,
                 },
                 crate::todo::TodoItem {
+                    group: None,
                     id: "two".to_string(),
                     content: "Run review subagent".to_string(),
                     status: "completed".to_string(),
@@ -177,6 +179,7 @@ fn test_refactor_resume_uses_saved_mode_and_current_todos() {
         crate::todo::save_todos(
             &app.session.id,
             &[crate::todo::TodoItem {
+                group: None,
                 id: "resume1".to_string(),
                 content: "Extract review prompt builder".to_string(),
                 status: "in_progress".to_string(),
@@ -233,4 +236,32 @@ fn test_fix_resets_provider_session() {
     assert_eq!(msg.role, "system");
     assert!(msg.content.contains("Fix Results"));
     assert!(msg.content.contains("Reset provider session resume state"));
+}
+
+#[test]
+fn test_turn_error_restores_prompt_to_input() {
+    let mut app = create_test_app();
+    // Simulate a submitted prompt that started a turn.
+    app.last_submitted_input = Some("explain this bug".to_string());
+    app.input.clear();
+
+    app.handle_turn_error("Token refresh needed");
+
+    // The typed prompt should be restored to the input box so it is not lost.
+    assert_eq!(app.input, "explain this bug");
+    // And the saved copy is consumed once restored.
+    assert!(app.last_submitted_input.is_none());
+}
+
+#[test]
+fn test_turn_error_does_not_clobber_new_input() {
+    let mut app = create_test_app();
+    app.last_submitted_input = Some("old prompt".to_string());
+    // User already started typing a new prompt.
+    app.input = "new prompt".to_string();
+
+    app.handle_turn_error("Token refresh needed");
+
+    // We must not overwrite text the user already started.
+    assert_eq!(app.input, "new prompt");
 }

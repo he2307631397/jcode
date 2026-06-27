@@ -31,7 +31,18 @@ pub(super) async fn openai_access_token(
         return Ok(access_token);
     }
 
-    let refreshed = oauth::refresh_openai_tokens(&refresh_token).await?;
+    force_refresh_openai_token(credentials, &refresh_token).await
+}
+
+/// Unconditionally refresh the OpenAI access token using the stored refresh
+/// token, persisting the rotated credentials in place. Used when the server
+/// rejects the current access token (401/403) even though it had not yet hit
+/// its local expiry window.
+pub(super) async fn force_refresh_openai_token(
+    credentials: &Arc<RwLock<CodexCredentials>>,
+    refresh_token: &str,
+) -> anyhow::Result<String> {
+    let refreshed = oauth::refresh_openai_tokens(refresh_token).await?;
     let mut tokens = credentials.write().await;
     let account_id = tokens.account_id.clone();
     let id_token = refreshed
@@ -169,11 +180,39 @@ pub(super) async fn stream_response(
 
         // Check if we need to refresh token
         if should_refresh_token(status, &body) {
-            // Token refresh needed - this is a retryable error
-            return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
-                "Token refresh needed: {}",
-                body
-            )));
+            // The server rejected our access token (401/403). Proactively
+            // refresh it in place so the retry loop reconnects with a fresh
+            // token instead of surfacing a raw "Token refresh needed" error.
+            let refresh_token = {
+                let creds = credentials.read().await;
+                creds.refresh_token.clone()
+            };
+
+            if refresh_token.is_empty() {
+                return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
+                    "OpenAI rejected the access token and no refresh token is available; run /login to re-authenticate: {}",
+                    body
+                )));
+            }
+
+            match force_refresh_openai_token(&credentials, &refresh_token).await {
+                Ok(_) => {
+                    crate::logging::info(
+                        "OpenAI access token rejected; refreshed credentials and will retry",
+                    );
+                    // Surface a retryable error so the retry loop reconnects
+                    // with the freshly refreshed token.
+                    return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
+                        "openai token refreshed, retrying: {}",
+                        body
+                    )));
+                }
+                Err(refresh_err) => {
+                    return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
+                        "OpenAI token refresh failed; run /login to re-authenticate: {refresh_err:#}"
+                    )));
+                }
+            }
         }
 
         // For rate limits, include retry info in the error
@@ -1404,89 +1443,18 @@ fn classify_unavailable_model_error(status: StatusCode, body: &str) -> Option<St
     None
 }
 
-pub(super) fn extract_error_with_retry(
-    response: &Option<Value>,
-    top_level_error: &Option<Value>,
-) -> (String, Option<u64>) {
-    // For "response.failed" events, the error is nested: response.error.message
-    // For "error"/"response.error" events, the error is top-level: error.message
-    let error = response
-        .as_ref()
-        .and_then(|r| r.get("error"))
-        .or(top_level_error.as_ref());
-
-    let error = match error {
-        Some(e) => e,
-        None => {
-            // Last resort: check if response itself has a status_message or message
-            if let Some(resp) = response.as_ref()
-                && let Some(msg) = resp
-                    .get("status_message")
-                    .or_else(|| resp.get("message"))
-                    .and_then(|v| v.as_str())
-            {
-                return (msg.to_string(), None);
-            }
-            return (
-                "OpenAI response stream error (no error details)".to_string(),
-                None,
-            );
-        }
-    };
-
-    let message = error
-        .get("message")
-        .and_then(|v| v.as_str())
-        .unwrap_or("OpenAI response stream error (unknown)")
-        .to_string();
-    let error_type = error.get("type").and_then(|v| v.as_str());
-    let code = error.get("code").and_then(|v| v.as_str());
-
-    let message_lower = message.to_lowercase();
-    let message = match (error_type, code) {
-        (Some(error_type), Some(code))
-            if !message_lower.contains(&error_type.to_lowercase())
-                && !message_lower.contains(&code.to_lowercase()) =>
-        {
-            format!("{} ({}): {}", error_type, code, message)
-        }
-        (Some(error_type), _) if !message_lower.contains(&error_type.to_lowercase()) => {
-            format!("{}: {}", error_type, message)
-        }
-        (_, Some(code)) if !message_lower.contains(&code.to_lowercase()) => {
-            format!("{}: {}", code, message)
-        }
-        _ => message,
-    };
-
-    // Try to extract retry_after from error object or response metadata
-    let retry_after = error
-        .get("retry_after")
-        .and_then(|v| v.as_u64())
-        .or_else(|| {
-            response
-                .as_ref()
-                .and_then(|r| r.get("retry_after"))
-                .and_then(|v| v.as_u64())
-        });
-
-    (message, retry_after)
-}
-
 /// Check if an error is transient and should be retried
 pub(super) fn is_retryable_error(error_str: &str) -> bool {
-    // Network/connection errors
-    error_str.contains("connection reset")
-        || error_str.contains("connection closed")
-        || error_str.contains("connection refused")
-        || error_str.contains("broken pipe")
-        || error_str.contains("timed out")
-        || error_str.contains("timeout")
+    // Shared transport-layer classifier used by every other provider. This
+    // covers transient TLS/network faults (connection reset/closed/refused/
+    // aborted, broken pipe, timeouts, unexpected EOF, error decoding/reading,
+    // TLS BadRecordMac / fatal-alert, TLS handshake EOF, DNS/route failures,
+    // and HTTP/2 stream/protocol faults). Keeping the OpenAI path delegated
+    // here ensures retry behavior is unified across providers (issue #338).
+    crate::provider::is_transient_transport_error(error_str)
+        // OpenAI-specific transport wrapper.
         || error_str.contains("failed to send request to openai api")
-        // Stream/decode errors
-        || error_str.contains("error decoding")
-        || error_str.contains("error reading")
-        || error_str.contains("unexpected eof")
+        // Stream/decode errors specific to the OpenAI streaming runtime.
         || error_str.contains("incomplete message")
         || error_str.contains("stream disconnected before completion")
         || error_str.contains("ended before message completion marker")
@@ -1497,10 +1465,96 @@ pub(super) fn is_retryable_error(error_str: &str) -> bool {
         || error_str.contains("503 service unavailable")
         || error_str.contains("504 gateway timeout")
         || error_str.contains("overloaded")
+        // Rate limiting (429): transient, recovers on retry. Unified with the
+        // other providers (Anthropic/Copilot) which already retry these.
+        || error_str.contains("429 too many requests")
+        || error_str.contains("rate limit")
+        || error_str.contains("rate_limit")
         // API-level server errors
         || error_str.contains("api_error")
         || error_str.contains("server_error")
         || error_str.contains("internal server error")
         || error_str.contains("an error occurred while processing your request")
         || error_str.contains("please include the request id")
+        // Auth: we just force-refreshed the OpenAI token in place and want the
+        // retry loop to reconnect with the fresh credentials.
+        || error_str.contains("openai token refreshed, retrying")
+}
+
+#[cfg(test)]
+mod stream_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn unauthorized_triggers_token_refresh() {
+        assert!(should_refresh_token(StatusCode::UNAUTHORIZED, ""));
+    }
+
+    #[test]
+    fn forbidden_triggers_refresh_only_for_token_bodies() {
+        assert!(should_refresh_token(
+            StatusCode::FORBIDDEN,
+            "access token expired"
+        ));
+        assert!(!should_refresh_token(
+            StatusCode::FORBIDDEN,
+            "region not allowed"
+        ));
+    }
+
+    #[test]
+    fn refreshed_token_marker_is_retryable() {
+        // After a 401/403 we force-refresh the OpenAI token and surface this
+        // marker so the retry loop reconnects with the new credentials.
+        assert!(is_retryable_error(
+            "openai token refreshed, retrying: 401 unauthorized"
+        ));
+    }
+
+    #[test]
+    fn missing_or_failed_refresh_is_not_retryable() {
+        assert!(!is_retryable_error(
+            "openai rejected the access token and no refresh token is available; run /login to re-authenticate: 401"
+        ));
+        assert!(!is_retryable_error(
+            "openai token refresh failed; run /login to re-authenticate: network error"
+        ));
+    }
+
+    #[test]
+    fn tls_transient_errors_are_retryable() {
+        // Regression for issue #338: transient TLS faults must be retried on
+        // the OpenAI path, matching every other provider. Callers pass the
+        // error string already lowercased.
+        assert!(is_retryable_error(
+            "stream error: io error: received fatal alert: badrecordmac"
+        ));
+        assert!(is_retryable_error("received fatal alert: badrecordmac"));
+        assert!(is_retryable_error("decryption failed or bad record mac"));
+        assert!(is_retryable_error("tls handshake eof"));
+        assert!(is_retryable_error("connection aborted"));
+        assert!(is_retryable_error("temporary failure in name resolution"));
+        assert!(is_retryable_error("no route to host"));
+        assert!(is_retryable_error("network is unreachable"));
+        // A send-level cause that callers now surface via the full anyhow
+        // chain ({:#}) instead of the masked top-level context alone.
+        assert!(is_retryable_error(
+            "failed to send request to openai api: error sending request: received fatal alert: badrecordmac"
+        ));
+    }
+
+    #[test]
+    fn rate_limit_is_retryable() {
+        // Regression for issue #338 (gap #2): 429s should be retried, unifying
+        // behavior with Anthropic/Copilot.
+        assert!(is_retryable_error("429 too many requests"));
+        assert!(is_retryable_error("rate limit exceeded"));
+        assert!(is_retryable_error("rate_limit_exceeded"));
+    }
+
+    #[test]
+    fn auth_errors_remain_non_retryable() {
+        assert!(!is_retryable_error("401 unauthorized"));
+        assert!(!is_retryable_error("invalid api key"));
+    }
 }

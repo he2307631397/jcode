@@ -403,6 +403,7 @@ impl BenchState {
                         "new_string": format!("target line {} updated", idx),
                     }),
                     intent: None,
+                    thought_signature: None,
                 };
                 let tool_output = format!(
                     "{line}- target line {idx}\n{line}+ target line {idx} updated",
@@ -637,6 +638,7 @@ fn stored_message_visible_text(message: &jcode::session::StoredMessage) -> Strin
             }
             ContentBlock::OpenAICompaction { .. }
             | ContentBlock::AnthropicThinking { .. }
+            | ContentBlock::ReasoningTrace { .. }
             | ContentBlock::OpenAIReasoning { .. } => {}
         }
     }
@@ -1065,6 +1067,10 @@ impl TuiState for BenchState {
 
     fn diagram_pane_ratio(&self) -> u8 {
         40
+    }
+
+    fn diagram_pane_ratio_user_adjusted(&self) -> bool {
+        false
     }
 
     fn diagram_pane_animating(&self) -> bool {

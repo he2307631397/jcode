@@ -61,6 +61,10 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/ssh", "Connect to a remote machine using system SSH"),
     RegisteredCommand::public("/git", "Show git status for the session working directory"),
     RegisteredCommand::public("/commit", "Make logical commits from current changes"),
+    RegisteredCommand::public(
+        "/commit-push",
+        "Make logical commits from current changes, then push",
+    ),
     RegisteredCommand::public("/transcript", "Open the current session transcript file"),
     RegisteredCommand::public("/subagent-model", "Show/change subagent model policy"),
     RegisteredCommand::public("/autoreview", "Show/toggle automatic end-of-turn review"),
@@ -71,6 +75,14 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/fast", "Toggle fast mode"),
     RegisteredCommand::public("/transport", "Show/change connection transport"),
     RegisteredCommand::public("/alignment", "Show/change default text alignment"),
+    RegisteredCommand::public(
+        "/compact-notifications",
+        "Show/toggle single-line swarm/file-activity notifications",
+    ),
+    RegisteredCommand::public(
+        "/reasoning",
+        "Show/change reasoning display (off/full/current)",
+    ),
     RegisteredCommand::public("/clear", "Clear conversation history"),
     RegisteredCommand::public("/rewind", "Rewind conversation to previous message"),
     RegisteredCommand::public("/poke", "Poke model to resume with incomplete todos"),
@@ -91,14 +103,27 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/swarm", "Toggle swarm feature"),
     RegisteredCommand::public("/overnight", "Run a supervised overnight coordinator"),
     RegisteredCommand::public("/context", "Show the full session context snapshot"),
+    RegisteredCommand::public(
+        "/skills",
+        "Show loaded skills and jcode-endorsed recommendations",
+    ),
     RegisteredCommand::public("/version", "Show current version"),
     RegisteredCommand::public("/changelog", "Show recent changes in this build"),
     RegisteredCommand::public("/info", "Show session info and tokens"),
     RegisteredCommand::public("/usage", "Show connected provider usage limits"),
+    RegisteredCommand::public(
+        "/productivity",
+        "Generate a shareable usage report + dashboard image",
+    ),
+    RegisteredCommand::public("/wrapped", "Alias for /productivity"),
     RegisteredCommand::public("/feedback", "Send feedback about jcode"),
     RegisteredCommand::public("/subscription", "Show jcode subscription status"),
     RegisteredCommand::public("/config", "Show or edit configuration"),
     RegisteredCommand::public("/log", "Mark the current location in the jcode logs"),
+    RegisteredCommand::public(
+        "/keys",
+        "Show keybinding conflicts with your terminal and OS (/keys refresh to rescan)",
+    ),
     RegisteredCommand::public(
         "/diff",
         "Cycle or set diff display mode (off/inline/full/pinned/file)",
@@ -136,6 +161,11 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/record", "Record a demo capture"),
     RegisteredCommand::remote("/client-reload", "Force reload client binary"),
     RegisteredCommand::remote("/server-reload", "Force reload server binary"),
+    RegisteredCommand::remote(
+        "/continue",
+        "Continue every interrupted live session that would auto-resume",
+    ),
+    RegisteredCommand::remote("/resumeall", "Alias for /continue"),
     RegisteredCommand::hidden("/z", "Secret premium-mode command"),
     RegisteredCommand::hidden("/zz", "Secret premium-mode command"),
     RegisteredCommand::hidden("/zzz", "Secret premium-mode command"),
@@ -214,34 +244,11 @@ impl App {
         self.cursor_pos = self.input.len();
     }
 
-    pub(super) fn fuzzy_score(needle: &str, haystack: &str) -> Option<usize> {
-        if needle.is_empty() {
-            return Some(0);
-        }
-        // Both needle and haystack should start with '/', match from char 1 onward
-        let n = needle.strip_prefix('/').unwrap_or(needle);
-        let h = haystack.strip_prefix('/').unwrap_or(haystack);
-        if n.is_empty() {
-            return Some(0);
-        }
-        // First char of the command (after /) must match
-        if let Some(first_char) = n.chars().next()
-            && !h.starts_with(&n[..first_char.len_utf8()])
-        {
-            return None;
-        }
-        let mut score = 0usize;
-        let mut pos = 0usize;
-        for ch in n.chars() {
-            let idx = h[pos..].find(ch)?;
-            score += idx;
-            pos += idx + ch.len_utf8();
-        }
-        // Penalize large gaps - reject if average gap is too big
-        if n.len() > 1 && score > n.len() * 3 {
-            return None;
-        }
-        Some(score)
+    /// Typo-resistant fuzzy score. Higher is better; `None` means no match.
+    /// Delegates to the shared [`crate::tui::fuzzy`] matcher so slash-command
+    /// ranking and highlight positions stay in sync.
+    pub(super) fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+        crate::tui::fuzzy::fuzzy_score(needle, haystack)
     }
 
     pub(super) fn rank_suggestions(
@@ -250,18 +257,21 @@ impl App {
         candidates: Vec<(String, &'static str)>,
     ) -> Vec<(String, &'static str)> {
         let needle = needle.to_lowercase();
-        let mut scored: Vec<(bool, usize, String, &'static str)> = Vec::new();
+        // Bucket 1 = literal prefix matches (kept ahead of looser fuzzy hits so
+        // exact typing always wins). Bucket 0 = typo-tolerant fuzzy matches,
+        // ordered by descending fuzzy score.
+        let mut scored: Vec<(u8, i32, String, &'static str)> = Vec::new();
         for (cmd, help) in candidates {
             let lower = cmd.to_lowercase();
             if lower.starts_with(&needle) {
-                scored.push((true, 0, cmd, help));
+                scored.push((1, i32::MAX, cmd, help));
             } else if let Some(score) = Self::fuzzy_score(&needle, &lower) {
-                scored.push((false, score, cmd, help));
+                scored.push((0, score, cmd, help));
             }
         }
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| b.1.cmp(&a.1))
                 .then_with(|| a.2.len().cmp(&b.2.len()))
                 .then_with(|| a.2.cmp(&b.2))
         });
@@ -930,6 +940,26 @@ impl App {
             );
         }
 
+        if prefix.starts_with("/compact-notifications ") {
+            return self.rank_suggestions(
+                input,
+                vec![
+                    (
+                        "/compact-notifications status".into(),
+                        "Show whether notifications are compact",
+                    ),
+                    (
+                        "/compact-notifications on".into(),
+                        "Collapse swarm/file-activity notifications to one line",
+                    ),
+                    (
+                        "/compact-notifications off".into(),
+                        "Show full multi-line notification cards",
+                    ),
+                ],
+            );
+        }
+
         if prefix.starts_with("/config ") {
             return self.rank_suggestions(
                 input,
@@ -1131,32 +1161,43 @@ impl App {
         use crate::tui::app::onboarding_flow::OnboardingPhase;
         match self.onboarding_phase() {
             Some(OnboardingPhase::Login { import }) => {
-                let prompt = import.as_ref().and_then(|review| {
-                    review.current().map(|candidate| {
-                        crate::tui::LoginImportPrompt {
+                let prompt = import.as_ref().map(|review| {
+                    let rows = review
+                        .candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, candidate)| crate::tui::LoginImportRow {
                             provider_summary: candidate.provider_summary().to_string(),
                             source_name: candidate.source_name().to_string(),
-                            position: review.position(),
-                            total: review.total(),
-                            yes_highlighted: review.yes_highlighted,
-                            seconds_left: review.seconds_remaining(),
-                        }
-                    })
+                            checked: review.checked.get(i).copied().unwrap_or(false),
+                        })
+                        .collect();
+                    crate::tui::LoginImportPrompt {
+                        rows,
+                        cursor: review.cursor,
+                        continue_focused: review.continue_focused,
+                        checked_count: review.checked_count(),
+                        seconds_left: review.seconds_remaining(),
+                    }
                 });
-                OnboardingWelcomeKind::Login { import: prompt }
-            }
-            Some(OnboardingPhase::TelemetryConsent {
-                yes_highlighted,
-                shown_at,
-            }) => {
-                let total = crate::tui::app::onboarding_flow::DECISION_TIMEOUT.as_secs();
-                let seconds_left = total.saturating_sub(shown_at.elapsed().as_secs());
-                OnboardingWelcomeKind::TelemetryConsent {
-                    yes_highlighted: *yes_highlighted,
-                    seconds_left,
+                OnboardingWelcomeKind::Login {
+                    import: prompt,
+                    importing: self.onboarding_import_in_progress.is_some(),
+                    error: self.onboarding_import_error.clone(),
+                    // Only offer the agent-repair option on the failure screen,
+                    // and only when we can name an agent the user recently used.
+                    repair_agent_label: self.onboarding_import_error.as_ref().and_then(|_| {
+                        crate::tui::app::onboarding_repair::detect_preferred_repair_agent()
+                            .map(|a| a.label().to_string())
+                    }),
                 }
             }
-            Some(OnboardingPhase::ModelSelect) => OnboardingWelcomeKind::ModelSelect,
+            Some(OnboardingPhase::LoginOpenAi { yes_highlighted }) => {
+                OnboardingWelcomeKind::LoginOpenAi {
+                    yes_highlighted: *yes_highlighted,
+                }
+            }
+            Some(OnboardingPhase::ModelSelect) => OnboardingWelcomeKind::Suggestions,
             Some(OnboardingPhase::ContinuePrompt {
                 cli,
                 yes_highlighted,
@@ -1175,16 +1216,15 @@ impl App {
     }
 
     /// Whether the guided onboarding flow is in a phase that should take over
-    /// the welcome screen body (model select or continue prompt). The
-    /// transcript-pick phase uses the session-picker overlay instead, and the
-    /// suggestions phase is the default welcome body.
+    /// the welcome screen body (login, OpenAI-login prompt, or continue prompt).
+    /// The transcript-pick phase uses the session-picker overlay instead, and
+    /// the suggestions phase is the default welcome body.
     fn onboarding_flow_drives_welcome(&self) -> bool {
         use crate::tui::app::onboarding_flow::OnboardingPhase;
         matches!(
             self.onboarding_phase(),
             Some(OnboardingPhase::Login { .. })
-                | Some(OnboardingPhase::TelemetryConsent { .. })
-                | Some(OnboardingPhase::ModelSelect)
+                | Some(OnboardingPhase::LoginOpenAi { .. })
                 | Some(OnboardingPhase::ContinuePrompt { .. })
         )
     }
@@ -1214,16 +1254,7 @@ impl App {
         let is_new_user = if preview_mode {
             true
         } else {
-            crate::storage::jcode_dir()
-                .ok()
-                .and_then(|dir| {
-                    let path = dir.join("setup_hints.json");
-                    std::fs::read_to_string(&path).ok()
-                })
-                .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-                .and_then(|v| v.get("launch_count")?.as_u64())
-                .map(|count| count <= 5)
-                .unwrap_or(true)
+            Self::is_new_user_install()
         };
 
         if !is_new_user {
@@ -1242,7 +1273,7 @@ impl App {
         ];
 
         prompts.push((
-            "Continue my last CLI agent session".to_string(),
+            "Continue my last Codex CLI / Claude Code session".to_string(),
             latest_external_cli_continuation_prompt().unwrap_or_else(|| {
                 "Find my recent Codex or Claude Code sessions, identify the latest useful one, summarize what was happening, and continue from there.".to_string()
             }),
@@ -1397,6 +1428,8 @@ impl App {
                 | "/compact"
                 | "/compact mode"
                 | "/alignment"
+                | "/compact-notifications"
+                | "/reasoning"
                 | "/config"
                 | "/save"
                 | "/rename"
@@ -1415,7 +1448,45 @@ struct ExternalCliSuggestionCandidate {
     context: Option<String>,
 }
 
+/// How long a scan of the external-CLI session directories is reused before we
+/// re-scan. The onboarding welcome screen animates a donut, so it redraws at
+/// animation FPS and calls [`latest_external_cli_continuation_prompt`] multiple
+/// times per frame. Scanning `~/.codex/sessions` / `~/.claude/projects` (reading
+/// and JSON-parsing the newest transcripts) can cost hundreds of milliseconds
+/// for users with large histories, which would otherwise make first-run
+/// onboarding extremely laggy. A short TTL keeps the suggestion fresh while
+/// reducing the cost to a single scan per window.
+const EXTERNAL_CLI_PROMPT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cached result of the external-CLI continuation-prompt scan, with the time it
+/// was computed. `None` value means "scanned, but nothing found".
+type ExternalCliPromptCache = std::sync::RwLock<Option<(Option<String>, std::time::Instant)>>;
+static EXTERNAL_CLI_PROMPT_CACHE: std::sync::LazyLock<ExternalCliPromptCache> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
+/// Cached front-end for [`latest_external_cli_continuation_prompt_uncached`].
+///
+/// See [`EXTERNAL_CLI_PROMPT_CACHE_TTL`] for why this is cached: the uncached
+/// scan reads and parses the newest external transcripts, which is expensive for
+/// large histories and would otherwise run several times per onboarding frame.
 fn latest_external_cli_continuation_prompt() -> Option<String> {
+    if let Ok(cache) = EXTERNAL_CLI_PROMPT_CACHE.read()
+        && let Some((ref value, ref when)) = *cache
+        && when.elapsed() < EXTERNAL_CLI_PROMPT_CACHE_TTL
+    {
+        return value.clone();
+    }
+
+    let value = latest_external_cli_continuation_prompt_uncached();
+
+    if let Ok(mut cache) = EXTERNAL_CLI_PROMPT_CACHE.write() {
+        *cache = Some((value.clone(), std::time::Instant::now()));
+    }
+
+    value
+}
+
+fn latest_external_cli_continuation_prompt_uncached() -> Option<String> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     let mut candidates = Vec::new();
     candidates.extend(latest_jsonl_suggestion_candidates(
@@ -1634,6 +1705,40 @@ fn compact_suggestion_text(text: &str, max_chars: usize) -> String {
 mod external_cli_suggestion_tests {
     use super::*;
     use std::io::Write;
+
+    /// Faithful, real-home measurement of the per-frame onboarding cost.
+    /// Ignored by default (depends on local ~/.codex and ~/.claude contents).
+    /// Run with:
+    ///   cargo test -p jcode-tui --lib onboarding_suggestion_scan_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn onboarding_suggestion_scan_cost() {
+        use std::time::Instant;
+
+        // Cold: the uncached scan that reads + JSON-parses the newest external
+        // transcripts. This is the work that used to run several times per frame.
+        let cold_start = Instant::now();
+        let cold = latest_external_cli_continuation_prompt_uncached();
+        let cold_ms = cold_start.elapsed().as_secs_f64() * 1000.0;
+
+        // Warm: the cached front-end the onboarding screen actually calls. Prime
+        // the cache once, then measure repeated calls (as a redrawing frame does).
+        let _ = latest_external_cli_continuation_prompt();
+        let runs = 1000;
+        let warm_start = Instant::now();
+        let mut warm = None;
+        for _ in 0..runs {
+            warm = latest_external_cli_continuation_prompt();
+        }
+        let warm_ms = warm_start.elapsed().as_secs_f64() * 1000.0 / runs as f64;
+
+        eprintln!(
+            "external-cli continuation prompt: cold(uncached)={cold_ms:.1} ms, \
+             warm(cached, avg of {runs})={warm_ms:.4} ms; cold_some={}, warm_some={}",
+            cold.is_some(),
+            warm.is_some()
+        );
+    }
 
     #[test]
     fn parses_claude_code_jsonl_with_session_path_and_context() {

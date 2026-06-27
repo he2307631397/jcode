@@ -73,7 +73,7 @@ impl App {
         )
     }
 
-    fn effective_remote_provider_model(&self) -> Option<String> {
+    pub(super) fn effective_remote_provider_model(&self) -> Option<String> {
         Self::sanitize_remote_model_hint(self.remote_provider_model.clone())
             .or_else(|| Self::sanitize_remote_model_hint(self.session.model.clone()))
             .or_else(|| self.configured_remote_model_hint())
@@ -156,48 +156,88 @@ impl App {
         }
     }
 
-    fn widget_auth_method(&self, route: WidgetRouteInfo) -> crate::tui::info_widget::AuthMethod {
+    /// Resolve the active credential (OAuth vs API key) for a dual-auth
+    /// provider (Anthropic / OpenAI). This is the one place billing identity is
+    /// decided for the info widget, regardless of transport:
+    ///
+    /// * Remote sessions use [`App::remote_resolved_credential`], which the
+    ///   server resolved authoritatively from its live credentials.
+    /// * Local sessions prefer the provider's *explicitly pinned* credential
+    ///   ([`Provider::active_explicit_credential`]) so the widget reflects the
+    ///   credential the next request will actually use the instant the user
+    ///   switches OAuth<->API (model picker, `/account`, header toggle). That
+    ///   read is in-memory and cache-free, so it never lingers on a stale
+    ///   [`AuthStatus`] snapshot (cached up to 60s) or a `JCODE_RUNTIME_PROVIDER`
+    ///   pin that drifted out of sync with the provider. When the provider is in
+    ///   auto mode (no explicit pin) it falls back to
+    ///   [`resolve_dual_credential_auth`] -- shared with the header tag and
+    ///   model-switch line -- which is cheap (cached probe, no per-frame I/O).
+    ///
+    /// Returns `None` when neither transport can determine the credential (e.g.
+    /// the server didn't report one, or no credentials are configured locally).
+    fn dual_credential_active(
+        &self,
+        route: WidgetRouteInfo,
+        provider: jcode_provider_core::ActiveProvider,
+    ) -> Option<crate::auth::ActiveCredential> {
         if route.is_remote {
-            return crate::tui::info_widget::AuthMethod::Unknown;
+            return self.remote_resolved_credential.map(Into::into);
+        }
+
+        // Authoritative, cache-free answer from the live provider whenever the
+        // user has explicitly pinned a credential. This reflects exactly what the
+        // next request will use, so an explicit OAuth<->API switch is visible on
+        // the very next frame. For local sessions the requested `provider` always
+        // matches the live active provider (the widget route is derived from
+        // `self.provider.name()`), and remote sessions returned above, so the
+        // pin maps onto the right dual-auth provider. Explicit reads do no disk
+        // I/O, so the common per-frame path stays cheap; auto mode returns `None`
+        // here and falls through to the cached heuristic below.
+        if let Some(resolved) = self.provider.active_explicit_credential() {
+            return Some(resolved.into());
         }
 
         let auth_status = crate::auth::AuthStatus::check_fast();
         let runtime_provider = active_runtime_provider_key();
+        crate::auth::resolve_dual_credential_auth(
+            provider,
+            &auth_status,
+            runtime_provider.as_deref(),
+        )
+        .map(|resolved| resolved.active)
+    }
+
+    fn widget_auth_method(&self, route: WidgetRouteInfo) -> crate::tui::info_widget::AuthMethod {
+        use crate::auth::ActiveCredential;
+        use crate::tui::info_widget::AuthMethod;
 
         match route.provider {
             WidgetProviderKind::Anthropic => {
-                if matches!(
-                    runtime_provider.as_deref(),
-                    Some("claude-api" | "anthropic-api")
-                ) {
-                    crate::tui::info_widget::AuthMethod::AnthropicApiKey
-                } else if matches!(runtime_provider.as_deref(), Some("claude" | "anthropic")) {
-                    crate::tui::info_widget::AuthMethod::AnthropicOAuth
-                } else if auth_status.anthropic.has_oauth {
-                    // Anthropic Auto prefers OAuth (Claude subscription) before
-                    // falling back to a direct API key.
-                    crate::tui::info_widget::AuthMethod::AnthropicOAuth
-                } else if auth_status.anthropic.has_api_key {
-                    crate::tui::info_widget::AuthMethod::AnthropicApiKey
-                } else {
-                    crate::tui::info_widget::AuthMethod::Unknown
+                match self
+                    .dual_credential_active(route, jcode_provider_core::ActiveProvider::Claude)
+                {
+                    Some(ActiveCredential::OAuth) => AuthMethod::AnthropicOAuth,
+                    Some(ActiveCredential::ApiKey) => AuthMethod::AnthropicApiKey,
+                    None => AuthMethod::Unknown,
                 }
             }
             WidgetProviderKind::OpenAI => {
-                if matches!(runtime_provider.as_deref(), Some("openai-api")) {
-                    crate::tui::info_widget::AuthMethod::OpenAIApiKey
-                } else if matches!(runtime_provider.as_deref(), Some("openai")) {
-                    crate::tui::info_widget::AuthMethod::OpenAIOAuth
-                } else if auth_status.openai_has_oauth {
-                    crate::tui::info_widget::AuthMethod::OpenAIOAuth
-                } else if auth_status.openai_has_api_key {
-                    crate::tui::info_widget::AuthMethod::OpenAIApiKey
-                } else {
-                    crate::tui::info_widget::AuthMethod::Unknown
+                match self
+                    .dual_credential_active(route, jcode_provider_core::ActiveProvider::OpenAI)
+                {
+                    Some(ActiveCredential::OAuth) => AuthMethod::OpenAIOAuth,
+                    Some(ActiveCredential::ApiKey) => AuthMethod::OpenAIApiKey,
+                    None => AuthMethod::Unknown,
                 }
             }
+            // Providers below have no OAuth-vs-API-key ambiguity to resolve from
+            // remote credentials; remote sessions render usage via
+            // `widget_usage_info`'s `is_remote` handling, so report Unknown here
+            // and let the local heuristics run only for local sessions.
+            _ if route.is_remote => AuthMethod::Unknown,
             WidgetProviderKind::OpenCode => crate::tui::info_widget::AuthMethod::OpenCodeApiKey,
             WidgetProviderKind::OpenRouter => {
+                let runtime_provider = active_runtime_provider_key();
                 let transport_state =
                     crate::provider::openrouter::OpenRouterTransportState::from_current_env(
                         runtime_provider.as_deref(),
@@ -213,6 +253,7 @@ impl App {
             WidgetProviderKind::CostBasedApiKey => crate::tui::info_widget::AuthMethod::ApiKey,
             WidgetProviderKind::Copilot => crate::tui::info_widget::AuthMethod::CopilotOAuth,
             WidgetProviderKind::Gemini => {
+                let auth_status = crate::auth::AuthStatus::check_fast();
                 if auth_status.gemini == crate::auth::AuthState::Available {
                     crate::tui::info_widget::AuthMethod::GeminiOAuth
                 } else {
@@ -234,6 +275,23 @@ impl App {
             None
         };
 
+        // On a resumed session, `token_accounting.total_*` is reset to 0 and the
+        // prior usage lives in `remote_total_tokens` (restored from history). Add
+        // them so the widget's "in + out" reflects the whole session, mirroring
+        // the `/cache` stats path, rather than only tokens seen since resume.
+        let (display_input_tokens, display_output_tokens) =
+            if let Some((hist_in, hist_out)) = self.remote_total_tokens {
+                (
+                    hist_in.saturating_add(self.token_accounting.total_input_tokens),
+                    hist_out.saturating_add(self.token_accounting.total_output_tokens),
+                )
+            } else {
+                (
+                    self.token_accounting.total_input_tokens,
+                    self.token_accounting.total_output_tokens,
+                )
+            };
+
         let cost_based_usage = || crate::tui::info_widget::UsageInfo {
             provider: crate::tui::info_widget::UsageProvider::CostBased,
             five_hour: 0.0,
@@ -242,11 +300,11 @@ impl App {
             seven_day_resets_at: None,
             spark: None,
             spark_resets_at: None,
-            total_cost: self.total_cost,
-            input_tokens: self.total_input_tokens,
-            output_tokens: self.total_output_tokens,
-            cache_read_tokens: self.streaming_cache_read_tokens,
-            cache_write_tokens: self.streaming_cache_creation_tokens,
+            total_cost: self.cost.total_cost,
+            input_tokens: display_input_tokens,
+            output_tokens: display_output_tokens,
+            cache_read_tokens: self.streaming.streaming_cache_read_tokens,
+            cache_write_tokens: self.streaming.streaming_cache_creation_tokens,
             output_tps,
             available: true,
         };
@@ -261,12 +319,12 @@ impl App {
                 spark: None,
                 spark_resets_at: None,
                 total_cost: 0.0,
-                input_tokens: self.total_input_tokens,
-                output_tokens: self.total_output_tokens,
+                input_tokens: display_input_tokens,
+                output_tokens: display_output_tokens,
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 output_tps,
-                available: self.total_input_tokens > 0 || self.total_output_tokens > 0,
+                available: display_input_tokens > 0 || display_output_tokens > 0,
             }),
             WidgetProviderKind::Anthropic => {
                 if matches!(
@@ -387,12 +445,42 @@ impl crate::tui::TuiState for App {
         }
     }
 
+    fn side_pane_images_signature(&self) -> (usize, u64) {
+        // Recomputing the signature walks (and in local mode re-renders) every
+        // image payload, so cache it per display_messages_version: image sets
+        // only change when the transcript does.
+        let version = self.display_messages_version;
+        if let Some((cached_version, signature)) = self.side_pane_images_signature_cache.get()
+            && cached_version == version
+        {
+            return signature;
+        }
+        use std::hash::{Hash, Hasher};
+        let images = self.side_pane_images();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for image in &images {
+            image.media_type.hash(&mut hasher);
+            image.data.len().hash(&mut hasher);
+            image
+                .data
+                .as_bytes()
+                .iter()
+                .take(64)
+                .for_each(|b| b.hash(&mut hasher));
+            crate::tui::hash_rendered_image_anchor(image.anchor.as_ref(), &mut hasher);
+        }
+        let signature = (images.len(), hasher.finish());
+        self.side_pane_images_signature_cache
+            .set(Some((version, signature)));
+        signature
+    }
+
     fn display_messages_version(&self) -> u64 {
         self.display_messages_version
     }
 
     fn streaming_text(&self) -> &str {
-        &self.streaming_text
+        &self.streaming.streaming_text
     }
 
     fn input(&self) -> &str {
@@ -427,13 +515,30 @@ impl crate::tui::TuiState for App {
         self.auto_scroll_paused
     }
 
+    fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
+        self.pending_history_anchor
+            .map(|anchor| anchor.lines_from_bottom)
+    }
+
+    fn chat_overscroll_active(&self) -> bool {
+        self.chat_overscroll_active()
+    }
+
+    fn chat_overscroll_remaining(&self) -> Option<f32> {
+        self.chat_overscroll_remaining()
+    }
+
+    fn copy_selection_edge_autoscroll_active(&self) -> bool {
+        self.copy_selection_edge_autoscroll.is_some() && self.copy_selection_dragging
+    }
+
     fn provider_name(&self) -> String {
         if self.is_remote {
             self.remote_header_provider_name().unwrap_or_default()
         } else {
-            self.remote_provider_name.clone().unwrap_or_else(|| {
-                crate::provider_catalog::runtime_provider_display_name(self.provider.name())
-            })
+            self.remote_provider_name
+                .clone()
+                .unwrap_or_else(|| self.provider.display_name())
         }
     }
 
@@ -477,13 +582,16 @@ impl crate::tui::TuiState for App {
     }
 
     fn streaming_tokens(&self) -> (u64, u64) {
-        (self.streaming_input_tokens, self.streaming_output_tokens)
+        (
+            self.streaming.streaming_input_tokens,
+            self.streaming.streaming_output_tokens,
+        )
     }
 
     fn streaming_cache_tokens(&self) -> (Option<u64>, Option<u64>) {
         (
-            self.streaming_cache_read_tokens,
-            self.streaming_cache_creation_tokens,
+            self.streaming.streaming_cache_read_tokens,
+            self.streaming.streaming_cache_creation_tokens,
         )
     }
 
@@ -558,6 +666,10 @@ impl crate::tui::TuiState for App {
         }
 
         Some(self.app_started.elapsed())
+    }
+
+    fn client_focused(&self) -> bool {
+        App::client_focused(self)
     }
 
     fn stream_message_ended(&self) -> bool {
@@ -644,6 +756,20 @@ impl crate::tui::TuiState for App {
             }
             crate::registry::find_server_by_socket_sync(&crate::server::socket_path())
                 .map(|info| info.icon)
+        })
+    }
+
+    fn server_display_version(&self) -> Option<String> {
+        if !self.is_remote {
+            return None;
+        }
+        // Prefer the live version reported by the connected server (history
+        // sync); fall back to the registry record so a version is available
+        // even before the first history event arrives.
+        self.remote_server_version.clone().or_else(|| {
+            crate::registry::find_server_by_socket_sync(&crate::server::socket_path())
+                .map(|info| info.version)
+                .filter(|version| !version.trim().is_empty())
         })
     }
 
@@ -856,7 +982,8 @@ impl crate::tui::TuiState for App {
                             tool_result_count += 1;
                             tool_result_chars += content.len();
                         }
-                        ContentBlock::Reasoning { text } => {
+                        ContentBlock::Reasoning { text }
+                        | ContentBlock::ReasoningTrace { text } => {
                             asst_chars += text.len();
                         }
                         ContentBlock::AnthropicThinking {
@@ -990,6 +1117,7 @@ impl crate::tui::TuiState for App {
                     status: item.status.clone(),
                     priority: item.priority.clone(),
                     id: item.id.clone(),
+                    group: None,
                     blocked_by: item.blocked_by.clone(),
                     assigned_to: item.assigned_to.clone(),
                     confidence: None,
@@ -1111,6 +1239,7 @@ impl crate::tui::TuiState for App {
                         is_headless: Some(false),
                         live_attachments: Some(1),
                         status_age_secs: Some(0),
+                        output_tail: None,
                     });
                 }
                 (
@@ -1169,28 +1298,35 @@ impl crate::tui::TuiState for App {
             None
         };
 
-        let cache_hit_info = (self.total_cache_reported_input_tokens > 0).then(|| {
-            crate::tui::info_widget::CacheHitInfo {
-                reported_input_tokens: self.total_cache_reported_input_tokens,
-                read_tokens: self.total_cache_read_tokens,
-                creation_tokens: self.total_cache_creation_tokens,
-                optimal_input_tokens: self.total_cache_optimal_input_tokens,
-                last_reported_input_tokens: self.last_cache_reported_input_tokens,
-                last_read_tokens: self.last_cache_read_tokens,
-                last_optimal_input_tokens: self.last_cache_optimal_input_tokens,
-                miss_attributions: self
-                    .kv_cache_miss_samples
-                    .iter()
-                    .rev()
-                    .map(|sample| crate::tui::info_widget::CacheMissAttribution {
-                        turn_number: sample.turn_number,
-                        call_index: sample.call_index,
-                        missed_tokens: sample.missed_tokens,
-                        reason: sample.reason.label().to_string(),
-                    })
-                    .collect(),
-            }
-        });
+        let cache_hit_info =
+            (self.token_accounting.total_cache_reported_input_tokens > 0).then(|| {
+                crate::tui::info_widget::CacheHitInfo {
+                    reported_input_tokens: self.token_accounting.total_cache_reported_input_tokens,
+                    read_tokens: self.token_accounting.total_cache_read_tokens,
+                    creation_tokens: self.token_accounting.total_cache_creation_tokens,
+                    optimal_input_tokens: self.token_accounting.total_cache_optimal_input_tokens,
+                    last_reported_input_tokens: self
+                        .token_accounting
+                        .last_cache_reported_input_tokens,
+                    last_read_tokens: self.token_accounting.last_cache_read_tokens,
+                    last_creation_tokens: self.token_accounting.last_cache_creation_tokens,
+                    last_optimal_input_tokens: self
+                        .token_accounting
+                        .last_cache_optimal_input_tokens,
+                    miss_attributions: self
+                        .kv_cache
+                        .kv_cache_miss_samples
+                        .iter()
+                        .rev()
+                        .map(|sample| crate::tui::info_widget::CacheMissAttribution {
+                            turn_number: sample.turn_number,
+                            call_index: sample.call_index,
+                            missed_tokens: sample.missed_tokens,
+                            reason: sample.reason.label().to_string(),
+                        })
+                        .collect(),
+                }
+            });
 
         // Get active mermaid diagrams - only for margin mode (pinned mode uses dedicated pane)
         let diagrams = if self.diagram_mode == crate::config::DiagramDisplayMode::Margin {
@@ -1199,13 +1335,14 @@ impl crate::tui::TuiState for App {
             Vec::new()
         };
 
-        let workspace_rows = if crate::tui::workspace_client::is_enabled() {
+        let workspace_rows = if self.workspace_client.is_enabled() {
             let session_id = if self.is_remote {
                 self.remote_session_id.as_deref()
             } else {
                 Some(self.session.id.as_str())
             };
-            crate::tui::workspace_client::visible_rows(5, session_id, self.is_processing)
+            self.workspace_client
+                .visible_rows(5, session_id, self.is_processing)
         } else {
             Vec::new()
         };
@@ -1245,6 +1382,7 @@ impl crate::tui::TuiState for App {
             native_compaction_threshold_tokens,
             session_count,
             session_name,
+            working_dir: self.session.working_dir.clone(),
             client_count,
             memory_info,
             swarm_info,
@@ -1254,9 +1392,9 @@ impl crate::tui::TuiState for App {
             provider_name: if uses_remote_widget_metadata {
                 self.remote_provider_name
                     .clone()
-                    .or_else(|| Some(self.provider.name().to_string()))
+                    .or_else(|| Some(self.provider.display_name()))
             } else {
-                Some(self.provider.name().to_string())
+                Some(self.provider.display_name())
             },
             auth_method,
             upstream_provider: self.upstream_provider.clone(),
@@ -1282,7 +1420,7 @@ impl crate::tui::TuiState for App {
     }
 
     fn workspace_mode_enabled(&self) -> bool {
-        crate::tui::workspace_client::is_enabled()
+        self.workspace_client.is_enabled()
     }
 
     fn workspace_map_rows(&self) -> Vec<crate::tui::workspace_map::VisibleWorkspaceRow> {
@@ -1291,7 +1429,8 @@ impl crate::tui::TuiState for App {
         } else {
             Some(self.session.id.as_str())
         };
-        crate::tui::workspace_client::visible_rows(5, session_id, self.is_processing)
+        self.workspace_client
+            .visible_rows(5, session_id, self.is_processing)
     }
 
     fn workspace_animation_tick(&self) -> u64 {
@@ -1301,7 +1440,7 @@ impl crate::tui::TuiState for App {
     fn render_streaming_markdown(&self, width: usize) -> Vec<ratatui::text::Line<'static>> {
         let mut renderer = self.streaming_md_renderer.borrow_mut();
         renderer.set_width(Some(width));
-        renderer.update(&self.streaming_text)
+        renderer.update(&self.streaming.streaming_text)
     }
 
     fn centered_mode(&self) -> bool {
@@ -1314,6 +1453,28 @@ impl crate::tui::TuiState for App {
 
     fn diagram_mode(&self) -> crate::config::DiagramDisplayMode {
         self.diagram_mode
+    }
+
+    fn inline_swarm_gallery_active(&self) -> bool {
+        if self.debug_force_inline_gallery {
+            return !self.inline_swarm_members().is_empty();
+        }
+        self.swarm_enabled
+            && matches!(
+                crate::config::config().agents.swarm_spawn_mode,
+                crate::config::SwarmSpawnMode::Inline
+            )
+            && !self.inline_swarm_members().is_empty()
+    }
+
+    fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+        if self.debug_force_inline_gallery {
+            return self.remote_swarm_members.clone();
+        }
+        if !self.swarm_enabled {
+            return Vec::new();
+        }
+        self.remote_swarm_members.clone()
     }
 
     fn diagram_focus(&self) -> bool {
@@ -1330,6 +1491,10 @@ impl crate::tui::TuiState for App {
 
     fn diagram_pane_ratio(&self) -> u8 {
         self.animated_diagram_pane_ratio()
+    }
+
+    fn diagram_pane_ratio_user_adjusted(&self) -> bool {
+        self.diagram_pane_ratio_user_adjusted
     }
 
     fn diagram_pane_animating(&self) -> bool {
@@ -1366,6 +1531,22 @@ impl crate::tui::TuiState for App {
     }
     fn pin_images(&self) -> bool {
         self.pin_images && !self.side_panel_user_hidden
+    }
+
+    fn inline_images_visible(&self) -> bool {
+        self.inline_images_visible
+    }
+    fn image_expand_level(
+        &self,
+        image_id: u64,
+    ) -> crate::tui::ui::inline_image_ui::ImageExpandLevel {
+        self.expanded_images
+            .get(&image_id)
+            .copied()
+            .unwrap_or_default()
+    }
+    fn expanded_images_version(&self) -> u64 {
+        self.expanded_images_version
     }
     fn pinned_images_auto_hide_remaining_secs(&self) -> Option<u64> {
         if self.side_panel_user_hidden
@@ -1456,16 +1637,23 @@ impl crate::tui::TuiState for App {
             return None;
         }
 
-        let text = self.current_copy_selection_text().unwrap_or_default();
-        let has_selection = !text.is_empty();
+        // Compute selection metrics without building the full selected string,
+        // which previously re-allocated the entire selection on every render
+        // frame and drag move (O(selection) per frame; a "select all" rebuilt
+        // the whole transcript text repeatedly).
+        let (selected_chars, selected_lines) = self
+            .normalized_copy_selection()
+            .and_then(crate::tui::ui::copy_selection_metrics)
+            .unwrap_or((0, 0));
+        let has_selection = selected_chars > 0;
         Some(crate::tui::CopySelectionStatus {
             pane: self
                 .current_copy_selection_pane()
                 .unwrap_or(crate::tui::CopySelectionPane::Chat),
             has_action: has_selection,
-            selected_chars: text.chars().count(),
+            selected_chars,
             selected_lines: if has_selection {
-                text.lines().count().max(1)
+                selected_lines.max(1)
             } else {
                 0
             },

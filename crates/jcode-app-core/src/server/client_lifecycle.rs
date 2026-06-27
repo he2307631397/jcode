@@ -40,15 +40,16 @@ use super::comm_sync::{
 use super::provider_control::{
     handle_cycle_model, handle_notify_auth_changed, handle_refresh_models,
     handle_set_compaction_mode, handle_set_model, handle_set_premium_mode,
-    handle_set_reasoning_effort, handle_set_service_tier, handle_set_transport,
+    handle_set_reasoning_effort, handle_set_route, handle_set_service_tier, handle_set_transport,
     handle_switch_anthropic_account, handle_switch_openai_account,
     try_available_models_updated_event,
 };
 use super::{
-    AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileAccess, SessionControlHandle,
-    SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember, SwarmMutationRuntime,
-    VersionedPlan, format_structured_completion_report, register_session_interrupt_queue,
-    truncate_detail, update_member_status, update_member_status_with_report,
+    AwaitMembersRuntime, ClientConnectionInfo, ClientDebugState, FileTouchService,
+    SessionControlHandle, SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember,
+    SwarmMutationRuntime, VersionedPlan, format_structured_completion_report,
+    register_session_interrupt_queue, truncate_detail, update_member_status,
+    update_member_status_with_report,
 };
 use crate::agent::Agent;
 use crate::bus::{Bus, BusEvent};
@@ -61,7 +62,6 @@ use anyhow::Result;
 use futures::FutureExt;
 use jcode_agent_runtime::{InterruptSignal, SoftInterruptSource, StreamError};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -315,8 +315,7 @@ pub(super) async fn handle_client(
     shared_context: Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_plans: Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: Arc<RwLock<HashMap<String, String>>>,
-    file_touches: Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: FileTouchService,
     channel_subscriptions: ChannelSubscriptions,
     channel_subscriptions_by_session: ChannelSubscriptions,
     client_debug_state: Arc<RwLock<ClientDebugState>>,
@@ -371,7 +370,7 @@ pub(super) async fn handle_client(
                             shared_context: &shared_context,
                             swarm_plans: &swarm_plans,
                             swarm_coordinators: &swarm_coordinators,
-                            files_touched_by_session: &files_touched_by_session,
+                            file_touch: &file_touch,
                             channel_subscriptions: &channel_subscriptions,
                             channel_subscriptions_by_session: &channel_subscriptions_by_session,
                             client_connections: &client_connections,
@@ -455,6 +454,7 @@ pub(super) async fn handle_client(
                 last_seen: connected_at,
                 is_processing: false,
                 current_tool_name: None,
+                terminal_env: Vec::new(),
                 disconnect_tx: disconnect_tx.clone(),
             },
         );
@@ -742,10 +742,33 @@ pub(super) async fn handle_client(
                         }
                         let encoded_len = encoded_event.len();
                         if encoded_len > MAX_LIVE_AVAILABLE_MODELS_UPDATE_BYTES {
-                            crate::logging::warn(&format!(
-                                "Skipping oversized bus AvailableModelsUpdated frame for connection {} ({} bytes)",
-                                client_connection_id, encoded_len
-                            ));
+                            // Don't drop the catalog update entirely: clients still
+                            // need fresh model names for the picker. Strip the heavy
+                            // route expansion and ship a names-only snapshot; the TUI
+                            // rebuilds fallback routes for missing models locally.
+                            let slim_event = names_only_available_models_event(&event);
+                            let slim_encoded =
+                                slim_event.as_ref().map(crate::protocol::encode_event);
+                            match (slim_event, slim_encoded) {
+                                (Some(slim_event), Some(slim_encoded))
+                                    if slim_encoded.len()
+                                        <= MAX_LIVE_AVAILABLE_MODELS_UPDATE_BYTES =>
+                                {
+                                    crate::logging::info(&format!(
+                                        "Downgrading oversized bus AvailableModelsUpdated frame to names-only for connection {} ({} -> {} bytes)",
+                                        client_connection_id,
+                                        encoded_len,
+                                        slim_encoded.len()
+                                    ));
+                                    let _ = client_event_tx.send(slim_event);
+                                }
+                                _ => {
+                                    crate::logging::warn(&format!(
+                                        "Skipping oversized bus AvailableModelsUpdated frame for connection {} ({} bytes)",
+                                        client_connection_id, encoded_len
+                                    ));
+                                }
+                            }
                             last_available_models_snapshot = Some(encoded_event);
                             continue;
                         }
@@ -1102,8 +1125,7 @@ pub(super) async fn handle_client(
                     &client_connections,
                     &swarm_members,
                     &swarms_by_id,
-                    &file_touches,
-                    &files_touched_by_session,
+                    &file_touch,
                     &channel_subscriptions,
                     &channel_subscriptions_by_session,
                     &swarm_plans,
@@ -1255,12 +1277,20 @@ pub(super) async fn handle_client(
                 client_instance_id,
                 client_has_local_history,
                 allow_session_takeover,
+                terminal_env,
             } => {
                 current_client_instance_id = client_instance_id.clone();
                 {
                     let mut connections = client_connections.write().await;
                     if let Some(info) = connections.get_mut(&client_connection_id) {
                         info.client_instance_id = client_instance_id.clone();
+                        // Record the client's terminal env so spawn/focus hooks
+                        // target the client's terminal, not the server's stale
+                        // startup env (#405). Only overwrite when the client sent
+                        // something, so reconnects without env don't clobber it.
+                        if !terminal_env.is_empty() {
+                            info.terminal_env = terminal_env.clone();
+                        }
                     }
                 }
                 if let Some(target_session_id) = target_session_id {
@@ -1285,8 +1315,7 @@ pub(super) async fn handle_client(
                             &client_debug_state,
                             &swarm_members,
                             &swarms_by_id,
-                            &file_touches,
-                            &files_touched_by_session,
+                            &file_touch,
                             &channel_subscriptions,
                             &channel_subscriptions_by_session,
                             &swarm_plans,
@@ -1468,9 +1497,10 @@ pub(super) async fn handle_client(
                 });
             }
 
-            Request::Reload { id } => {
+            Request::Reload { id, force } => {
                 handle_reload(
                     id,
+                    force,
                     &client_session_id,
                     &agent,
                     &swarm_members,
@@ -1512,8 +1542,7 @@ pub(super) async fn handle_client(
                     &client_debug_state,
                     &swarm_members,
                     &swarms_by_id,
-                    &file_touches,
-                    &files_touched_by_session,
+                    &file_touch,
                     &channel_subscriptions,
                     &channel_subscriptions_by_session,
                     &swarm_plans,
@@ -1541,6 +1570,20 @@ pub(super) async fn handle_client(
                 }
             }
 
+            Request::ResumeAllSessions { id } => {
+                super::client_actions::handle_resume_all_sessions(
+                    id,
+                    &sessions,
+                    &swarm_members,
+                    &swarms_by_id,
+                    &event_history,
+                    &event_counter,
+                    &swarm_event_tx,
+                    &client_event_tx,
+                )
+                .await;
+            }
+
             Request::CycleModel { id, direction } => {
                 handle_cycle_model(id, direction, &agent, &client_event_tx).await;
             }
@@ -1555,6 +1598,10 @@ pub(super) async fn handle_client(
 
             Request::SetModel { id, model } => {
                 handle_set_model(id, model, &agent, &client_event_tx).await;
+            }
+
+            Request::SetRoute { id, selection } => {
+                handle_set_route(id, selection, &agent, &client_event_tx).await;
             }
 
             Request::SetSubagentModel { id, model } => {
@@ -1796,6 +1843,10 @@ pub(super) async fn handle_client(
                         soft_interrupt_queues: &soft_interrupt_queues,
                         client_connections: &client_connections,
                         swarm_members: &swarm_members,
+                        swarms_by_id: &swarms_by_id,
+                        event_history: &event_history,
+                        event_counter: &event_counter,
+                        swarm_event_tx: &swarm_event_tx,
                         client_event_tx: &client_event_tx,
                     },
                 )
@@ -1918,7 +1969,9 @@ pub(super) async fn handle_client(
                     &client_event_tx,
                     &swarm_members,
                     &swarms_by_id,
-                    &files_touched_by_session,
+                    &file_touch,
+                    &sessions,
+                    &client_connections,
                 )
                 .await;
             }
@@ -2063,6 +2116,7 @@ pub(super) async fn handle_client(
                     &mcp_pool,
                     &soft_interrupt_queues,
                     &swarm_mutation_runtime,
+                    &client_connections,
                 )
                 .await;
             }
@@ -2150,7 +2204,7 @@ pub(super) async fn handle_client(
                     &sessions,
                     &swarm_members,
                     &client_connections,
-                    &files_touched_by_session,
+                    &file_touch,
                     &client_event_tx,
                 )
                 .await;
@@ -2442,8 +2496,7 @@ pub(super) async fn handle_client(
         &swarms_by_id,
         &swarm_coordinators,
         &swarm_plans,
-        &file_touches,
-        &files_touched_by_session,
+        &file_touch,
         &channel_subscriptions,
         &channel_subscriptions_by_session,
         &client_debug_state,
@@ -2737,6 +2790,27 @@ async fn cancel_processing_message(
 fn try_available_models_snapshot(agent: &Arc<Mutex<Agent>>) -> Option<String> {
     let event = try_available_models_updated_event(agent)?;
     Some(crate::protocol::encode_event(&event))
+}
+
+/// Build a names-only copy of an `AvailableModelsUpdated` event by dropping the
+/// per-model route expansion. Used when the fully-routed frame exceeds the live
+/// update size cap so clients still receive fresh model names.
+fn names_only_available_models_event(event: &ServerEvent) -> Option<ServerEvent> {
+    let ServerEvent::AvailableModelsUpdated {
+        provider_name,
+        provider_model,
+        available_models,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    Some(ServerEvent::AvailableModelsUpdated {
+        provider_name: provider_name.clone(),
+        provider_model: provider_model.clone(),
+        available_models: available_models.clone(),
+        available_model_routes: Vec::new(),
+    })
 }
 
 fn queue_soft_interrupt(

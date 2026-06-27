@@ -11,7 +11,7 @@ use jcode_import_core::{
     ClaudeCodeContent, ClaudeCodeContentBlock, ClaudeCodeEntry, ClaudeCodeSessionInfo,
     SessionIndexEntry, SessionsIndex, claude_code_session_info_from_index,
     claude_text_from_content, clean_optional_text, codex_title_candidate, collect_files_recursive,
-    collect_recent_files_recursive, extract_text_from_json_value,
+    collect_recent_files_recursive, extract_opencode_part_text, extract_text_from_json_value,
     ordered_claude_code_message_entries, parse_rfc3339_json, parse_rfc3339_string,
     resolve_claude_session_path, truncate_title,
 };
@@ -266,7 +266,7 @@ pub fn list_claude_code_sessions_lazy(scan_limit: usize) -> Result<Vec<ClaudeCod
                 .map(|name| name.replace('-', "/"));
             let label = format!(
                 "Claude Code session {}",
-                &session_id[..session_id.len().min(8)]
+                jcode_core::util::truncate_str(&session_id, 8)
             );
             all_sessions.push(ClaudeCodeSessionInfo {
                 session_id: session_id.clone(),
@@ -352,6 +352,7 @@ fn convert_content_blocks(content: &ClaudeCodeContent) -> Vec<ContentBlock> {
                         id: id.clone(),
                         name: name.clone(),
                         input: input.clone(),
+                        thought_signature: None,
                     })
                 }
                 ClaudeCodeContentBlock::ToolResult {
@@ -376,31 +377,29 @@ pub fn import_session(session_id: &str) -> Result<Session> {
 }
 
 pub fn imported_session_id_for_target(
-    target: &jcode_tui_session_picker::ResumeTarget,
+    target: &jcode_session_types::ResumeTarget,
 ) -> Option<String> {
     match target {
-        jcode_tui_session_picker::ResumeTarget::JcodeSession { session_id } => {
-            Some(session_id.clone())
-        }
-        jcode_tui_session_picker::ResumeTarget::ClaudeCodeSession { session_id, .. } => {
+        jcode_session_types::ResumeTarget::JcodeSession { session_id } => Some(session_id.clone()),
+        jcode_session_types::ResumeTarget::ClaudeCodeSession { session_id, .. } => {
             Some(imported_claude_code_session_id(session_id))
         }
-        jcode_tui_session_picker::ResumeTarget::CodexSession { session_id, .. } => {
+        jcode_session_types::ResumeTarget::CodexSession { session_id, .. } => {
             Some(imported_codex_session_id(session_id))
         }
-        jcode_tui_session_picker::ResumeTarget::PiSession { session_path } => {
+        jcode_session_types::ResumeTarget::PiSession { session_path } => {
             Some(imported_pi_session_id(session_path))
         }
-        jcode_tui_session_picker::ResumeTarget::OpenCodeSession { session_id, .. } => {
+        jcode_session_types::ResumeTarget::OpenCodeSession { session_id, .. } => {
             Some(imported_opencode_session_id(session_id))
         }
     }
 }
 
 pub fn resolve_resume_target_to_jcode(
-    target: &jcode_tui_session_picker::ResumeTarget,
-) -> Result<jcode_tui_session_picker::ResumeTarget> {
-    use jcode_tui_session_picker::ResumeTarget;
+    target: &jcode_session_types::ResumeTarget,
+) -> Result<jcode_session_types::ResumeTarget> {
+    use jcode_session_types::ResumeTarget;
 
     let session_id = match target {
         ResumeTarget::JcodeSession { session_id } => {
@@ -920,6 +919,7 @@ pub fn import_opencode_session_from_path(
         ".local/share/opencode/storage/message/{}",
         session_id
     ))?;
+    let parts_base = crate::storage::user_home_path(".local/share/opencode/storage/part")?;
     let mut messages: Vec<(Option<DateTime<Utc>>, Role, String)> = Vec::new();
     let mut model: Option<String> = None;
     let mut provider_key = session.provider_key.clone();
@@ -936,10 +936,20 @@ pub fn import_opencode_session_from_path(
                 Some("assistant") => Role::Assistant,
                 _ => continue,
             };
+            // Modern OpenCode (Go storage) stores message body text in
+            // storage/part/<messageID>/*.json; fall back to legacy inline
+            // content/summary for older stores.
             let text = msg_value
-                .get("content")
-                .map(extract_text_from_json_value)
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|id| extract_opencode_part_text(&parts_base, id, true))
                 .filter(|text| !text.trim().is_empty())
+                .or_else(|| {
+                    msg_value
+                        .get("content")
+                        .map(extract_text_from_json_value)
+                        .filter(|text| !text.trim().is_empty())
+                })
                 .or_else(|| msg_value.get("summary").map(extract_text_from_json_value))
                 .unwrap_or_default();
             if model.is_none() {

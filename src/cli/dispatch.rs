@@ -7,7 +7,8 @@ use std::time::Instant;
 
 use super::args::{
     AmbientCommand, Args, AuthCommand, CloudCommand, CloudSessionsCommand, Command, MemoryCommand,
-    ModelCommand, ProviderCommand, RestartCommand, SessionCommand, TranscriptModeArg,
+    ModelCommand, ProviderCommand, RestartCommand, ServerCommand, SessionCommand,
+    TranscriptModeArg,
 };
 use crate::{
     agent, auth, build, provider, provider_catalog, server, session, setup_hints, startup_profile,
@@ -92,6 +93,14 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
         Some(Command::Connect) => {
             tui_launch::run_client().await?;
         }
+        Some(Command::Server { action }) => match action {
+            ServerCommand::Reload { force, json } => {
+                commands::run_server_reload_command(force, json).await?;
+            }
+            ServerCommand::Stop { force, json } => {
+                commands::run_server_stop_command(force, json).await?;
+            }
+        },
         Some(Command::Run {
             message,
             json,
@@ -417,6 +426,9 @@ pub(crate) async fn run_main(mut args: Args) -> Result<()> {
             RestartCommand::Status => commands::run_restart_status_command()?,
             RestartCommand::Clear => commands::run_restart_clear_command()?,
         },
+        Some(Command::Menubar { once, json }) => {
+            commands::run_menubar_command(once, json)?;
+        }
         None => run_default_command(args).await?,
     }
 
@@ -442,21 +454,69 @@ fn resolve_resume_arg(args: &mut Args) -> Result<()> {
             return tui_launch::list_sessions();
         }
 
-        match resolve_resume_id(resume_id) {
+        let resume_id = resume_id.clone();
+        match resolve_resume_id(&resume_id) {
             Ok(full_id) => {
                 args.resume = Some(full_id);
             }
             Err(e) => {
-                eprintln!("Error: {}", e);
-                if !output::quiet_enabled() {
-                    eprintln!("\nUse `jcode --resume` to list available sessions.");
+                match resume_resolution_failure_action(&resume_id, |key| std::env::var_os(key)) {
+                    // During a reload/update/restart handoff the client re-execs
+                    // itself with `--resume <id>` and `JCODE_RESUMING=1`. In the
+                    // client/server architecture the shared server is the authority
+                    // for session lifecycle, so an id that is not in the local store
+                    // can still be valid server-side. Hard-exiting here dumped the
+                    // user back to a shell with "No session found matching ...",
+                    // making jcode unusable after an auto-update (issue #328).
+                    // Instead, keep the raw id and let the remote connection resolve
+                    // it; if the server cannot find it either, the TUI surfaces a
+                    // recoverable message and falls back to a fresh session rather
+                    // than killing the process.
+                    ResumeResolutionFailureAction::DeferToServer => {
+                        crate::logging::warn(&format!(
+                            "Resume id '{}' not found locally during reload handoff ({}); deferring resolution to the server instead of exiting",
+                            resume_id, e
+                        ));
+                        // Leave args.resume as the raw id for the server to resolve.
+                    }
+                    ResumeResolutionFailureAction::Exit => {
+                        eprintln!("Error: {}", e);
+                        if !output::quiet_enabled() {
+                            eprintln!("\nUse `jcode --resume` to list available sessions.");
+                        }
+                        std::process::exit(1);
+                    }
                 }
-                std::process::exit(1);
             }
         }
     }
 
     Ok(())
+}
+
+/// What to do when a `--resume <id>` cannot be resolved from the local session
+/// store. Extracted as a pure function so the reload-handoff recovery path can
+/// be unit-tested without invoking `std::process::exit` (issue #328).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResumeResolutionFailureAction {
+    /// Keep the raw id and let the shared server resolve it (reload handoff).
+    DeferToServer,
+    /// No live handoff in progress; the id is genuinely bad, so exit.
+    Exit,
+}
+
+fn resume_resolution_failure_action<F, V>(
+    _resume_id: &str,
+    var_os: F,
+) -> ResumeResolutionFailureAction
+where
+    F: Fn(&str) -> Option<V>,
+{
+    if var_os("JCODE_RESUMING").is_some() {
+        ResumeResolutionFailureAction::DeferToServer
+    } else {
+        ResumeResolutionFailureAction::Exit
+    }
 }
 
 fn resolve_resume_id(resume_id: &str) -> Result<String> {
@@ -666,9 +726,37 @@ async fn run_default_command(args: Args) -> Result<()> {
     let startup_hints = if args.fresh_spawn {
         None
     } else {
+        // One-time: bake per-repo launch hotkeys from session history into config,
+        // then reinstall so the new chords take effect. Scanning session history
+        // can take a few hundred ms, so run it on a detached thread to keep it off
+        // the first-frame critical path. It is gated by an `imported` flag, so it
+        // does real work at most once and no-ops on every later launch.
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            std::thread::Builder::new()
+                .name("launch-hotkey-bake".to_string())
+                .spawn(|| {
+                    if crate::config::Config::bake_launch_hotkeys_once() {
+                        setup_hints::reinstall_launch_hotkeys_after_config_change();
+                    }
+                })
+                .ok();
+        }
+
+        // Prefer existing setup hints (alignment/welcome/terminal nudges); only
+        // surface the keybinding-conflict heads-up when nothing else is queued,
+        // so we never clobber an early-launch tip. The conflict hint is
+        // self-debouncing (shown once per distinct conflict set).
         setup_hints::maybe_show_setup_hints()
+            .or_else(|| {
+                setup_hints::maybe_show_keymap_conflict_hint(&crate::config::config().keybindings)
+            })
+            .or_else(setup_hints::maybe_show_glyph_safe_notice)
     };
     startup_profile::mark("setup_hints");
+
+    // Best-effort: make sure the macOS menu bar session-count indicator is
+    // running so it shows up automatically for every macOS user.
+    commands::ensure_menubar_helper_running();
 
     if args.resume.is_none() {
         terminal::show_crash_resume_hint();
@@ -679,6 +767,15 @@ async fn run_default_command(args: Args) -> Result<()> {
     let in_jcode_repo = build::is_jcode_repo(&cwd);
     startup_profile::mark("is_jcode_repo");
     let already_in_selfdev = crate::cli::selfdev::client_selfdev_requested();
+
+    // Record where this interactive launch happened so the system-wide launch
+    // hotkeys can reopen jcode in the last project directory (Cmd+') and the
+    // last jcode repo for self-dev (Cmd+Shift+'). Best-effort; ignored unless a
+    // real TTY and not a fresh-spawn re-entry.
+    if !args.fresh_spawn && std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let repo_dir = build::get_repo_dir();
+        setup_hints::record_launch_dirs(&cwd, repo_dir.as_deref());
+    }
 
     if in_jcode_repo && !already_in_selfdev && !args.no_selfdev {
         output::stderr_info("📍 Detected jcode repository - enabling self-dev mode");
@@ -731,6 +828,16 @@ async fn run_default_command(args: Args) -> Result<()> {
     }
 
     if !server_running {
+        // No live server and no in-flight reload/resume. If a dead socket was
+        // left behind by a crashed or upgraded daemon, reap it now so the spawn
+        // below binds cleanly instead of wedging the client in a connect-retry
+        // loop against a stale socket (issues #277/#291). This only removes a
+        // socket that has no live listener AND whose daemon lock is free, so it
+        // can never disturb a running server.
+        if server::reap_stale_socket_if_dead(&server::socket_path()).await {
+            output::stderr_info("Removed a stale jcode socket from a previous server.");
+        }
+
         maybe_prompt_server_bootstrap_login(&args.provider).await?;
         spawn_server(
             &args.provider,

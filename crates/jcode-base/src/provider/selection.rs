@@ -192,18 +192,45 @@ impl MultiProvider {
         }
     }
 
+    /// Canonicalize a persisted session `provider_key` into the legacy
+    /// vocabulary the reconstruction helpers below understand.
+    ///
+    /// Two vocabularies persist into sessions and must be treated as
+    /// equivalent, otherwise the OAuth-vs-API-key auth mode is silently lost on
+    /// restore/model-switch:
+    ///
+    /// - Legacy `/model` + login path: `claude` / `claude-api` / `openai` /
+    ///   `openai-api`.
+    /// - Structured model-route picker (`RouteSelection::stable_id`):
+    ///   `claude-oauth` / `anthropic-api-key` / `openai-oauth` /
+    ///   `openai-api-key`.
+    ///
+    /// Both encode the same auth route; we fold the picker forms back onto the
+    /// canonical keys so a session whose `provider_key` is `anthropic-api-key`
+    /// (and whose `route_api_method` was not also persisted, e.g. inherited by a
+    /// child/forked session) still reconstructs the Anthropic API-key route
+    /// instead of falling through to Auto (which prefers OAuth).
+    pub(crate) fn canonical_session_provider_key(provider_key: &str) -> &str {
+        // Fold any dual-auth (Anthropic/OpenAI OAuth-vs-API) alias onto its
+        // canonical session key via the single shared parser, so this never
+        // drifts from the route/runtime vocabularies. Non-dual keys pass through.
+        if let Some(route) = jcode_provider_core::AuthRoute::parse(provider_key) {
+            return route.session_provider_key();
+        }
+        provider_key.trim()
+    }
+
     fn explicit_session_provider_key_for_model_request(model_request: &str) -> Option<String> {
         let model_request = model_request.trim();
         if let Some((prefix, rest)) = model_request.split_once(':') {
             let prefix = prefix.trim();
             if !prefix.is_empty() && !rest.trim().is_empty() {
+                // Dual-auth (Anthropic/OpenAI) prefixes fold onto their canonical
+                // session key via the single shared parser.
+                if let Some(route) = jcode_provider_core::AuthRoute::parse(prefix) {
+                    return Some(route.session_provider_key().to_string());
+                }
                 match prefix {
-                    "claude-api" => return Some("claude-api".to_string()),
-                    "claude-oauth" | "claude" | "anthropic" => {
-                        return Some("claude".to_string());
-                    }
-                    "openai-api" => return Some("openai-api".to_string()),
-                    "openai-oauth" | "openai" => return Some("openai".to_string()),
                     "copilot" | "antigravity" | "gemini" | "cursor" | "bedrock" | "openrouter" => {
                         return Some(prefix.to_string());
                     }
@@ -287,7 +314,7 @@ impl MultiProvider {
     }
 
     fn session_provider_key_matches_provider_name(provider_key: &str, provider_name: &str) -> bool {
-        let provider_key = provider_key.trim();
+        let provider_key = Self::canonical_session_provider_key(provider_key.trim());
         let Some(derived) = Self::session_provider_key_from_provider_name(provider_name)
             .or_else(|| crate::session::derive_session_provider_key(provider_name))
         else {
@@ -342,12 +369,19 @@ impl MultiProvider {
         else {
             return model.to_string();
         };
+        // Fold the structured-picker vocabulary (`anthropic-api-key`,
+        // `openai-oauth`, ...) onto the canonical keys so the OAuth-vs-API-key
+        // route survives even when only `provider_key` was persisted (e.g. a
+        // forked/child session that inherited it without `route_api_method`).
+        let provider_key = Self::canonical_session_provider_key(provider_key);
+
+        // Dual-auth keys map to their canonical model prefix via the single
+        // shared parser, keeping the emitted prefix in lockstep with the parsers.
+        if let Some(route) = jcode_provider_core::AuthRoute::parse(provider_key) {
+            return format!("{}:{model}", route.model_prefix());
+        }
 
         match provider_key {
-            "claude-api" => format!("claude-api:{model}"),
-            "claude-oauth" | "claude" | "anthropic" => format!("claude-oauth:{model}"),
-            "openai-api" => format!("openai-api:{model}"),
-            "openai-oauth" | "openai" => format!("openai-oauth:{model}"),
             "copilot" | "antigravity" | "gemini" | "cursor" | "bedrock" | "openrouter" => {
                 format!("{provider_key}:{model}")
             }
@@ -364,6 +398,43 @@ impl MultiProvider {
                 }
             }
         }
+    }
+
+    pub fn model_switch_request_for_session_route(
+        model: &str,
+        provider_key: Option<&str>,
+        route_api_method: Option<&str>,
+    ) -> String {
+        let model = model.trim();
+        if model.is_empty() {
+            return String::new();
+        }
+        if let Some(api_method) = route_api_method
+            .map(str::trim)
+            .filter(|api_method| !api_method.is_empty())
+        {
+            match ModelRouteApiMethod::parse(api_method) {
+                ModelRouteApiMethod::ClaudeOAuth => return format!("claude-oauth:{model}"),
+                ModelRouteApiMethod::AnthropicApiKey => return format!("claude-api:{model}"),
+                ModelRouteApiMethod::OpenAIOAuth => return format!("openai-oauth:{model}"),
+                ModelRouteApiMethod::OpenAIApiKey => return format!("openai-api:{model}"),
+                ModelRouteApiMethod::OpenRouter => return format!("openrouter:{model}"),
+                ModelRouteApiMethod::OpenAiCompatible {
+                    profile_id: Some(profile_id),
+                } => return format!("{profile_id}:{model}"),
+                ModelRouteApiMethod::Copilot => return format!("copilot:{model}"),
+                ModelRouteApiMethod::Cursor => return format!("cursor:{model}"),
+                ModelRouteApiMethod::Bedrock => return format!("bedrock:{model}"),
+                ModelRouteApiMethod::AntigravityHttps => return format!("antigravity:{model}"),
+                ModelRouteApiMethod::OpenAiCompatible { profile_id: None }
+                | ModelRouteApiMethod::CodeAssistOAuth
+                | ModelRouteApiMethod::RemoteCatalog
+                | ModelRouteApiMethod::Current
+                | ModelRouteApiMethod::Other(_) => {}
+            }
+        }
+
+        Self::model_switch_request_for_session_model(model, provider_key)
     }
 
     pub(super) fn resolve_config_provider_selection(
@@ -385,7 +456,16 @@ impl MultiProvider {
             return Some(ConfigProviderSelection::NamedProfile(trimmed.to_string()));
         }
 
-        Self::parse_provider_hint(trimmed).map(ConfigProviderSelection::BuiltIn)
+        // Accept the dual-auth `--provider` vocabulary (`anthropic-api`,
+        // `claude-api`, `openai-api`, `claude-oauth`, ...) in addition to the
+        // bare provider hints. Without this, a config `default_provider =
+        // "anthropic-api"` is rejected as "Unknown default_provider" and the
+        // OAuth-vs-API routing decision it encodes is silently dropped.
+        Self::parse_provider_hint(trimmed)
+            .or_else(|| {
+                jcode_provider_core::AuthRoute::parse(trimmed).map(|route| route.active_provider())
+            })
+            .map(ConfigProviderSelection::BuiltIn)
     }
 }
 
@@ -557,6 +637,82 @@ mod tests {
                 MultiProvider::model_switch_request_for_session_model(model, provider_key),
                 expected_request,
                 "restore {model:?} with {provider_key:?}"
+            );
+        }
+
+        assert_eq!(
+            MultiProvider::model_switch_request_for_session_route(
+                "openrouter/owl-alpha",
+                Some("openrouter"),
+                Some("openrouter"),
+            ),
+            "openrouter:openrouter/owl-alpha"
+        );
+        assert_eq!(
+            MultiProvider::model_switch_request_for_session_route(
+                "nvidia/example",
+                Some("openai-compatible:nvidia-nim"),
+                Some("openai-compatible:nvidia-nim"),
+            ),
+            "nvidia-nim:nvidia/example"
+        );
+    }
+
+    #[test]
+    fn session_provider_key_picker_vocabulary_preserves_auth_mode_without_route() {
+        // The structured model-route picker persists `RuntimeKey::stable_id()`
+        // values (`anthropic-api-key`, `openai-oauth`, ...). When a child/forked
+        // session inherits only `provider_key` without `route_api_method`, the
+        // reconstruction helpers must still recover the exact OAuth-vs-API-key
+        // route instead of dropping to Auto (which prefers OAuth) and silently
+        // shifting an API-key user onto the subscription.
+        for (model, provider_key, expected_request) in [
+            (
+                "claude-opus-4-8",
+                Some("anthropic-api-key"),
+                "claude-api:claude-opus-4-8",
+            ),
+            (
+                "claude-opus-4-8",
+                Some("claude-oauth"),
+                "claude-oauth:claude-opus-4-8",
+            ),
+            ("gpt-5.5", Some("openai-api-key"), "openai-api:gpt-5.5"),
+            ("gpt-5.5", Some("openai-oauth"), "openai-oauth:gpt-5.5"),
+        ] {
+            assert_eq!(
+                MultiProvider::model_switch_request_for_session_model(model, provider_key),
+                expected_request,
+                "restore {model:?} with picker provider_key {provider_key:?}"
+            );
+        }
+
+        // The same picker vocabulary must be recognized as matching its provider
+        // so an auth-change rewrite keeps the persisted key instead of
+        // overwriting it with the canonical name (losing the auth mode).
+        for (model, provider_name, previous_key, expected_key) in [
+            (
+                "claude-opus-4-8",
+                "Anthropic",
+                Some("anthropic-api-key"),
+                Some("anthropic-api-key"),
+            ),
+            (
+                "gpt-5.5",
+                "OpenAI",
+                Some("openai-api-key"),
+                Some("openai-api-key"),
+            ),
+        ] {
+            assert_eq!(
+                MultiProvider::session_provider_key_after_model_switch(
+                    model,
+                    provider_name,
+                    previous_key,
+                )
+                .as_deref(),
+                expected_key,
+                "{model:?} via {provider_name:?} keeps picker key {previous_key:?}"
             );
         }
     }

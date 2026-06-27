@@ -1,7 +1,7 @@
 use super::DesktopApp;
 use super::session_launch;
 use super::single_session::{SingleSessionApp, SingleSessionMessage};
-use super::workspace;
+use super::workspace::{self, KeyInput};
 use anyhow::{Context, Result};
 use std::process::Command;
 use std::time::Duration;
@@ -16,9 +16,17 @@ const TEMPORARY_DESKTOP_GALLERY_STATES: &[&str] = &[
     "stdin-request",
     "streaming",
     "error",
+    "hotkey-help",
     "model-picker",
+    "session-info",
+    "session-switcher",
+    "slash-suggestions",
     "long-transcript",
 ];
+
+pub(super) fn gallery_states() -> &'static [&'static str] {
+    TEMPORARY_DESKTOP_GALLERY_STATES
+}
 
 pub(super) fn launch_temporary_windows() -> Result<()> {
     let binary = std::env::current_exe().context("failed to resolve current desktop binary")?;
@@ -42,6 +50,11 @@ fn temporary_gallery_title(state: &str) -> String {
 }
 
 pub(super) fn temporary_app(state: &str) -> DesktopApp {
+    if state == "fresh" {
+        // Pristine first-launch app (welcome hero, no session), useful for
+        // headless captures of fresh-welcome layout interactions.
+        return DesktopApp::SingleSession(SingleSessionApp::new(None));
+    }
     let mut app = SingleSessionApp::new(None);
     app.replace_session(Some(workspace::SessionCard {
         session_id: format!("gallery-{state}"),
@@ -165,9 +178,16 @@ pub(super) fn temporary_app(state: &str) -> DesktopApp {
                 "Fixture backend error: socket disconnected".to_string(),
             ));
         }
+        "hotkey-help" => {
+            app.messages.push(SingleSessionMessage::user(
+                "Show the keyboard shortcut inline widget.",
+            ));
+            app.handle_key(KeyInput::HotkeyHelp);
+        }
         "model-picker" => {
             app.messages
                 .push(SingleSessionMessage::user("Show model catalog/status."));
+            app.handle_key(KeyInput::OpenModelPicker);
             app.apply_session_event(session_launch::DesktopSessionEvent::ModelCatalog {
                 current_model: Some("gpt-5.1".to_string()),
                 provider_name: Some("openai".to_string()),
@@ -176,7 +196,25 @@ pub(super) fn temporary_app(state: &str) -> DesktopApp {
                 service_tier: Some("priority".to_string()),
                 compaction_mode: Some("auto".to_string()),
             });
-            app.draft = "/model".to_string();
+        }
+        "session-info" => {
+            app.messages.push(SingleSessionMessage::user(
+                "Show the current session info inline widget.",
+            ));
+            app.handle_key(KeyInput::ToggleSessionInfo);
+        }
+        "session-switcher" => {
+            app.messages.push(SingleSessionMessage::user(
+                "Show the recent session switcher inline widget with preview panes.",
+            ));
+            app.handle_key(KeyInput::OpenSessionSwitcher);
+            app.apply_session_switcher_cards(temporary_gallery_sessions());
+        }
+        "slash-suggestions" => {
+            app.messages.push(SingleSessionMessage::user(
+                "Show slash command suggestions as an inline widget.",
+            ));
+            app.draft = "/".to_string();
         }
         "long-transcript" => {
             for turn in 1..=8 {
@@ -194,6 +232,31 @@ pub(super) fn temporary_app(state: &str) -> DesktopApp {
     DesktopApp::SingleSession(app)
 }
 
+fn temporary_gallery_sessions() -> Vec<workspace::SessionCard> {
+    (1..=5)
+        .map(|index| workspace::SessionCard {
+            session_id: format!("gallery-resume-{index}"),
+            title: format!("Gallery resume target {index}"),
+            subtitle: if index == 1 {
+                "active · fixture-model".to_string()
+            } else {
+                "recent · fixture-model".to_string()
+            },
+            detail: format!("{messages} msgs · fixture workspace", messages = index * 3),
+            preview_lines: vec![
+                format!("Prompt {index}  inspect inline widget geometry"),
+                "Assistant  preview pane content should wrap cleanly".to_string(),
+            ],
+            detail_lines: vec![
+                format!("Prompt {index}  inspect inline widget geometry"),
+                "Assistant  preview pane content should wrap cleanly".to_string(),
+                "Tool  cargo check -p jcode-desktop completed".to_string(),
+            ],
+            transcript_messages: Vec::new(),
+        })
+        .collect()
+}
+
 fn temporary_gallery_models() -> Vec<session_launch::DesktopModelChoice> {
     vec![
         session_launch::DesktopModelChoice {
@@ -209,6 +272,20 @@ fn temporary_gallery_models() -> Vec<session_launch::DesktopModelChoice> {
             api_method: Some("messages".to_string()),
             detail: Some("fixture alternative".to_string()),
             available: true,
+        },
+        session_launch::DesktopModelChoice {
+            model: "gemini-2.5-pro".to_string(),
+            provider: Some("google".to_string()),
+            api_method: Some("generate".to_string()),
+            detail: Some("preview tier".to_string()),
+            available: true,
+        },
+        session_launch::DesktopModelChoice {
+            model: "gpt-5.1-codex".to_string(),
+            provider: Some("openai".to_string()),
+            api_method: Some("responses".to_string()),
+            detail: Some("coding optimized".to_string()),
+            available: false,
         },
     ]
 }

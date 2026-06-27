@@ -13,7 +13,6 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::net::TcpStream;
@@ -31,34 +30,75 @@ const RESPONSES_PATH: &str = "responses";
 const DEFAULT_MODEL: &str = "gpt-5.5";
 const ORIGINATOR: &str = "codex_cli_rs";
 
+/// Whether the hosted `image_generation` tool can be attached for `model_id`.
+///
+/// The Responses backend only exposes `image_generation` to general
+/// ChatGPT/GPT models. Codex models (ids containing `codex`) reject unknown
+/// hosted tools, so they must not receive it. See issue #369.
+fn model_supports_image_generation(model_id: &str) -> bool {
+    !model_id.to_ascii_lowercase().contains("codex")
+}
+
+
 /// Maximum number of retries for transient errors
 const MAX_RETRIES: u32 = 3;
 
 /// Base delay for exponential backoff (in milliseconds)
 const RETRY_BASE_DELAY_MS: u64 = 1000;
 const WEBSOCKET_UPGRADE_REQUIRED_ERROR: StatusCode = StatusCode::UPGRADE_REQUIRED;
-const WEBSOCKET_FALLBACK_NOTICE: &str = "falling back from websockets to https transport";
 const WEBSOCKET_CONNECT_TIMEOUT_SECS: u64 = 8;
-const WEBSOCKET_FIRST_EVENT_TIMEOUT_SECS: u64 = 8;
-const WEBSOCKET_COMPLETION_TIMEOUT_SECS: u64 = 300;
 /// Maximum age of a persistent WebSocket connection before forcing reconnect
 const WEBSOCKET_PERSISTENT_MAX_AGE_SECS: u64 = 3000; // 50 min (server limit is 60 min)
-/// If a persistent socket sits idle this long, reconnect before reuse instead of
-/// discovering a dead socket on the next turn.
-const WEBSOCKET_PERSISTENT_IDLE_RECONNECT_SECS: u64 = 90;
+/// Default idle window after which we reconnect instead of reusing the socket.
+///
+/// Raised from the original 90s. Tearing the socket down loses the server-side
+/// `previous_response_id` chain, so the next turn must re-send the full
+/// conversation and relies on OpenAI prefix-hash routing, which frequently
+/// lands on a cold machine (observed zero cache reads). The lightweight
+/// healthcheck ping below (1.5s timeout) is the real liveness probe, so for
+/// typical interactive pauses we prefer to confirm-and-reuse the live socket
+/// and keep the warm cache. Dead/half-closed sockets are still detected by the
+/// ping and reconnect gracefully, and `WEBSOCKET_PERSISTENT_MAX_AGE_SECS` still
+/// caps total connection lifetime. Tunable via
+/// `JCODE_OPENAI_WS_IDLE_RECONNECT_SECS` (0 disables the idle reconnect entirely,
+/// relying solely on the healthcheck + max-age cap).
+const WEBSOCKET_PERSISTENT_IDLE_RECONNECT_SECS_DEFAULT: u64 = 600; // 10 min
 /// If a persistent socket has been idle for a while, send a lightweight ping
 /// before reuse so we can proactively detect half-closed connections.
 const WEBSOCKET_PERSISTENT_HEALTHCHECK_IDLE_SECS: u64 = 15;
+
+/// Resolved idle-reconnect threshold (seconds), read once from the environment.
+/// `Some(secs)` means reconnect after that idle duration; `None` means never
+/// force a reconnect on idle alone (healthcheck + max-age still apply).
+static WEBSOCKET_PERSISTENT_IDLE_RECONNECT_SECS: LazyLock<Option<u64>> = LazyLock::new(|| {
+    match std::env::var("JCODE_OPENAI_WS_IDLE_RECONNECT_SECS") {
+        Ok(raw) => match raw.trim().parse::<u64>() {
+            Ok(0) => {
+                crate::logging::info(
+                    "OpenAI persistent WS idle reconnect disabled (JCODE_OPENAI_WS_IDLE_RECONNECT_SECS=0); relying on healthcheck + max-age",
+                );
+                None
+            }
+            Ok(secs) => {
+                crate::logging::info(&format!(
+                    "OpenAI persistent WS idle reconnect threshold set to {}s (JCODE_OPENAI_WS_IDLE_RECONNECT_SECS)",
+                    secs
+                ));
+                Some(secs)
+            }
+            Err(_) => {
+                crate::logging::info(&format!(
+                    "Warning: invalid JCODE_OPENAI_WS_IDLE_RECONNECT_SECS '{}'; using default {}s",
+                    raw, WEBSOCKET_PERSISTENT_IDLE_RECONNECT_SECS_DEFAULT
+                ));
+                Some(WEBSOCKET_PERSISTENT_IDLE_RECONNECT_SECS_DEFAULT)
+            }
+        },
+        Err(_) => Some(WEBSOCKET_PERSISTENT_IDLE_RECONNECT_SECS_DEFAULT),
+    }
+});
 const WEBSOCKET_PERSISTENT_HEALTHCHECK_TIMEOUT_MS: u64 = 1500;
-/// Base websocket cooldown after a fallback in auto mode.
-/// Keep this short so one flaky attempt does not pin the TUI to HTTPS for a long time.
-const WEBSOCKET_MODEL_COOLDOWN_BASE_SECS: u64 = 60;
-/// Maximum websocket cooldown after repeated fallback streaks.
-const WEBSOCKET_MODEL_COOLDOWN_MAX_SECS: u64 = 600;
 const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 32_768;
-static FALLBACK_TOOL_CALL_COUNTER: AtomicU64 = AtomicU64::new(1);
-static RECOVERED_TEXT_WRAPPED_TOOL_CALLS: AtomicU64 = AtomicU64::new(0);
-static NORMALIZED_NULL_TOOL_ARGUMENTS: AtomicU64 = AtomicU64::new(0);
 static WEBSOCKET_COOLDOWNS: LazyLock<Arc<RwLock<HashMap<String, Instant>>>> =
     LazyLock::new(|| Arc::new(RwLock::new(HashMap::new())));
 static WEBSOCKET_FAILURE_STREAKS: LazyLock<Arc<RwLock<HashMap<String, u32>>>> =
@@ -141,14 +181,26 @@ pub(crate) enum OpenAICredentialMode {
 
 impl OpenAICredentialMode {
     fn from_runtime_env() -> Self {
-        match std::env::var("JCODE_RUNTIME_PROVIDER")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("openai-api") => Self::ApiKey,
-            Some("openai") => Self::OAuth,
-            _ => Self::Auto,
+        // Canonical parse: recognizes every runtime/route/CLI/prefix alias for
+        // the OpenAI OAuth-vs-API decision in one place, so this can never drift
+        // from the other vocabularies (see jcode_provider_core::auth_mode).
+        match jcode_provider_core::runtime_env_pinned_mode(
+            jcode_provider_core::DualAuthProvider::OpenAI,
+        ) {
+            Some(jcode_provider_core::AuthMode::ApiKey) => Self::ApiKey,
+            Some(jcode_provider_core::AuthMode::Oauth) => Self::OAuth,
+            None => Self::Auto,
+        }
+    }
+
+    /// The canonical dual-auth route this explicit mode pins, if any.
+    /// `Auto` has no explicit pin and returns `None`.
+    pub(crate) fn auth_route(self) -> Option<jcode_provider_core::AuthRoute> {
+        use jcode_provider_core::{AuthMode, AuthRoute};
+        match self {
+            Self::Auto => None,
+            Self::OAuth => Some(AuthRoute::openai(AuthMode::Oauth)),
+            Self::ApiKey => Some(AuthRoute::openai(AuthMode::ApiKey)),
         }
     }
 
@@ -355,8 +407,15 @@ fn persistent_ws_idle_needs_healthcheck(idle_for: Duration) -> bool {
     idle_for >= Duration::from_secs(WEBSOCKET_PERSISTENT_HEALTHCHECK_IDLE_SECS)
 }
 
+fn idle_requires_reconnect_with(threshold_secs: Option<u64>, idle_for: Duration) -> bool {
+    match threshold_secs {
+        Some(secs) => idle_for >= Duration::from_secs(secs),
+        None => false,
+    }
+}
+
 fn persistent_ws_idle_requires_reconnect(idle_for: Duration) -> bool {
-    idle_for >= Duration::from_secs(WEBSOCKET_PERSISTENT_IDLE_RECONNECT_SECS)
+    idle_requires_reconnect_with(*WEBSOCKET_PERSISTENT_IDLE_RECONNECT_SECS, idle_for)
 }
 
 async fn emit_connection_phase(
@@ -639,15 +698,14 @@ impl OpenAIProvider {
         // Keep the runtime provider identity in sync with the explicit credential
         // choice so UI surfaces report the auth method requests will actually use.
         // `Auto` leaves the existing identity untouched.
-        match mode {
-            OpenAICredentialMode::OAuth => {
-                crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai");
-            }
-            OpenAICredentialMode::ApiKey => {
-                crate::env::set_var("JCODE_RUNTIME_PROVIDER", "openai-api");
-            }
-            OpenAICredentialMode::Auto => {}
+        if let Some(route) = mode.auth_route() {
+            crate::env::set_var("JCODE_RUNTIME_PROVIDER", route.runtime_provider_key());
         }
+        // Drop any cached auth snapshot so surfaces that still consult the cheap
+        // cached probe (auto-mode resolution, usage availability, account labels)
+        // re-derive from the new credential choice on their next read instead of
+        // lingering on a snapshot taken before the switch.
+        crate::auth::AuthStatus::invalidate_cache();
         Ok(())
     }
 
@@ -790,11 +848,129 @@ impl OpenAIProvider {
 
     fn responses_url(credentials: &CodexCredentials) -> String {
         let base = if Self::is_chatgpt_mode(credentials) {
-            CHATGPT_API_BASE
+            // ChatGPT/Codex OAuth backend is fixed; a custom base only applies
+            // to API-key usage of the native Responses API.
+            CHATGPT_API_BASE.to_string()
         } else {
-            OPENAI_API_BASE
+            Self::resolve_api_base()
         };
         format!("{}/{}", base.trim_end_matches('/'), RESPONSES_PATH)
+    }
+
+    /// Resolve the OpenAI Responses API base URL for **API-key** mode.
+    ///
+    /// Defaults to `https://api.openai.com/v1`, but honors a user override so
+    /// the native `openai-api` provider can target a local/proxied Responses
+    /// API endpoint (issue #343). Checked in order:
+    /// `JCODE_OPENAI_API_BASE`, `OPENAI_BASE_URL`, `OPENAI_API_BASE`.
+    ///
+    /// The override must be an absolute `http(s)://` URL; anything else is
+    /// logged and ignored so a malformed value never silently breaks requests.
+    /// A `/responses` suffix is not expected here (it is appended by callers),
+    /// so a trailing `/responses` is trimmed to avoid `.../responses/responses`.
+    pub(crate) fn resolve_api_base() -> String {
+        const OVERRIDE_VARS: [&str; 3] = [
+            "JCODE_OPENAI_API_BASE",
+            "OPENAI_BASE_URL",
+            "OPENAI_API_BASE",
+        ];
+        for var in OVERRIDE_VARS {
+            let Ok(raw) = std::env::var(var) else {
+                continue;
+            };
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+                crate::logging::warn(&format!(
+                    "Ignoring invalid {} '{}'; expected an absolute http(s):// URL",
+                    var, trimmed
+                ));
+                continue;
+            }
+            let normalized = trimmed
+                .trim_end_matches('/')
+                .trim_end_matches("/responses")
+                .trim_end_matches('/');
+            if normalized.is_empty() {
+                crate::logging::warn(&format!(
+                    "Ignoring invalid {} '{}'; URL has no host/path",
+                    var, trimmed
+                ));
+                continue;
+            }
+            crate::logging::info(&format!(
+                "OpenAI Responses API base overridden to '{}' via {}",
+                normalized, var
+            ));
+            return normalized.to_string();
+        }
+        // Fall back to the active Codex Responses provider base URL from
+        // `~/.codex/config.toml` so OpenAI-compatible API-key traffic honors a
+        // gateway configured there, before defaulting to api.openai.com (#374).
+        if let Some(base) = Self::codex_config_responses_base() {
+            crate::logging::info(&format!(
+                "OpenAI Responses API base resolved to '{}' from ~/.codex/config.toml",
+                base
+            ));
+            return base;
+        }
+        OPENAI_API_BASE.to_string()
+    }
+
+    /// Read the active Codex model_provider's `base_url` from
+    /// `~/.codex/config.toml` when it serves the Responses wire API.
+    ///
+    /// Codex config shape:
+    /// ```toml
+    /// model_provider = "mygw"
+    /// [model_providers.mygw]
+    /// base_url = "https://gateway.example/v1"
+    /// wire_api = "responses"   # only "responses" is honored here
+    /// ```
+    /// Returns `None` when the file/keys are missing, the URL is not absolute
+    /// http(s), or the provider's `wire_api` is not `responses`.
+    fn codex_config_responses_base() -> Option<String> {
+        let path = crate::storage::user_home_path(".codex/config.toml").ok()?;
+        let contents = std::fs::read_to_string(&path).ok()?;
+        let value: toml::Value = contents.parse().ok()?;
+
+        let provider_name = value.get("model_provider")?.as_str()?.trim();
+        if provider_name.is_empty() {
+            return None;
+        }
+        let provider = value
+            .get("model_providers")?
+            .as_table()?
+            .get(provider_name)?
+            .as_table()?;
+
+        // Only honor providers that speak the Responses wire API. When the key
+        // is absent, Codex defaults to the Responses API for OpenAI-style
+        // providers, so treat "missing" as eligible.
+        if let Some(wire_api) = provider.get("wire_api").and_then(|v| v.as_str()) {
+            if !wire_api.trim().eq_ignore_ascii_case("responses") {
+                return None;
+            }
+        }
+
+        let base = provider.get("base_url")?.as_str()?.trim();
+        if !(base.starts_with("http://") || base.starts_with("https://")) {
+            crate::logging::warn(&format!(
+                "Ignoring ~/.codex/config.toml base_url '{}' for provider '{}'; expected an absolute http(s):// URL",
+                base, provider_name
+            ));
+            return None;
+        }
+        let normalized = base
+            .trim_end_matches('/')
+            .trim_end_matches("/responses")
+            .trim_end_matches('/');
+        if normalized.is_empty() {
+            return None;
+        }
+        Some(normalized.to_string())
     }
 
     fn responses_ws_url(credentials: &CodexCredentials) -> String {
@@ -825,7 +1001,10 @@ impl OpenAIProvider {
         native_compaction_threshold: Option<usize>,
     ) -> Value {
         let mut tools = api_tools.to_vec();
-        if is_chatgpt_mode {
+        // The hosted `image_generation` tool is only available to general
+        // ChatGPT/GPT models on the Responses backend. Codex models
+        // (`*-codex*`) reject unknown hosted tools, so don't attach it for them.
+        if is_chatgpt_mode && model_supports_image_generation(model_id) {
             tools.push(serde_json::json!({ "type": "image_generation" }));
         }
 
@@ -953,9 +1132,7 @@ impl OpenAIProvider {
 
 mod stream;
 
-use self::openai_stream_runtime::{
-    PersistentWsResult, extract_error_with_retry, is_retryable_error, openai_access_token,
-};
+use self::openai_stream_runtime::{PersistentWsResult, is_retryable_error, openai_access_token};
 
 use self::stream::{OpenAIResponsesStream, parse_openai_response_event};
 #[cfg(test)]
@@ -968,16 +1145,19 @@ mod openai_stream_runtime;
 
 mod websocket_health;
 
+use self::websocket_health::{
+    WEBSOCKET_COMPLETION_TIMEOUT_SECS, WEBSOCKET_FALLBACK_NOTICE,
+    WEBSOCKET_FIRST_EVENT_TIMEOUT_SECS, classify_websocket_fallback_reason,
+    is_stream_activity_event, is_websocket_activity_payload, is_websocket_fallback_notice,
+    is_websocket_first_activity_payload, record_websocket_fallback, record_websocket_success,
+    summarize_websocket_fallback_reason, websocket_activity_timeout_kind,
+    websocket_cooldown_remaining, websocket_next_activity_timeout_secs,
+};
 #[cfg(test)]
 use self::websocket_health::{
-    WebsocketFallbackReason, clear_websocket_cooldown, normalize_transport_model,
-    set_websocket_cooldown, websocket_cooldown_for_streak, websocket_remaining_timeout_secs,
-};
-use self::websocket_health::{
-    classify_websocket_fallback_reason, is_stream_activity_event, is_websocket_activity_payload,
-    is_websocket_fallback_notice, is_websocket_first_activity_payload, record_websocket_fallback,
-    record_websocket_success, summarize_websocket_fallback_reason, websocket_activity_timeout_kind,
-    websocket_cooldown_remaining, websocket_next_activity_timeout_secs,
+    WEBSOCKET_MODEL_COOLDOWN_BASE_SECS, WEBSOCKET_MODEL_COOLDOWN_MAX_SECS, WebsocketFallbackReason,
+    clear_websocket_cooldown, normalize_transport_model, set_websocket_cooldown,
+    websocket_cooldown_for_streak, websocket_remaining_timeout_secs,
 };
 
 #[cfg(test)]

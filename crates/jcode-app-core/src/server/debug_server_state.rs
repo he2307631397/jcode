@@ -1,11 +1,10 @@
 use super::{
-    ClientConnectionInfo, ClientDebugState, DebugJob, FileAccess, ServerIdentity,
+    ClientConnectionInfo, ClientDebugState, DebugJob, FileAccess, FileTouchService, ServerIdentity,
     SessionInterruptQueues, SharedContext, SwarmEvent, SwarmMember, VersionedPlan,
 };
 use crate::agent::Agent;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{Mutex, RwLock};
@@ -29,8 +28,7 @@ pub(super) async fn maybe_handle_server_state_command(
     shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    file_touches: &Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: &Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: &FileTouchService,
     channel_subscriptions: &ChannelSubscriptions,
     channel_subscriptions_by_session: &ChannelSubscriptions,
     debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
@@ -124,8 +122,7 @@ pub(super) async fn maybe_handle_server_state_command(
             shared_context,
             swarm_plans,
             swarm_coordinators,
-            file_touches,
-            files_touched_by_session,
+            file_touch,
             channel_subscriptions,
             channel_subscriptions_by_session,
             debug_jobs,
@@ -143,6 +140,16 @@ pub(super) async fn maybe_handle_server_state_command(
         return Ok(Some(
             serde_json::to_string_pretty(&crate::process_memory::history(256))
                 .unwrap_or_else(|_| "[]".to_string()),
+        ));
+    }
+
+    if cmd == "memory-judge" || cmd == "memory:judge" || cmd == "server:memory-judge" {
+        // Attribution of no-LLM memory-mode conversions: how often a surfacing
+        // turn ran the LLM judge vs converted (intended opt-out/cadence vs the
+        // degradations we drive to zero). See `memory_judge_metrics`.
+        return Ok(Some(
+            serde_json::to_string_pretty(&jcode_base::memory_judge_metrics::snapshot())
+                .unwrap_or_else(|_| "{}".to_string()),
         ));
     }
 
@@ -262,8 +269,7 @@ async fn build_server_memory_payload(
     shared_context: &Arc<RwLock<HashMap<String, HashMap<String, SharedContext>>>>,
     swarm_plans: &Arc<RwLock<HashMap<String, VersionedPlan>>>,
     swarm_coordinators: &Arc<RwLock<HashMap<String, String>>>,
-    file_touches: &Arc<RwLock<HashMap<PathBuf, Vec<FileAccess>>>>,
-    files_touched_by_session: &Arc<RwLock<HashMap<String, HashSet<PathBuf>>>>,
+    file_touch: &FileTouchService,
     channel_subscriptions: &ChannelSubscriptions,
     channel_subscriptions_by_session: &ChannelSubscriptions,
     debug_jobs: &Arc<RwLock<HashMap<String, DebugJob>>>,
@@ -460,7 +466,7 @@ async fn build_server_memory_payload(
         .sum();
     drop(coordinators);
 
-    let touches = file_touches.read().await;
+    let touches = file_touch.snapshot().await;
     let file_touch_path_count = touches.len();
     let file_touch_entry_count: usize = touches.values().map(|entries| entries.len()).sum();
     let file_touch_estimate_bytes: usize = touches
@@ -475,7 +481,7 @@ async fn build_server_memory_payload(
         .sum();
     drop(touches);
 
-    let touched_by_session = files_touched_by_session.read().await;
+    let touched_by_session = file_touch.reverse_snapshot().await;
     let touched_session_count = touched_by_session.len();
     let touched_session_estimate_bytes: usize = touched_by_session
         .iter()

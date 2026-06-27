@@ -31,6 +31,33 @@ pub(in crate::tui::app) async fn send_interleave_now(
     }
 }
 
+pub(in crate::tui::app) async fn handle_remote_update_command(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+) -> Result<()> {
+    reload_stale_remote_server_before_update(app, remote).await?;
+
+    let session_id = app
+        .remote_session_id
+        .clone()
+        .unwrap_or_else(|| crate::id::new_id("ses"));
+    app.start_background_client_update(session_id);
+    Ok(())
+}
+
+pub(in crate::tui::app) async fn reload_stale_remote_server_before_update(
+    app: &mut App,
+    remote: &mut RemoteConnection,
+) -> Result<bool> {
+    if app.remote_server_has_update != Some(true) {
+        return Ok(false);
+    }
+
+    app.append_reload_message("Reloading stale server before checking for client updates...");
+    remote.reload().await?;
+    Ok(true)
+}
+
 async fn apply_remote_effort_direction(
     app: &mut App,
     remote: &mut RemoteConnection,
@@ -197,8 +224,8 @@ impl App {
                 self.prompt_new_account_label(provider)
             }
             other => {
-                if let Some(input) = Self::account_command_for_picker(&other) {
-                    crate::tui::app::auth::handle_account_command_remote(self, &input, remote)
+                if let Some(command) = crate::tui::app::auth::account_command_from_picker(&other) {
+                    crate::tui::app::auth::execute_account_command_remote(self, command, remote)
                         .await?;
                 }
             }
@@ -294,6 +321,16 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    if app.new_terminal_key_matches(code, modifiers) {
+        app.handle_new_terminal_hotkey();
+        return Ok(());
+    }
+
+    if app.open_resume_key_matches(code, modifiers) {
+        app.open_session_picker();
+        return Ok(());
+    }
+
     if handle_workspace_navigation_key(app, code, modifiers, remote).await? {
         return Ok(());
     }
@@ -329,7 +366,7 @@ async fn handle_remote_key_internal(
         app.toggle_typing_scroll_lock();
         return Ok(());
     }
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.centered_toggle_keys.matches(code, modifiers) {
         app.toggle_centered_mode();
         return Ok(());
     }
@@ -354,7 +391,12 @@ async fn handle_remote_key_internal(
                 app.cursor_pos = app.find_word_boundary_back();
                 return Ok(());
             }
-            KeyCode::Char('f') => {
+            // Alt/Option+Left/Right move by word, matching Alt+B / Alt+F.
+            KeyCode::Left => {
+                app.cursor_pos = app.find_word_boundary_back();
+                return Ok(());
+            }
+            KeyCode::Char('f') | KeyCode::Right => {
                 app.cursor_pos = app.find_word_boundary_forward();
                 return Ok(());
             }
@@ -440,7 +482,7 @@ async fn handle_remote_key_internal(
         return Ok(());
     }
 
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.centered_toggle_keys.matches(code, modifiers) {
         app.toggle_centered_mode();
         return Ok(());
     }
@@ -523,7 +565,7 @@ async fn handle_remote_key_internal(
                 return Ok(());
             }
             KeyCode::Char('e') => {
-                input::edit_input_in_external_editor(app);
+                app.cursor_pos = app.input.len();
                 return Ok(());
             }
             KeyCode::Char('f') => {
@@ -628,7 +670,7 @@ async fn handle_remote_key_internal(
     }
 
     if code == KeyCode::Enter
-        && modifiers.contains(KeyModifiers::CONTROL)
+        && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
         && !app.input.trim().starts_with('/')
     {
         if app.activate_picker_from_preview() {
@@ -793,10 +835,7 @@ async fn handle_remote_key_internal(
                         app.push_display_message(DisplayMessage::system(
                             "Reloading client with newer binary...".to_string(),
                         ));
-                        let session_id = app
-                            .remote_session_id
-                            .clone()
-                            .unwrap_or_else(|| crate::id::new_id("ses"));
+                        let session_id = app.reload_handoff_session_id();
                         app.save_input_for_reload(&session_id);
                         app.reload_requested = Some(session_id);
                         app.should_quit = true;
@@ -808,10 +847,7 @@ async fn handle_remote_key_internal(
                     app.push_display_message(DisplayMessage::system(
                         "Reloading client...".to_string(),
                     ));
-                    let session_id = app
-                        .remote_session_id
-                        .clone()
-                        .unwrap_or_else(|| crate::id::new_id("ses"));
+                    let session_id = app.reload_handoff_session_id();
                     app.save_input_for_reload(&session_id);
                     app.reload_requested = Some(session_id);
                     app.should_quit = true;
@@ -821,6 +857,23 @@ async fn handle_remote_key_internal(
                 if trimmed == "/server-reload" {
                     app.append_reload_message("Reloading server...");
                     remote.reload().await?;
+                    return Ok(());
+                }
+
+                if trimmed == "/continue" || trimmed == "/resumeall" || trimmed == "/resume-all" {
+                    app.push_display_message(DisplayMessage::system(
+                        "Continuing all interrupted sessions...".to_string(),
+                    ));
+                    match remote.resume_all_sessions().await {
+                        Ok(_) => app.set_status_notice("Continuing interrupted sessions..."),
+                        Err(error) => {
+                            app.push_display_message(DisplayMessage::error(format!(
+                                "Failed to continue sessions: {}",
+                                error
+                            )));
+                            app.set_status_notice("Continue all failed");
+                        }
+                    }
                     return Ok(());
                 }
 
@@ -834,11 +887,7 @@ async fn handle_remote_key_internal(
                 }
 
                 if trimmed == "/update" {
-                    let session_id = app
-                        .remote_session_id
-                        .clone()
-                        .unwrap_or_else(|| crate::id::new_id("ses"));
-                    app.start_background_client_update(session_id);
+                    handle_remote_update_command(app, remote).await?;
                     return Ok(());
                 }
 
@@ -1011,9 +1060,10 @@ async fn handle_remote_key_internal(
                         })
                         .collect();
                     app.push_display_message(DisplayMessage::system(format!(
-                        "Reasoning effort: {}\nAvailable: {}\nUse /effort <level> or Alt+Left / Alt+Right to change.",
+                        "Reasoning effort: {}\nAvailable: {}\nUse /effort <level> or {} to change.",
                         label,
-                        list.join(" · ")
+                        list.join(" · "),
+                        crate::tui::keybind::effort_switch_keys_label()
                     )));
                     return Ok(());
                 }
@@ -1580,6 +1630,7 @@ async fn handle_remote_key_internal(
 
                 if trimmed == "/resume" || trimmed == "/sessions" || trimmed == "/session" {
                     app.open_session_picker();
+                    app.hint_resume_shortcut();
                     return Ok(());
                 }
 
@@ -1727,29 +1778,41 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
-                if trimmed == "/commit" {
-                    let prompt = app_mod::commands::build_commit_prompt();
+                if trimmed == "/commit"
+                    || trimmed == "/commit-push"
+                    || trimmed == "/commit-and-push"
+                {
+                    let is_push = trimmed != "/commit";
+                    let prompt = if is_push {
+                        app_mod::commands::build_commit_push_prompt()
+                    } else {
+                        app_mod::commands::build_commit_prompt()
+                    };
+                    let launch_notice = |interrupted: bool| {
+                        if is_push {
+                            app_mod::commands::commit_push_launch_notice(interrupted)
+                        } else {
+                            app_mod::commands::commit_launch_notice(interrupted)
+                        }
+                    };
+                    let cmd_label = if is_push { "/commit-push" } else { "/commit" };
                     if app.is_processing {
-                        app.push_display_message(DisplayMessage::system(
-                            app_mod::commands::commit_launch_notice(true),
-                        ));
+                        app.push_display_message(DisplayMessage::system(launch_notice(true)));
                         match remote.soft_interrupt(prompt.clone(), false).await {
                             Ok(request_id) => {
                                 app.track_pending_soft_interrupt(request_id, prompt);
-                                app.set_status_notice("Interrupting for /commit...");
+                                app.set_status_notice(format!("Interrupting for {}...", cmd_label));
                             }
                             Err(error) => {
                                 app.push_display_message(DisplayMessage::error(format!(
-                                    "Failed to start /commit: {}",
-                                    error
+                                    "Failed to start {}: {}",
+                                    cmd_label, error
                                 )));
-                                app.set_status_notice("/commit failed");
+                                app.set_status_notice(format!("{} failed", cmd_label));
                             }
                         }
                     } else {
-                        app.push_display_message(DisplayMessage::system(
-                            app_mod::commands::commit_launch_notice(false),
-                        ));
+                        app.push_display_message(DisplayMessage::system(launch_notice(false)));
                         input_dispatch::begin_remote_send(
                             app,
                             remote,
@@ -1926,9 +1989,8 @@ async fn handle_remote_key_internal(
                         app.push_display_message(DisplayMessage::system(
                             app_mod::commands::plan_launch_notice(command.goal.as_deref(), false),
                         ));
-                        let _ =
-                            begin_remote_send(app, remote, prompt, vec![], true, None, true, 0)
-                                .await;
+                        let _ = begin_remote_send(app, remote, prompt, vec![], true, None, true, 0)
+                            .await;
                     }
                     return Ok(());
                 }

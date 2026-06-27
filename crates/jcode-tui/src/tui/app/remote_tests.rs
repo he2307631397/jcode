@@ -58,6 +58,91 @@ fn reload_handoff_active_when_server_flag_is_set() {
 }
 
 #[test]
+fn client_focus_defaults_to_true() {
+    let app = create_test_app();
+    assert!(
+        app.client_focused(),
+        "a freshly created client should start focused so terminals that never \
+         report focus events still animate/redraw normally"
+    );
+}
+
+#[test]
+fn idle_donut_pauses_while_unfocused() {
+    let mut app = create_test_app();
+
+    // Whether the donut runs while focused depends on the machine's perf tier
+    // and `display.idle_animation` config, so we do not assert the focused case
+    // absolutely. We only assert the invariant that matters for the swarm CPU
+    // regression: it must never run while the terminal is unfocused.
+    let redraw = app.set_client_focused(false);
+    assert!(
+        !redraw,
+        "losing focus should not request an immediate redraw"
+    );
+    assert!(!app.client_focused());
+    assert!(
+        !crate::tui::idle_donut_active(&app),
+        "idle animation must pause while the terminal is unfocused"
+    );
+
+    // Regaining focus requests a full repaint so the window is not stuck on the
+    // last paused frame.
+    let redraw = app.set_client_focused(true);
+    assert!(redraw, "regaining focus should request a redraw");
+    assert!(app.client_focused());
+}
+
+#[test]
+fn unfocused_redraw_warranted_tracks_live_activity() {
+    let mut app = create_test_app();
+    // `unfocused_redraw_warranted` is only consulted while unfocused, and the
+    // decorative donut is force-disabled when unfocused, so evaluate it in that
+    // state to mirror the run loop.
+    app.set_client_focused(false);
+
+    // Idle empty session: no live output to paint while unfocused.
+    assert!(
+        !app.unfocused_redraw_warranted(),
+        "an idle unfocused session has nothing changing worth a full-rate redraw"
+    );
+
+    // A streaming/processing session keeps painting even while unfocused so a
+    // visible-but-unfocused window in a tiling WM still shows live progress.
+    app.is_processing = true;
+    assert!(
+        app.unfocused_redraw_warranted(),
+        "a processing session should keep redrawing while unfocused"
+    );
+}
+
+#[test]
+fn client_interaction_restores_focus_so_scroll_redraws_at_full_rate() {
+    // Regression for the intermittent "can't scroll" bug. If a FocusGained is
+    // dropped (flaky under tiling WMs / multiplexers) the window can get stuck
+    // as "unfocused idle", which the run loop throttles to ~1 Hz. Any terminal
+    // input (key/mouse/scroll) is only delivered to the focused window, so it
+    // must restore the focused state and full-rate redraws immediately.
+    let mut app = create_test_app();
+
+    // Simulate a stuck-unfocused window (FocusLost seen, FocusGained dropped).
+    app.set_client_focused(false);
+    assert!(!app.client_focused());
+    assert!(
+        !app.unfocused_redraw_warranted(),
+        "an idle unfocused session is throttled to ~1 Hz redraws"
+    );
+
+    // A mouse-wheel / key event arrives: the terminal only routes input to the
+    // focused window, so interacting proves focus and must restore it.
+    app.note_client_interaction();
+    assert!(
+        app.client_focused(),
+        "interaction must restore focus so scrolling repaints at full rate"
+    );
+}
+
+#[test]
 fn auth_provider_hint_maps_openai_compatible_login_providers() {
     assert_eq!(
         auth_provider_hint_for_login_provider("Azure OpenAI"),
@@ -277,6 +362,148 @@ fn reload_wait_status_message_uses_waiting_language() {
 }
 
 #[test]
+fn submit_prepared_remote_input_defers_until_history_loads() {
+    // Regression for the intermittent "first prompt vanishes / weird render"
+    // bug: when a manual submit lands before the bootstrap History payload is
+    // applied, the History handler's `session_changed` branch calls
+    // `clear_display_messages()` and wipes the just-echoed user message. The
+    // submit path must hold the prompt until history loads instead of echoing
+    // and sending it into that race.
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = crate::tui::app::AppRuntimeMode::RemoteClient;
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    // History has NOT loaded yet (fresh connect window).
+    assert!(!remote.has_loaded_history());
+
+    let prepared = crate::tui::app::input::PreparedInput {
+        raw_input: "hi".to_string(),
+        expanded: "hi".to_string(),
+        images: vec![],
+    };
+    rt.block_on(crate::tui::app::remote::submit_prepared_remote_input(
+        &mut app,
+        &mut remote,
+        prepared,
+    ))
+    .expect("submit should not error while history is loading");
+
+    // The prompt must be held, not echoed or sent.
+    assert!(
+        !app.is_processing,
+        "submit must not begin a remote send before history loads"
+    );
+    assert!(
+        app.display_messages().iter().all(|m| m.role != "user"),
+        "user message must not be echoed before history loads (would be clobbered)"
+    );
+    let held = app
+        .pending_prompt_before_history
+        .as_ref()
+        .expect("prompt should be held until history loads");
+    assert_eq!(held.raw_input, "hi");
+
+    // Once history loads, the post-connect dispatcher fires the held prompt.
+    remote.mark_history_loaded();
+    rt.block_on(process_remote_followups(&mut app, &mut remote));
+
+    assert!(
+        app.pending_prompt_before_history.is_none(),
+        "held prompt should be consumed once history is loaded"
+    );
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|m| m.role == "user" && m.content == "hi"),
+        "the held prompt should be echoed as a user message after history loads"
+    );
+    assert!(
+        app.is_processing,
+        "the held prompt should be sent once history is loaded"
+    );
+}
+
+#[test]
+fn process_remote_followups_auto_submits_staged_startup_prompt() {
+    // Regression for issues #267/#268/#76: a headed swarm spawn stages its
+    // initial prompt into `app.input` with `submit_input_on_startup = true`
+    // (not `queued_messages`). The post-connect dispatcher must still submit it;
+    // otherwise the spawned agent shows its prompt but never sends it.
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.runtime_mode = crate::tui::app::AppRuntimeMode::RemoteClient;
+    app.input = "Classify the issues in /tmp/batch.txt".to_string();
+    app.cursor_pos = app.input.len();
+    app.submit_input_on_startup = true;
+
+    // The gate predicate is the actual fix site: a staged startup prompt counts
+    // as pending work even though no message was queued via `queued_messages`.
+    assert!(
+        !app.has_queued_followups(),
+        "a staged startup prompt is not a queued follow-up"
+    );
+    assert!(
+        app.has_pending_startup_submission(),
+        "staged startup prompt should be recognized as pending work so the \
+         post-connect dispatcher invokes process_remote_followups"
+    );
+
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    remote.mark_history_loaded();
+
+    rt.block_on(process_remote_followups(&mut app, &mut remote));
+
+    assert!(
+        !app.submit_input_on_startup,
+        "startup submission flag should be consumed after dispatch"
+    );
+    assert!(
+        app.input.is_empty(),
+        "input should be cleared once the startup prompt is submitted"
+    );
+    assert!(
+        app.display_messages()
+            .iter()
+            .any(|message| message.role == "user"
+                && message.content == "Classify the issues in /tmp/batch.txt"),
+        "submitting the startup prompt should record it as a user message"
+    );
+}
+
+#[test]
+fn has_pending_startup_submission_requires_input_and_flag() {
+    // Guards the predicate that gates post-connect startup dispatch.
+    let mut app = create_test_app();
+    assert!(!app.has_pending_startup_submission());
+
+    app.submit_input_on_startup = true;
+    assert!(
+        !app.has_pending_startup_submission(),
+        "flag alone with empty input is not a pending submission"
+    );
+
+    app.input = "   ".to_string();
+    assert!(
+        !app.has_pending_startup_submission(),
+        "whitespace-only input is not a pending submission"
+    );
+
+    app.input = "do the work".to_string();
+    assert!(app.has_pending_startup_submission());
+
+    app.submit_input_on_startup = false;
+    assert!(
+        !app.has_pending_startup_submission(),
+        "input without the auto-submit flag is just editor state, not pending"
+    );
+}
+
+#[test]
 fn process_remote_followups_auto_reloads_server_by_default() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().expect("runtime");
@@ -290,6 +517,37 @@ fn process_remote_followups_auto_reloads_server_by_default() {
     rt.block_on(process_remote_followups(&mut app, &mut remote));
 
     assert!(!app.pending_server_reload);
+    let last = app
+        .display_messages()
+        .last()
+        .expect("missing reload message");
+    assert_eq!(last.title.as_deref(), Some("Reload"));
+    assert!(last.content.contains("Reloading server with newer binary"));
+}
+
+#[test]
+fn process_remote_followups_reloads_server_even_before_history_loads() {
+    // Regression guard: when the server/client binaries differ, the History
+    // handler defers session state and sets `pending_server_reload = true`
+    // WITHOUT marking history as loaded. The reload must still fire; otherwise
+    // history stays unloaded forever and every typed prompt stalls on
+    // "Loading session..." until the user restarts.
+    let mut app = create_test_app();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let _guard = rt.enter();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    // Intentionally do NOT mark history loaded, mirroring the deferred path.
+    assert!(!remote.has_loaded_history());
+
+    app.pending_server_reload = true;
+    app.auto_server_reload = true;
+
+    rt.block_on(process_remote_followups(&mut app, &mut remote));
+
+    assert!(
+        !app.pending_server_reload,
+        "pending server reload should be consumed even while history is unloaded"
+    );
     let last = app
         .display_messages()
         .last()
@@ -335,11 +593,11 @@ fn process_remote_followups_pauses_auto_reload_after_repeated_attempts() {
         app.pending_server_reload = true;
         rt.block_on(process_remote_followups(&mut app, &mut remote));
         assert!(!app.pending_server_reload);
-        if let Some(last) = app.display_messages().last() {
-            if last.content.contains("auto-reload paused") {
-                paused = true;
-                break;
-            }
+        if let Some(last) = app.display_messages().last()
+            && last.content.contains("auto-reload paused")
+        {
+            paused = true;
+            break;
         }
     }
 
@@ -463,4 +721,121 @@ fn handle_server_event_applies_remote_memory_activity_snapshot() {
     assert!(activity.state_since.elapsed().as_millis() >= 100);
 
     crate::memory::clear_activity();
+}
+
+/// Reproduces the "stuck on loading session…" bug and verifies the watchdog
+/// recovers it: a remote connection that never receives the bootstrap History
+/// event (so `has_loaded_history()` stays false) must re-request `GetHistory`
+/// once it has waited past the recovery delay, instead of staying stuck forever.
+#[test]
+fn remote_history_watchdog_rerequests_history_when_stuck() {
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncBufReadExt;
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_session_id = Some("session_stuck".to_string());
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut line = String::new();
+    let (redraw, attempts) = rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        // The bug condition: history never loaded after (re)connect.
+        assert!(!remote.has_loaded_history());
+        let peer = remote
+            .take_dummy_peer()
+            .expect("dummy remote should retain peer stream");
+        let (reader, _writer) = peer.into_split();
+        let mut reader = tokio::io::BufReader::new(reader);
+
+        // First tick simply starts tracking the wait; no re-request yet.
+        let first = super::recover_stuck_remote_history(&mut app, &mut remote).await;
+        assert!(!first, "first observation should only arm the watchdog");
+        assert!(app.remote_history_wait_started.is_some());
+        assert_eq!(app.remote_history_recovery_attempts, 0);
+
+        // Simulate the connection having been stuck past the recovery delay.
+        app.remote_history_wait_started = Instant::now().checked_sub(Duration::from_secs(60));
+
+        let redraw = super::recover_stuck_remote_history(&mut app, &mut remote).await;
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("history re-request should be readable by peer");
+        (redraw, app.remote_history_recovery_attempts)
+    });
+
+    assert!(redraw, "re-requesting history should trigger a redraw");
+    assert_eq!(
+        attempts, 1,
+        "watchdog should have re-requested history once"
+    );
+    assert!(matches!(
+        serde_json::from_str::<crate::protocol::Request>(&line)
+            .expect("history re-request should deserialize"),
+        crate::protocol::Request::GetHistory { .. }
+    ));
+}
+
+/// Once history loads, the watchdog must clear its budget and do nothing.
+#[test]
+fn remote_history_watchdog_clears_budget_once_history_loads() {
+    use std::time::{Duration, Instant};
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_history_wait_started = Instant::now().checked_sub(Duration::from_secs(60));
+    app.remote_history_recovery_attempts = 2;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let redraw = rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        remote.mark_history_loaded();
+        super::recover_stuck_remote_history(&mut app, &mut remote).await
+    });
+
+    assert!(!redraw);
+    assert!(app.remote_history_wait_started.is_none());
+    assert_eq!(app.remote_history_recovery_attempts, 0);
+    assert!(app.remote_history_recovery_last_attempt.is_none());
+}
+
+/// After exhausting re-requests the watchdog surfaces an actionable `/restart`
+/// hint exactly once instead of silently leaving the user stuck.
+#[test]
+fn remote_history_watchdog_advises_restart_after_giving_up() {
+    use std::time::{Duration, Instant};
+
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_history_wait_started = Instant::now().checked_sub(Duration::from_secs(60));
+    app.remote_history_recovery_attempts = super::REMOTE_HISTORY_RECOVERY_MAX_ATTEMPTS;
+    app.remote_history_recovery_last_attempt = Some(Instant::now());
+
+    let before = app.display_messages().len();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let redraw = rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        super::recover_stuck_remote_history(&mut app, &mut remote).await
+    });
+
+    assert!(redraw);
+    let messages = app.display_messages();
+    assert_eq!(messages.len(), before + 1, "should add exactly one hint");
+    assert!(
+        messages.last().unwrap().content.contains("/restart"),
+        "hint should advise /restart: {}",
+        messages.last().unwrap().content
+    );
+    // last_attempt cleared so the hint is not repeated every tick.
+    assert!(app.remote_history_recovery_last_attempt.is_none());
+
+    // A subsequent tick must not add another hint.
+    let rt2 = tokio::runtime::Runtime::new().unwrap();
+    let redraw2 = rt2.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        super::recover_stuck_remote_history(&mut app, &mut remote).await
+    });
+    assert!(!redraw2);
+    assert_eq!(app.display_messages().len(), before + 1);
 }

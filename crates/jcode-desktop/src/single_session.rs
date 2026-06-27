@@ -166,6 +166,18 @@ const DESKTOP_SLASH_COMMANDS: &[(&str, &str)] = &[
         "compact context or set compaction mode",
     ),
     ("/rename <title|--clear>", "rename the current session"),
+    ("/usage", "desktop parity notice for TUI usage overlay"),
+    ("/todo", "desktop parity notice for TUI todo panel"),
+    ("/todos", "alias for /todo"),
+    ("/memory", "desktop parity notice for TUI memory panel"),
+    (
+        "/changelog",
+        "desktop parity notice for TUI changelog overlay",
+    ),
+    ("/diff", "desktop parity notice for TUI diff viewer"),
+    ("/account", "desktop parity notice for TUI account picker"),
+    ("/swarm", "desktop parity notice for TUI swarm panel"),
+    ("/bg", "desktop parity notice for TUI background task panel"),
     (
         "/copy [latest|code|transcript]",
         "copy latest response, latest code block, or transcript",
@@ -274,6 +286,10 @@ pub(crate) struct SingleSessionApp {
     view: SingleSessionViewState,
     side_panel: DesktopSidePanelState,
     pending_issue_sync_request: bool,
+    /// Session id whose transcript should be hydrated from disk off the UI
+    /// thread. Set when resuming from the session switcher; serviced by the
+    /// event loop so large transcript parses never stall key handling.
+    pending_transcript_hydration: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -596,10 +612,21 @@ impl SingleSessionWelcomeState {
     fn new(has_session: bool) -> Self {
         let name = desktop_welcome_name();
         let hero_phrase_index = welcome_phrase_index(&name);
+        // The continuation suggestion is only rendered on the fresh welcome
+        // screen (when there is no session). Scanning external CLI history
+        // (`~/.codex`, `~/.claude`) is expensive, so skip it entirely when a
+        // session is present. This keeps workspace pane construction cheap,
+        // which matters because workspace rendering builds one ephemeral
+        // `SingleSessionApp` per visible surface every frame.
+        let continuation_suggestion = if has_session {
+            None
+        } else {
+            latest_external_cli_continuation_suggestion()
+        };
         Self {
             name,
             recovery_session_count: 0,
-            continuation_suggestion: latest_external_cli_continuation_suggestion(),
+            continuation_suggestion,
             timeline: !has_session,
             hero_phrase_index,
         }
@@ -977,7 +1004,9 @@ impl InlineWidgetKind {
     pub(crate) fn visible_line_limit(self) -> usize {
         match self {
             Self::HotkeyHelp => 18,
-            Self::SessionInfo => 10,
+            // Compact type fits the whole panel including the closing rail
+            // corner; truncating mid-panel leaves the box-drawing rail open.
+            Self::SessionInfo => 18,
             Self::ModelPicker => usize::MAX,
             Self::SessionSwitcher => 24,
             Self::SlashSuggestions => DESKTOP_SLASH_SUGGESTION_ROW_LIMIT + 1,
@@ -1812,6 +1841,7 @@ impl SingleSessionApp {
             view: SingleSessionViewState::default(),
             side_panel: DesktopSidePanelState::default(),
             pending_issue_sync_request: false,
+            pending_transcript_hydration: None,
         }
     }
 
@@ -2546,6 +2576,18 @@ impl SingleSessionApp {
         }
     }
 
+    /// Fast-forward entry/exit animations so captures render the settled
+    /// frame instead of a mid-reveal state. Used by the headless gallery
+    /// screenshot tool.
+    pub(crate) fn settle_animations_for_capture(&mut self) {
+        if let Some(opened_at) = &mut self.view.inline_widget_opened_at {
+            *opened_at = Instant::now() - INLINE_WIDGET_REVEAL_DURATION * 2;
+        }
+        if let Some(closing) = &mut self.view.closing_inline_widget {
+            closing.started_at = Instant::now() - INLINE_WIDGET_EXIT_DURATION * 2;
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn activity_indicator_active(&self) -> bool {
         self.has_activity_indicator()
@@ -2559,6 +2601,13 @@ impl SingleSessionApp {
                 .status_kind
                 .as_ref()
                 .is_some_and(SingleSessionStatus::is_in_flight)
+    }
+
+    /// The standalone activity pill only shows while waiting for the first
+    /// streamed token. Once text flows, the streaming tail cursor takes over
+    /// as the "alive" cue at the end of the revealed text.
+    pub(crate) fn streaming_activity_pill_visible(&self) -> bool {
+        self.has_activity_indicator() && self.streaming_response.is_empty()
     }
 
     fn set_status(&mut self, status: SingleSessionStatus) {
@@ -2665,6 +2714,8 @@ impl SingleSessionApp {
 
         match key {
             KeyInput::SpawnPanel => KeyOutcome::SpawnSession,
+            KeyInput::SpawnSelfDevSession => KeyOutcome::SpawnSelfDevSession,
+            KeyInput::SpawnHomeSession => KeyOutcome::SpawnHomeSession,
             KeyInput::OpenSessionSwitcher => self.open_session_switcher(),
             KeyInput::OpenModelPicker => self.open_model_picker(),
             KeyInput::HotkeyHelp => {
@@ -3506,6 +3557,16 @@ impl SingleSessionApp {
                 self.session_switcher.close();
                 KeyOutcome::SpawnSession
             }
+            KeyInput::SpawnSelfDevSession => {
+                self.capture_inline_widget_exit();
+                self.session_switcher.close();
+                KeyOutcome::SpawnSelfDevSession
+            }
+            KeyInput::SpawnHomeSession => {
+                self.capture_inline_widget_exit();
+                self.session_switcher.close();
+                KeyOutcome::SpawnHomeSession
+            }
             _ => KeyOutcome::None,
         }
     }
@@ -3550,9 +3611,48 @@ impl SingleSessionApp {
         self.show_help = false;
         self.welcome.timeline = false;
         self.session_switcher.close();
-        self.hydrate_resumed_session_from_disk(&session_id);
+        // Card previews (if any) are applied synchronously above via
+        // replace-session state; the full transcript can be large, so defer
+        // the disk parse to the event loop instead of blocking this key.
+        self.pending_transcript_hydration = Some(session_id.clone());
         self.set_status(SingleSessionStatus::Info(format!("resumed {title}")));
         KeyOutcome::Redraw
+    }
+
+    /// Take the session id queued for off-thread transcript hydration.
+    pub(crate) fn take_pending_transcript_hydration(&mut self) -> Option<String> {
+        self.pending_transcript_hydration.take()
+    }
+
+    /// Queue a transcript hydration to be serviced off the UI thread.
+    pub(crate) fn request_transcript_hydration(&mut self, session_id: &str) {
+        self.pending_transcript_hydration = Some(session_id.to_string());
+    }
+
+    /// Apply a transcript loaded off the UI thread, if it still matches the
+    /// live session. Returns true when the transcript was applied.
+    pub(crate) fn apply_hydrated_transcript(
+        &mut self,
+        session_id: &str,
+        result: Result<Option<Vec<SessionTranscriptMessage>>, String>,
+    ) -> bool {
+        if self.live_session_id.as_deref() != Some(session_id) {
+            return false;
+        }
+        match result {
+            Ok(Some(messages)) if !messages.is_empty() => {
+                self.apply_resumed_session_transcript(messages);
+                true
+            }
+            Ok(_) => false,
+            Err(error) => {
+                crate::desktop_log::warn(format_args!(
+                    "jcode-desktop: failed to hydrate resumed transcript for {session_id}: {error}"
+                ));
+                self.error = Some(format!("failed to load transcript: {error}"));
+                false
+            }
+        }
     }
 
     fn handle_stdin_response_key(&mut self, key: KeyInput) -> KeyOutcome {
@@ -3867,9 +3967,24 @@ impl SingleSessionApp {
     }
 
     pub(crate) fn streaming_response_styled_lines(&self) -> Vec<SingleSessionStyledLine> {
+        self.streaming_response_revealed_styled_lines(self.streaming_response.len())
+    }
+
+    /// Styled lines for the first `revealed_bytes` of the streaming response.
+    /// Drives the adaptive streaming reveal: the renderer grows the visible
+    /// prefix smoothly instead of popping whole provider chunks in at once.
+    pub(crate) fn streaming_response_revealed_styled_lines(
+        &self,
+        revealed_bytes: usize,
+    ) -> Vec<SingleSessionStyledLine> {
+        let mut end = revealed_bytes.min(self.streaming_response.len());
+        while end > 0 && !self.streaming_response.is_char_boundary(end) {
+            end -= 1;
+        }
+        let revealed = self.streaming_response[..end].trim_end();
         let mut lines = Vec::new();
-        if !self.streaming_response.is_empty() {
-            append_streaming_assistant_lines(&mut lines, self.streaming_response.trim_end());
+        if !revealed.is_empty() {
+            append_streaming_assistant_lines(&mut lines, revealed);
         }
         lines
     }
@@ -4932,6 +5047,78 @@ impl SingleSessionApp {
                     KeyOutcome::RenameSession(Some(args.to_string()))
                 }
             }
+            "/usage" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                let usage = self.runtime_settings.token_usage.as_ref();
+                let message = usage
+                    .map(|usage| {
+                        format!(
+                            "desktop /usage overlay is not implemented yet · latest tokens: input={} output={}",
+                            usage.input, usage.output
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        "desktop /usage overlay is not implemented yet · no token usage received for this session".to_string()
+                    });
+                self.set_status(SingleSessionStatus::Info(message));
+                KeyOutcome::Redraw
+            }
+            "/todo" | "/todos" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop todo panel is not implemented yet · todo tool output is shown in transcript".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/memory" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop memory panel is not implemented yet · memory server events are not surfaced".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/changelog" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop changelog overlay is not implemented yet".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/diff" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop diff viewer is not implemented yet".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/account" | "/auth" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(
+                    "desktop account picker is not implemented yet · use the TUI for account management".to_string(),
+                ));
+                KeyOutcome::Redraw
+            }
+            "/swarm" | "/bg" => {
+                self.draft.clear();
+                self.draft_cursor = 0;
+                self.composer.input_undo_stack.clear();
+                self.set_status(SingleSessionStatus::Info(format!(
+                    "desktop {command} panel is not implemented yet · related tool output is shown in transcript"
+                )));
+                KeyOutcome::Redraw
+            }
             "/copy" => {
                 self.draft.clear();
                 self.draft_cursor = 0;
@@ -5951,7 +6138,20 @@ struct ExternalCliSessionCandidate {
     context: Option<String>,
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(crate) static EXTERNAL_CLI_SCAN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn latest_external_cli_continuation_suggestion() -> Option<String> {
+    #[cfg(test)]
+    EXTERNAL_CLI_SCAN_CALLS.with(|calls| calls.set(calls.get() + 1));
+    // Tests must stay hermetic: scanning the real ~/.codex/~/.claude history makes
+    // the welcome-hint layout depend on the developer's machine state and breaks
+    // deterministic rendering assertions. Skip the scan under test.
+    if cfg!(test) {
+        return None;
+    }
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     std::panic::catch_unwind(AssertUnwindSafe(|| {
         latest_external_cli_continuation_suggestion_from_home(&home)
@@ -6010,7 +6210,7 @@ fn latest_jsonl_candidates(
     }
     let mut files = Vec::new();
     collect_recent_jsonl_files(root, &mut files, scan_limit.saturating_mul(8));
-    files.sort_by(|a, b| b.1.cmp(&a.1));
+    files.sort_by_key(|file| std::cmp::Reverse(file.1));
     files.truncate(scan_limit);
     files
         .into_iter()
@@ -6225,29 +6425,27 @@ fn session_switcher_styled_lines(
     } else {
         format!("filter {}", switcher.filter.trim())
     };
-    let selected_label = switcher
-        .selected_session()
-        .map(|session| compact_tool_text(&session.title, 44))
-        .unwrap_or_else(|| "no session selected".to_string());
     let mut lines = vec![
         styled_line(
             format!("Resume sessions · {session_count} sessions · {filter_label}"),
             SingleSessionLineStyle::OverlayTitle,
         ),
         styled_line(
-            "Type to filter · Up/Down select · Tab or Left/Right preview · PageUp/PageDown scroll · Enter resume here · Ctrl+Enter open terminal · Esc close",
+            "type filter · ↑/↓ · Tab preview · Enter resume · Esc",
             SingleSessionLineStyle::Overlay,
         ),
         styled_line(
+            // Kept to one short line: the selected row is already highlighted
+            // in the list, and long header text wraps inside the narrow rail
+            // and pushes the session rows out of the visible card.
             format!(
-                "selected: {} · filter: {} · focus: {}",
-                selected_label,
-                if switcher.filter.is_empty() {
-                    "<none>"
-                } else {
-                    switcher.filter.as_str()
-                },
+                "focus: {}{}",
                 session_switcher_focus_label(switcher.focus),
+                if switcher.filter.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · filter: {}", switcher.filter.as_str())
+                },
             ),
             SingleSessionLineStyle::Meta,
         ),
@@ -6752,12 +6950,12 @@ fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSession
             SingleSessionLineStyle::Overlay,
         ),
         styled_line(
-            format!("│ status       {}", compact_tool_text(status, 92)),
+            format!(
+                "│ status       {} · model {}",
+                compact_tool_text(status, 46),
+                compact_tool_text(&model, 40)
+            ),
             SingleSessionLineStyle::Status,
-        ),
-        styled_line(
-            format!("│ model        {}", compact_tool_text(&model, 92)),
-            SingleSessionLineStyle::Overlay,
         ),
         styled_line(
             format!(
@@ -6810,10 +7008,6 @@ fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSession
             ),
             SingleSessionLineStyle::Overlay,
         ),
-        styled_line(
-            "│ tokens       not yet emitted by desktop stream; showing local transcript stats instead",
-            SingleSessionLineStyle::Meta,
-        ),
     ];
 
     if let Some(session) = &app.session {
@@ -6849,7 +7043,7 @@ fn session_info_inline_styled_lines(app: &SingleSessionApp) -> Vec<SingleSession
 }
 
 fn session_info_inline_line_count(app: &SingleSessionApp) -> usize {
-    12 + usize::from(
+    10 + usize::from(
         app.session
             .as_ref()
             .is_some_and(|session| !session.subtitle.trim().is_empty()),
@@ -6892,16 +7086,18 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
     } else {
         format!("filter \"{}\"", truncate_chars(picker.filter.trim(), 28))
     };
+    let current_label = model_picker_current_label(
+        picker.provider_name.as_deref(),
+        picker.current_model.as_deref(),
+    );
     let mut lines = vec![
         styled_line(
-            format!(
-                "Choose model  ·  current {}",
-                model_picker_current_label(
-                    picker.provider_name.as_deref(),
-                    picker.current_model.as_deref(),
-                )
-            ),
+            "Choose model".to_string(),
             SingleSessionLineStyle::OverlayTitle,
+        ),
+        styled_line(
+            format!("Current  {current_label}"),
+            SingleSessionLineStyle::Overlay,
         ),
         styled_line(
             format!("{filter}  ·  {count}"),
@@ -6935,7 +7131,6 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
         return lines;
     }
 
-    let current = picker.current_model.as_deref();
     let (window_start, window) = picker.visible_row_window(MODEL_PICKER_INLINE_ROW_LIMIT);
     for (row_offset, index) in window.iter().enumerate() {
         let Some(choice) = picker.choices.get(*index) else {
@@ -6944,11 +7139,6 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
         let visible_position = window_start + row_offset;
         let provider = choice.provider.as_deref().unwrap_or("auto");
         let method = choice.api_method.as_deref().unwrap_or("auto");
-        let current_badge = if Some(choice.model.as_str()) == current {
-            "  Current"
-        } else {
-            ""
-        };
         let availability = if choice.available {
             "available"
         } else {
@@ -6965,19 +7155,15 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
             SingleSessionLineStyle::Overlay
         };
         lines.push(styled_line(
-            format!(
-                "     {}{}",
-                truncate_chars(&choice.model, 49),
-                current_badge,
-            ),
+            format!("       {}", truncate_chars(&choice.model, 46)),
             row_style,
         ));
         lines.push(styled_line(
             format!(
                 "       {} · {} · {}",
-                truncate_chars(provider, 22),
-                truncate_chars(method, 18),
-                truncate_chars(detail, 42),
+                truncate_chars(provider, 18),
+                truncate_chars(method, 16),
+                truncate_chars(detail, 24),
             ),
             SingleSessionLineStyle::Meta,
         ));
@@ -7003,7 +7189,7 @@ fn model_picker_inline_styled_lines(picker: &ModelPickerState) -> Vec<SingleSess
 
 fn model_picker_inline_line_count(picker: &ModelPickerState) -> usize {
     let visible_len = picker.filtered_indices().len();
-    let mut count = 2;
+    let mut count = 3;
     if picker.loading {
         count += 1;
     }
@@ -7301,7 +7487,7 @@ const SINGLE_SESSION_HELP_SECTIONS: &[HelpSection] = &[
             ("Ctrl+Up", "pull latest queued prompt back into the input"),
             ("PageUp/PageDown", "scroll transcript"),
             ("Ctrl+Home/End", "jump transcript to top/bottom"),
-            ("Super+K/J", "scroll transcript by one line"),
+            ("Super+K/J", "jump between user prompts"),
             ("Alt+Up/Down", "jump between user prompts"),
             ("Ctrl+[/]", "jump between user prompts"),
             ("Mouse wheel", "scroll transcript"),
@@ -7313,7 +7499,7 @@ const SINGLE_SESSION_HELP_SECTIONS: &[HelpSection] = &[
             ("Ctrl+A/E", "start/end of line"),
             ("Ctrl+U/K", "delete to line start/end"),
             ("Ctrl+W/Ctrl+Backspace", "delete previous word"),
-            ("Alt+Backspace", "delete previous word, terminal-style"),
+            ("Alt/Super+Backspace", "delete previous word"),
             ("Ctrl+←/→, Ctrl+B/F", "move by word"),
             ("Alt+B/F", "move by word, terminal-style"),
             ("Alt+D", "delete next word"),
@@ -7327,6 +7513,8 @@ const SINGLE_SESSION_HELP_SECTIONS: &[HelpSection] = &[
         title: "window",
         shortcuts: &[
             ("Ctrl+;", "reset/spawn fresh desktop session"),
+            ("Super+;", "spawn a self-dev jcode session"),
+            ("Super+'", "spawn a jcode session in home"),
             ("Ctrl+R", "reload sessions/models while a picker is open"),
             ("Ctrl+?", "toggle this help"),
             ("q", "close help or session info"),
@@ -9326,6 +9514,40 @@ mod tests {
             app.render_inline_widget_line_count(),
             app.render_inline_widget_styled_lines().len(),
             "render line count should match styled-line rendering"
+        );
+    }
+
+    #[test]
+    fn session_backed_app_skips_external_cli_scan() {
+        // Constructing an app for a workspace surface (session present) must not
+        // walk external CLI history: workspace rendering builds one ephemeral
+        // app per visible surface every frame, so this scan would be hot.
+        let card = workspace::SessionCard {
+            session_id: "scan-guard".to_string(),
+            title: "scan guard".to_string(),
+            subtitle: String::new(),
+            detail: String::new(),
+            preview_lines: Vec::new(),
+            detail_lines: Vec::new(),
+            transcript_messages: Vec::new(),
+        };
+
+        let before = EXTERNAL_CLI_SCAN_CALLS.with(|calls| calls.get());
+        let _app = SingleSessionApp::new(Some(card));
+        let after_session = EXTERNAL_CLI_SCAN_CALLS.with(|calls| calls.get());
+        assert_eq!(
+            after_session, before,
+            "session-backed app construction must not scan external CLI history"
+        );
+
+        // The fresh welcome (no session) still performs the scan so the
+        // continuation suggestion can be rendered.
+        let _fresh = SingleSessionApp::new(None);
+        let after_fresh = EXTERNAL_CLI_SCAN_CALLS.with(|calls| calls.get());
+        assert_eq!(
+            after_fresh,
+            after_session + 1,
+            "fresh welcome construction should perform exactly one external CLI scan"
         );
     }
 

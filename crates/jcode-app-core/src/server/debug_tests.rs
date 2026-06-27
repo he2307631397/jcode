@@ -128,6 +128,7 @@ mod transcript_routing_tests {
             joined_at: now,
             last_status_change: now,
             is_headless: false,
+            output_tail: None,
         }
     }
 
@@ -145,6 +146,7 @@ mod transcript_routing_tests {
             last_seen,
             is_processing: false,
             current_tool_name: None,
+            terminal_env: Vec::new(),
             disconnect_tx: mpsc::unbounded_channel().0,
         }
     }

@@ -1,37 +1,12 @@
 #![cfg_attr(
     test,
-    allow(
-        clippy::bind_instead_of_map,
-        clippy::clone_on_copy,
-        clippy::collapsible_if,
-        clippy::if_same_then_else,
-        clippy::implicit_saturating_sub,
+    expect(
         clippy::items_after_test_module,
-        clippy::large_enum_variant,
         clippy::let_and_return,
-        clippy::manual_abs_diff,
-        clippy::manual_div_ceil,
-        clippy::manual_find,
-        clippy::manual_is_multiple_of,
-        clippy::manual_pattern_char_comparison,
-        clippy::manual_repeat_n,
-        clippy::manual_strip,
-        clippy::map_entry,
         clippy::missing_const_for_thread_local,
         clippy::needless_borrow,
-        clippy::needless_borrows_for_generic_args,
-        clippy::needless_lifetimes,
-        clippy::needless_range_loop,
         clippy::needless_return,
-        clippy::question_mark,
-        clippy::redundant_closure,
-        clippy::too_many_arguments,
-        clippy::type_complexity,
-        clippy::unnecessary_cast,
-        clippy::unnecessary_lazy_evaluations,
-        clippy::unnecessary_map_or,
-        clippy::unwrap_or_default,
-        clippy::while_let_loop
+        clippy::too_many_arguments
     )
 )]
 
@@ -76,6 +51,8 @@ mod file_diff_ui;
 mod frame_metrics;
 #[path = "ui_header.rs"]
 mod header;
+#[path = "ui_inline_image.rs"]
+pub(crate) mod inline_image_ui;
 #[path = "ui_inline_interactive.rs"]
 mod inline_interactive_ui;
 #[path = "ui_inline.rs"]
@@ -96,6 +73,10 @@ mod overlays;
 mod pinned_ui;
 #[path = "ui_prepare.rs"]
 mod prepare;
+#[path = "ui_smoothness.rs"]
+mod smoothness;
+#[path = "ui_todo_changes.rs"]
+mod todo_changes;
 #[path = "ui_tools.rs"]
 pub(crate) mod tools_ui;
 #[path = "ui_transitions.rs"]
@@ -115,6 +96,7 @@ use changelog::get_grouped_changelog;
 use changelog::{ChangelogEntry, group_changelog_entries, parse_changelog_from};
 use debug_capture::{
     build_info_widget_summary, capture_widget_placements, rect_within_bounds, rects_overlap,
+    widget_overlaps_content,
 };
 pub use diagram_pane::{
     PinnedDiagramLiveDebugSnapshot, PinnedDiagramProbeRect, debug_probe_pinned_diagram,
@@ -148,8 +130,8 @@ use memory_ui::{group_into_tiles, render_memory_tiles, split_by_display_width};
 use messages::get_cached_message_lines;
 #[cfg_attr(test, allow(unused_imports))]
 pub(crate) use messages::{
-    render_assistant_message, render_background_task_message, render_swarm_message,
-    render_system_message, render_tool_message, render_usage_message,
+    render_assistant_message, render_background_task_message, render_reasoning_message,
+    render_swarm_message, render_system_message, render_tool_message, render_usage_message,
 };
 pub use pinned_ui::{
     SidePanelDebugStats, SidePanelMermaidProbe, SidePanelMermaidProbeRect,
@@ -172,7 +154,7 @@ use viewport::draw_messages;
 #[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use viewport::{
-    copy_badge_reserved_width, reserve_copy_badge_margins,
+    copy_badge_reserved_width, expand_badge_reserved_width, reserve_copy_badge_margins,
     truncate_line_in_place_to_width as truncate_copy_badge_line_to_width,
 };
 /// Last known max scroll value from the renderer. Updated each frame.
@@ -180,14 +162,39 @@ pub(crate) use viewport::{
 #[cfg(not(test))]
 static LAST_MAX_SCROLL: AtomicUsize = AtomicUsize::new(0);
 /// Whether the chat viewport used a native scrollbar in the most recent frame.
+///
+/// Initialized to `1` (assume visible) so the very first frame of a freshly
+/// resumed/loaded session prepares the narrow (scrollbar-reserved) width FIRST.
+/// Because narrow wraps at least as much as wide, an overflowing transcript is
+/// detected on that single narrow build and kept, avoiding a wasted wide build
+/// (~seconds on a long transcript) that would otherwise be discarded. Short
+/// transcripts that fit still fall through to a (cheap) second wide build, and
+/// the real decision is written back every frame, so steady state is unaffected.
 #[cfg(not(test))]
-static LAST_CHAT_SCROLLBAR_VISIBLE: AtomicUsize = AtomicUsize::new(0);
+static LAST_CHAT_SCROLLBAR_VISIBLE: AtomicUsize = AtomicUsize::new(1);
 /// Total line count in the pinned diff/content pane (set during render).
 #[cfg(not(test))]
 static PINNED_PANE_TOTAL_LINES: AtomicUsize = AtomicUsize::new(0);
 /// Effective scroll position of the side pane after render-time clamping.
 #[cfg(not(test))]
 static LAST_DIFF_PANE_EFFECTIVE_SCROLL: AtomicUsize = AtomicUsize::new(0);
+/// Total wrapped line count of the chat transcript on the most recent frame.
+/// Used together with `LAST_RESOLVED_CHAT_SCROLL` to anchor the viewport when
+/// older compacted history is loaded in (so the content under the reader stays
+/// put instead of teleporting to the new absolute top).
+#[cfg(not(test))]
+static LAST_TOTAL_WRAPPED_LINES: AtomicUsize = AtomicUsize::new(0);
+/// The chat scroll offset the renderer actually used on the most recent frame
+/// (after clamping and after resolving any pending history anchor). Scroll
+/// handlers adopt this so manual scrolling resumes from the on-screen position.
+#[cfg(not(test))]
+static LAST_RESOLVED_CHAT_SCROLL: AtomicUsize = AtomicUsize::new(0);
+/// Whether the tail-follow viewport is mid catch-up slide (a large content
+/// append is being scrolled into view over several frames instead of jumping).
+/// Drives the redraw loop so the slide completes promptly.
+#[cfg(not(test))]
+static TAIL_CATCHUP_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Wrapped line indices where each user prompt starts (updated each render frame).
 /// Used by prompt-jump keybindings (Ctrl+5..9, Ctrl+[/]) for accurate positioning.
 #[cfg(not(test))]
@@ -199,6 +206,9 @@ thread_local! {
     static TEST_LAST_CHAT_SCROLLBAR_VISIBLE: Cell<bool> = const { Cell::new(false) };
     static TEST_PINNED_PANE_TOTAL_LINES: Cell<usize> = const { Cell::new(0) };
     static TEST_LAST_DIFF_PANE_EFFECTIVE_SCROLL: Cell<usize> = const { Cell::new(0) };
+    static TEST_LAST_TOTAL_WRAPPED_LINES: Cell<usize> = const { Cell::new(0) };
+    static TEST_LAST_RESOLVED_CHAT_SCROLL: Cell<usize> = const { Cell::new(0) };
+    static TEST_TAIL_CATCHUP_ACTIVE: Cell<bool> = const { Cell::new(false) };
     static TEST_LAST_USER_PROMPT_POSITIONS: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     static TEST_LAST_LAYOUT: RefCell<Option<LayoutSnapshot>> = const { RefCell::new(None) };
     static TEST_LAST_STATUS_AREA: RefCell<Option<Rect>> = const { RefCell::new(None) };
@@ -345,6 +355,81 @@ pub(crate) fn set_last_diff_pane_effective_scroll(value: usize) {
     }
 }
 
+/// Total wrapped line count of the chat transcript on the most recent frame.
+/// Returns 0 if no frame has been rendered yet.
+pub fn last_total_wrapped_lines() -> usize {
+    #[cfg(test)]
+    {
+        return TEST_LAST_TOTAL_WRAPPED_LINES.with(Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        LAST_TOTAL_WRAPPED_LINES.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn set_last_total_wrapped_lines(value: usize) {
+    #[cfg(test)]
+    {
+        TEST_LAST_TOTAL_WRAPPED_LINES.with(|cell| cell.set(value));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        LAST_TOTAL_WRAPPED_LINES.store(value, Ordering::Relaxed);
+    }
+}
+
+/// The chat scroll offset the renderer actually used on the most recent frame
+/// (after clamping and after resolving any pending history anchor).
+pub fn last_resolved_chat_scroll() -> usize {
+    #[cfg(test)]
+    {
+        return TEST_LAST_RESOLVED_CHAT_SCROLL.with(Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        LAST_RESOLVED_CHAT_SCROLL.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn set_last_resolved_chat_scroll(value: usize) {
+    #[cfg(test)]
+    {
+        TEST_LAST_RESOLVED_CHAT_SCROLL.with(|cell| cell.set(value));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        LAST_RESOLVED_CHAT_SCROLL.store(value, Ordering::Relaxed);
+    }
+}
+
+/// Whether the tail-follow viewport is still sliding toward the bottom after a
+/// large append. The redraw loop keeps animation cadence while this is set.
+pub(crate) fn tail_catchup_active() -> bool {
+    #[cfg(test)]
+    {
+        return TEST_TAIL_CATCHUP_ACTIVE.with(Cell::get);
+    }
+    #[cfg(not(test))]
+    {
+        TAIL_CATCHUP_ACTIVE.load(Ordering::Relaxed)
+    }
+}
+
+pub(crate) fn set_tail_catchup_active(active: bool) {
+    #[cfg(test)]
+    {
+        TEST_TAIL_CATCHUP_ACTIVE.with(|cell| cell.set(active));
+        return;
+    }
+    #[cfg(not(test))]
+    {
+        TAIL_CATCHUP_ACTIVE.store(active, Ordering::Relaxed);
+    }
+}
+
 pub(super) fn hash_text_for_cache(text: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     text.hash(&mut hasher);
@@ -378,8 +463,8 @@ use theme_support::{
 
 pub(crate) use jcode_tui_markdown::{CopyTargetKind, RawCopyTarget};
 pub(crate) use jcode_tui_messages::{
-    CopyTarget, EditToolRange, ImageRegion, PreparedChatFrame, PreparedMessages, PreparedSection,
-    PreparedSectionKind, WrappedLineMap,
+    CopyTarget, EditToolRange, ImageRegion, MessageBoundary, PreparedChatFrame, PreparedMessages,
+    PreparedSection, PreparedSectionKind, WrappedLineMap,
 };
 
 #[derive(Clone, Debug)]
@@ -716,6 +801,18 @@ struct BodyCacheKey {
     messages_version: u64,
     diagram_mode: crate::config::DiagramDisplayMode,
     centered: bool,
+    /// Whether inline images render at all (Alt+M hides them).
+    pin_images: bool,
+    /// Whether inline images render expanded or as collapsed label stubs
+    /// (Alt+Shift+I toggles; persisted).
+    inline_images_visible: bool,
+    /// Signature of the inline image set; anchored images render inside the
+    /// body, so the body must rebuild when images arrive or change.
+    images_signature: (usize, u64),
+    /// Monotonic per-image expand-level version. Anchored images embed their
+    /// expand-level geometry into the body, so a level change must rebuild the
+    /// body exactly like an image-set change does.
+    expanded_images_version: u64,
 }
 
 #[derive(Clone)]
@@ -773,18 +870,24 @@ impl BodyCacheState {
     fn best_incremental_base(
         &self,
         key: &BodyCacheKey,
-        msg_count: usize,
+        _msg_count: usize,
     ) -> Option<(Arc<PreparedMessages>, usize)> {
         let regular = self
             .entries
             .iter()
             .filter(|entry| {
                 entry.msg_count > 0
-                    && msg_count > entry.msg_count
                     && entry.key.width == key.width
                     && entry.key.diff_mode == key.diff_mode
                     && entry.key.diagram_mode == key.diagram_mode
                     && entry.key.centered == key.centered
+                    // Anchored inline images render inside the body, and a
+                    // late-arriving image may target an already-prepared
+                    // message; only reuse bases built with the same image set.
+                    && entry.key.pin_images == key.pin_images
+                    && entry.key.inline_images_visible == key.inline_images_visible
+                    && entry.key.images_signature == key.images_signature
+                    && entry.key.expanded_images_version == key.expanded_images_version
             })
             .max_by_key(|entry| entry.msg_count)
             .map(|entry| (entry.prepared.clone(), entry.msg_count));
@@ -793,11 +896,17 @@ impl BodyCacheState {
             .iter()
             .filter(|entry| {
                 entry.msg_count > 0
-                    && msg_count > entry.msg_count
                     && entry.key.width == key.width
                     && entry.key.diff_mode == key.diff_mode
                     && entry.key.diagram_mode == key.diagram_mode
                     && entry.key.centered == key.centered
+                    // Anchored inline images render inside the body, and a
+                    // late-arriving image may target an already-prepared
+                    // message; only reuse bases built with the same image set.
+                    && entry.key.pin_images == key.pin_images
+                    && entry.key.inline_images_visible == key.inline_images_visible
+                    && entry.key.images_signature == key.images_signature
+                    && entry.key.expanded_images_version == key.expanded_images_version
             })
             .max_by_key(|entry| entry.msg_count)
             .map(|entry| (entry.prepared.clone(), entry.msg_count));
@@ -818,7 +927,6 @@ impl BodyCacheState {
     fn take_best_incremental_base(
         &mut self,
         key: &BodyCacheKey,
-        msg_count: usize,
     ) -> Option<(Arc<PreparedMessages>, usize)> {
         let regular = self
             .entries
@@ -826,11 +934,17 @@ impl BodyCacheState {
             .enumerate()
             .filter(|(_, entry)| {
                 entry.msg_count > 0
-                    && msg_count > entry.msg_count
                     && entry.key.width == key.width
                     && entry.key.diff_mode == key.diff_mode
                     && entry.key.diagram_mode == key.diagram_mode
                     && entry.key.centered == key.centered
+                    // Anchored inline images render inside the body, and a
+                    // late-arriving image may target an already-prepared
+                    // message; only reuse bases built with the same image set.
+                    && entry.key.pin_images == key.pin_images
+                    && entry.key.inline_images_visible == key.inline_images_visible
+                    && entry.key.images_signature == key.images_signature
+                    && entry.key.expanded_images_version == key.expanded_images_version
             })
             .max_by_key(|(_, entry)| entry.msg_count)
             .map(|(idx, entry)| (false, idx, entry.msg_count));
@@ -840,11 +954,17 @@ impl BodyCacheState {
             .enumerate()
             .filter(|(_, entry)| {
                 entry.msg_count > 0
-                    && msg_count > entry.msg_count
                     && entry.key.width == key.width
                     && entry.key.diff_mode == key.diff_mode
                     && entry.key.diagram_mode == key.diagram_mode
                     && entry.key.centered == key.centered
+                    // Anchored inline images render inside the body, and a
+                    // late-arriving image may target an already-prepared
+                    // message; only reuse bases built with the same image set.
+                    && entry.key.pin_images == key.pin_images
+                    && entry.key.inline_images_visible == key.inline_images_visible
+                    && entry.key.images_signature == key.images_signature
+                    && entry.key.expanded_images_version == key.expanded_images_version
             })
             .max_by_key(|(_, entry)| entry.msg_count)
             .map(|(idx, entry)| (true, idx, entry.msg_count));
@@ -933,6 +1053,12 @@ struct FullPrepCacheKey {
     streaming_text_len: usize,
     streaming_text_hash: u64,
     batch_progress_hash: u64,
+    inline_images_signature: (usize, u64),
+    /// Whether inline images render expanded or as collapsed label stubs.
+    inline_images_visible: bool,
+    /// Per-image expand-level version; anchored image geometry is embedded in
+    /// the prepared frame, so a level change must invalidate it.
+    expanded_images_version: u64,
 }
 
 #[derive(Clone)]
@@ -1094,6 +1220,9 @@ pub(crate) use frame_metrics::{
     debug_flicker_frame_history, debug_slow_frame_history, recent_flicker_copy_target_for_key,
     recent_flicker_ui_notice,
 };
+#[cfg(test)]
+pub(crate) use smoothness::frame_from_buffer as smoothness_frame_from_buffer;
+pub(crate) use smoothness::{report_json as smoothness_report_json, reset as smoothness_reset};
 
 #[cfg(test)]
 pub(crate) use frame_metrics::{
@@ -1167,6 +1296,8 @@ pub(crate) fn clear_test_render_state_for_tests() {
     set_last_max_scroll(0);
     set_pinned_pane_total_lines(0);
     set_last_diff_pane_effective_scroll(0);
+    set_last_total_wrapped_lines(0);
+    set_last_resolved_chat_scroll(0);
     update_user_prompt_positions(&[]);
     TEST_LAST_LAYOUT.with(|snapshot| {
         *snapshot.borrow_mut() = None;
@@ -1274,6 +1405,25 @@ impl CopyViewportSnapshot {
             } => wrapped_line_map.get(abs_line).copied(),
             CopyViewportData::ChatFrame { prepared } => prepared.wrapped_line_map(abs_line),
         }
+    }
+
+    /// If `abs_line` is the label line of a visible inline-image region, return
+    /// that image's id. The label line sits exactly one wrapped line above the
+    /// region's first placeholder line (see `anchored_image_lines`), so we map a
+    /// click on the label row back to the image it annotates.
+    fn inline_image_id_for_label_line(&self, abs_line: usize) -> Option<u64> {
+        let prepared = match &self.data {
+            CopyViewportData::ChatFrame { prepared } => prepared,
+            CopyViewportData::Dense { .. } => return None,
+        };
+        prepared
+            .image_regions
+            .iter()
+            .find(|region| {
+                region.render == jcode_tui_messages::ImageRegionRender::Fit
+                    && region.abs_line_idx == abs_line + 1
+            })
+            .map(|region| region.hash)
     }
 }
 
@@ -1495,6 +1645,21 @@ pub(crate) fn record_copy_viewport_snapshot(
     );
 }
 
+/// Record a real `ChatFrame` viewport snapshot for tests. Unlike
+/// `record_copy_viewport_snapshot` (which records a `Dense` snapshot that cannot
+/// resolve inline-image label lines), this preserves the `PreparedChatFrame` so
+/// `inline_image_id_for_label_line` works end to end.
+#[cfg(test)]
+pub(crate) fn record_copy_viewport_frame_snapshot_for_test(
+    prepared: Arc<PreparedChatFrame>,
+    scroll: usize,
+    visible_end: usize,
+    content_area: Rect,
+    left_margins: &[u16],
+) {
+    record_copy_viewport_frame_snapshot(prepared, scroll, visible_end, content_area, left_margins);
+}
+
 pub(crate) fn line_left_margins_for_area(lines: &[Line<'static>], area_width: u16) -> Vec<u16> {
     lines
         .iter()
@@ -1516,6 +1681,42 @@ pub(crate) fn record_side_pane_snapshot(
     visible_end: usize,
     content_area: Rect,
 ) {
+    record_pane_snapshot_from_lines(
+        crate::tui::CopySelectionPane::SidePane,
+        wrapped_lines,
+        scroll,
+        visible_end,
+        content_area,
+    );
+}
+
+/// Record a copy-selection snapshot for the chat pane from already-wrapped
+/// display lines. Used by full-screen overlays (e.g. `/changelog`) that replace
+/// the chat viewport but still want drag-to-select-and-copy support. Each
+/// display line is treated as a single raw line, so the copied text matches the
+/// rendered text verbatim.
+pub(crate) fn record_chat_overlay_copy_snapshot(
+    wrapped_lines: &[Line<'static>],
+    scroll: usize,
+    visible_end: usize,
+    content_area: Rect,
+) {
+    record_pane_snapshot_from_lines(
+        crate::tui::CopySelectionPane::Chat,
+        wrapped_lines,
+        scroll,
+        visible_end,
+        content_area,
+    );
+}
+
+fn record_pane_snapshot_from_lines(
+    pane: crate::tui::CopySelectionPane,
+    wrapped_lines: &[Line<'static>],
+    scroll: usize,
+    visible_end: usize,
+    content_area: Rect,
+) {
     let left_margins = line_left_margins_for_area(wrapped_lines, content_area.width);
     let raw_plain_lines: Vec<String> = wrapped_lines.iter().map(line_plain_text).collect();
     let wrapped_line_map: Vec<WrappedLineMap> = raw_plain_lines
@@ -1530,7 +1731,8 @@ pub(crate) fn record_side_pane_snapshot(
     let visible_left_margins = left_margins
         .get(scroll..visible_end.min(left_margins.len()))
         .unwrap_or(&[]);
-    record_side_pane_snapshot_precomputed(
+    record_copy_pane_snapshot(
+        pane,
         Arc::new(raw_plain_lines.clone()),
         Arc::new(vec![0; wrapped_lines.len()]),
         Arc::new(raw_plain_lines),
@@ -1576,6 +1778,173 @@ pub(crate) fn copy_point_from_screen(
                     .and_then(|snapshot| copy_point_from_snapshot(snapshot, column, row))
             })
     }
+}
+
+/// Number of rows at the top/bottom of a pane that act as the browser-style
+/// auto-scroll "hot zone". Dragging a selection anywhere inside this band keeps
+/// pulling in more transcript, instead of requiring the cursor to land exactly
+/// on the boundary row. Scales gently with pane height and is capped so small
+/// panes keep a usable middle region.
+fn edge_autoscroll_zone_rows(height: u16) -> u16 {
+    (height / 4).clamp(1, 3)
+}
+
+#[cfg(test)]
+mod edge_autoscroll_zone_tests {
+    use super::edge_autoscroll_zone_rows;
+
+    #[test]
+    fn zone_is_at_least_one_row_for_tiny_panes() {
+        // Even a 1-2 row pane should keep a usable hot zone so the edge still triggers.
+        assert_eq!(edge_autoscroll_zone_rows(0), 1);
+        assert_eq!(edge_autoscroll_zone_rows(1), 1);
+        assert_eq!(edge_autoscroll_zone_rows(3), 1);
+        assert_eq!(edge_autoscroll_zone_rows(4), 1);
+    }
+
+    #[test]
+    fn zone_scales_with_height_but_is_capped() {
+        assert_eq!(edge_autoscroll_zone_rows(8), 2);
+        assert_eq!(edge_autoscroll_zone_rows(12), 3);
+        // Capped at 3 so tall panes keep a large neutral middle region.
+        assert_eq!(edge_autoscroll_zone_rows(40), 3);
+        assert_eq!(edge_autoscroll_zone_rows(200), 3);
+    }
+}
+
+pub(crate) fn copy_pane_vertical_edge_point(
+    pane: crate::tui::CopySelectionPane,
+    column: u16,
+    row: u16,
+) -> Option<(crate::tui::CopySelectionPoint, bool)> {
+    let snapshot = copy_snapshot_for_pane(pane)?;
+    let area = snapshot.content_area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    // Browser-style edge auto-scroll: terminals clamp the mouse to the visible
+    // viewport, so a drag that "leaves" the top/bottom of the pane is reported on
+    // the boundary row itself. We additionally treat a small band near each edge
+    // as a hot zone, so dragging *near* (not just exactly onto) the top/bottom
+    // keeps pulling in more transcript, just like dragging a selection toward the
+    // edge of a browser window. The horizontal position is clamped into the pane
+    // so the selection extends no matter where along the edge the cursor sits.
+    let last_row = area.y.saturating_add(area.height).saturating_sub(1);
+    let zone = edge_autoscroll_zone_rows(area.height);
+    let top_trigger = area.y.saturating_add(zone);
+    let bottom_trigger = last_row.saturating_sub(zone);
+    // Only engage the hot zone when there is actually more transcript to pull in
+    // that direction. Otherwise dragging into the bottom band while the view is
+    // already pinned to the end (the common case) would snap the selection to the
+    // last visible line and fight precise highlighting of the bottom rows. When
+    // there is nothing to scroll, fall through (`None`) so the caller extends the
+    // selection to the exact cell under the cursor instead.
+    let can_scroll_up = snapshot.scroll > 0;
+    let can_scroll_down = snapshot.visible_end < snapshot.wrapped_plain_line_count();
+    let (edge_row, upward) = if row <= top_trigger && can_scroll_up {
+        (area.y, true)
+    } else if row >= bottom_trigger && can_scroll_down {
+        (last_row, false)
+    } else {
+        return None;
+    };
+
+    let clamped_col = column.clamp(area.x, area.x.saturating_add(area.width).saturating_sub(1));
+
+    copy_point_from_snapshot(&snapshot, clamped_col, edge_row).map(|point| (point, upward))
+}
+
+/// Resolve the selection point for a drag at `(column, row)`, clamping vertical
+/// overshoot to the nearest in-bounds line edge.
+///
+/// Terminals report a drag that "leaves" the pane on the boundary row, but a
+/// drag *into the empty space below the last content line* (common with short
+/// transcripts that leave blank rows underneath) lands on a row that maps to no
+/// line at all, so `copy_point_from_screen` returns `None`. Native terminal and
+/// browser selection treat that as "select through the end of the last line".
+/// This mirrors that: dragging below the last visible line snaps to the end of
+/// that line, and dragging above the first visible line snaps to its start, so
+/// the boundary line is fully covered even when there is nothing more to scroll.
+pub(crate) fn copy_pane_drag_point(
+    pane: crate::tui::CopySelectionPane,
+    column: u16,
+    row: u16,
+) -> Option<crate::tui::CopySelectionPoint> {
+    let snapshot = copy_snapshot_for_pane(pane)?;
+    let area = snapshot.content_area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+
+    // A direct hit on a real line wins: precise per-cell selection.
+    if let Some(point) = copy_point_from_snapshot(&snapshot, column, row) {
+        return Some(point);
+    }
+
+    let line_count = snapshot.wrapped_plain_line_count();
+    if line_count == 0 {
+        return None;
+    }
+    let last_line = line_count.saturating_sub(1);
+    let last_visible_line = snapshot.visible_end.saturating_sub(1).min(last_line);
+    let first_visible_line = snapshot.scroll.min(last_line);
+
+    let last_row = area.y.saturating_add(area.height).saturating_sub(1);
+    let clamped_col = column.clamp(area.x, area.x.saturating_add(area.width).saturating_sub(1));
+
+    // Below the visible content: snap to the end of the last visible line.
+    if row >= last_row {
+        let text = snapshot.wrapped_plain_line(last_visible_line).unwrap_or("");
+        return Some(crate::tui::CopySelectionPoint {
+            pane,
+            abs_line: last_visible_line,
+            column: line_display_width(text),
+        });
+    }
+
+    // Above the visible content: snap to the start of the first visible line.
+    if row <= area.y {
+        return Some(crate::tui::CopySelectionPoint {
+            pane,
+            abs_line: first_visible_line,
+            column: snapshot
+                .wrapped_copy_offset(first_visible_line)
+                .unwrap_or(0),
+        });
+    }
+
+    // Interior row that maps to no line (e.g. a blank gap row between/after
+    // content within the visible band): fall back to the boundary-clamped point.
+    copy_point_from_snapshot(&snapshot, clamped_col, row.clamp(area.y, last_row)).or(Some(
+        crate::tui::CopySelectionPoint {
+            pane,
+            abs_line: last_visible_line,
+            column: line_display_width(
+                snapshot.wrapped_plain_line(last_visible_line).unwrap_or(""),
+            ),
+        },
+    ))
+}
+
+/// Edge point for tick-driven continuous auto-scroll, where there is no live
+/// mouse position. Uses the top/bottom boundary row of the pane and its left
+/// content column so the selection keeps extending to the freshly revealed line.
+pub(crate) fn copy_pane_autoscroll_edge_point(
+    pane: crate::tui::CopySelectionPane,
+    upward: bool,
+) -> Option<crate::tui::CopySelectionPoint> {
+    let snapshot = copy_snapshot_for_pane(pane)?;
+    let area = snapshot.content_area;
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let edge_row = if upward {
+        area.y
+    } else {
+        area.y.saturating_add(area.height).saturating_sub(1)
+    };
+    copy_point_from_snapshot(&snapshot, area.x, edge_row)
 }
 
 #[cfg(test)]
@@ -1691,15 +2060,15 @@ pub(crate) fn copy_selection_text(range: crate::tui::CopySelectionRange) -> Opti
                 continue;
             }
         }
-        let line_width = line_display_width(&text);
+        let line_width = line_display_width(text);
         let copy_start = snapshot.wrapped_copy_offset(abs_line).unwrap_or(0);
         let start_col = if abs_line == start.abs_line {
-            clamp_display_col(&text, start.column).max(copy_start)
+            clamp_display_col(text, start.column).max(copy_start)
         } else {
             copy_start
         };
         let end_col = if abs_line == end.abs_line {
-            clamp_display_col(&text, end.column).max(copy_start)
+            clamp_display_col(text, end.column).max(copy_start)
         } else {
             line_width
         };
@@ -1708,20 +2077,151 @@ pub(crate) fn copy_selection_text(range: crate::tui::CopySelectionRange) -> Opti
             continue;
         }
 
-        let slice = display_col_slice(&text, start_col, end_col);
+        let slice = display_col_slice(text, start_col, end_col);
         if abs_line == start.abs_line {
             out.reserve(slice.len().saturating_mul(selected_lines.min(8)));
         }
-        out.push_str(&slice);
+        out.push_str(slice);
     }
 
     Some(out)
+}
+
+/// Compute `(char_count, line_count)` for the current copy selection without
+/// allocating the full joined selection string. Mirrors `copy_selection_text`
+/// so the status line "N chars · M lines" matches what would be copied, but is
+/// allocation-free so it can run cheaply on every render frame / drag move.
+pub(crate) fn copy_selection_metrics(
+    range: crate::tui::CopySelectionRange,
+) -> Option<(usize, usize)> {
+    if range.start.pane != range.end.pane {
+        return None;
+    }
+    let snapshot = copy_snapshot_for_pane(range.start.pane)?;
+    let (start, end) =
+        if (range.start.abs_line, range.start.column) <= (range.end.abs_line, range.end.column) {
+            (range.start, range.end)
+        } else {
+            (range.end, range.start)
+        };
+
+    if start.abs_line >= snapshot.wrapped_plain_line_count()
+        || end.abs_line >= snapshot.wrapped_plain_line_count()
+    {
+        return None;
+    }
+
+    if let Some(metrics) =
+        copy_selection::copy_selection_metrics_from_raw_lines(&snapshot, start, end)
+    {
+        return Some(metrics);
+    }
+
+    let mut chars = 0usize;
+    let mut lines = 0usize;
+    for abs_line in start.abs_line..=end.abs_line {
+        if abs_line > start.abs_line {
+            chars += 1; // joining '\n'
+        }
+        lines += 1;
+        let text = snapshot.wrapped_plain_line(abs_line)?;
+        if abs_line != start.abs_line && abs_line != end.abs_line {
+            let copy_start = snapshot.wrapped_copy_offset(abs_line).unwrap_or(0);
+            if copy_start == 0 {
+                chars += text.chars().count();
+                continue;
+            }
+        }
+        let line_width = line_display_width(text);
+        let copy_start = snapshot.wrapped_copy_offset(abs_line).unwrap_or(0);
+        let start_col = if abs_line == start.abs_line {
+            clamp_display_col(text, start.column).max(copy_start)
+        } else {
+            copy_start
+        };
+        let end_col = if abs_line == end.abs_line {
+            clamp_display_col(text, end.column).max(copy_start)
+        } else {
+            line_width
+        };
+        if end_col < start_col {
+            continue;
+        }
+        chars += display_col_slice(text, start_col, end_col).chars().count();
+    }
+
+    Some((chars, lines.max(1)))
 }
 
 pub(crate) fn link_target_from_screen(column: u16, row: u16) -> Option<String> {
     let point = copy_point_from_screen(column, row)?;
     let snapshot = copy_snapshot_for_pane(point.pane)?;
     link_target_from_snapshot(&snapshot, point)
+}
+
+/// First display column of the inline-image expand badge within a label line,
+/// if present. The badge is the `🖱 ●○○ expand` suffix that `image_label_line`
+/// appends; we accept a click from the leading click-icon to end of line as
+/// "hit the badge". Returns `None` when the line has no badge (e.g. a
+/// hidden/collapsed image label).
+fn expand_badge_start_col(text: &str) -> Option<usize> {
+    let icon = crate::tui::ui::inline_image_ui::EXPAND_BADGE_CLICK_ICON;
+    // Prefer the click icon (the badge's first cell); fall back to the dots so a
+    // future icon change can never silently drop the whole hit-region.
+    let byte_idx = text.find(icon).or_else(|| text.find(['○', '●']))?;
+    Some(line_display_width(&text[..byte_idx]))
+}
+
+#[cfg(test)]
+mod expand_badge_hit_tests {
+    use super::expand_badge_start_col;
+
+    #[test]
+    fn returns_none_without_dots() {
+        assert_eq!(expand_badge_start_col("  🖼 600×400  hide"), None);
+    }
+
+    #[test]
+    fn locates_first_dot_display_column() {
+        // ASCII prefix: the badge starts exactly at the prefix's display width.
+        let text = "abc ●○○ expand";
+        assert_eq!(expand_badge_start_col(text), Some(4));
+    }
+
+    #[test]
+    fn accounts_for_wide_chars_before_badge() {
+        // Multi-byte chars before the badge must be measured by display width,
+        // not byte offset. unicode-width reports the picture glyph as width 1,
+        // so emoji(1) + space(1) = 2.
+        let text = "🖼 ●○○ expand";
+        assert_eq!(expand_badge_start_col(text), Some(2));
+    }
+
+    #[test]
+    fn anchors_on_the_click_icon_when_present() {
+        // The real label puts a click icon ahead of the dots; the hit-region
+        // must start at the icon so users can click the whole affordance.
+        let icon = crate::tui::ui::inline_image_ui::EXPAND_BADGE_CLICK_ICON;
+        let text = format!("abc {icon} ●○○ expand");
+        // Prefix is "abc " (display width 4); the icon is the first badge cell.
+        assert_eq!(expand_badge_start_col(&text), Some(4));
+    }
+}
+
+/// If a screen click landed on an inline-image expand badge, return the image
+/// id so the caller can cycle that image's size. Only clicks on the badge
+/// suffix of the label line count, so the rest of the label stays inert.
+pub(crate) fn inline_image_expand_target_from_screen(column: u16, row: u16) -> Option<u64> {
+    let point = copy_point_from_screen(column, row)?;
+    let snapshot = copy_snapshot_for_pane(point.pane)?;
+    let image_id = snapshot.inline_image_id_for_label_line(point.abs_line)?;
+    let text = snapshot.wrapped_plain_line(point.abs_line)?;
+    let badge_start = expand_badge_start_col(text)?;
+    if point.column >= badge_start {
+        Some(image_id)
+    } else {
+        None
+    }
 }
 
 pub fn draw(frame: &mut Frame, app: &dyn TuiState) {
@@ -1754,7 +2254,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     clear_area(frame, area);
 
     if let Some(scroll) = app.changelog_scroll() {
-        overlays::draw_changelog_overlay(frame, area, scroll);
+        overlays::draw_changelog_overlay(frame, area, scroll, app);
         finalize_frame_metrics(
             app,
             total_start,
@@ -1849,14 +2349,15 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     let pane_position = app.diagram_pane_position();
     let has_side_panel_content = app.side_panel().focused_page().is_some();
     let diff_mode = app.diff_mode();
-    let pin_images = app.pin_images();
     let collect_diffs = diff_mode.is_pinned();
-    let has_pinned_content = if collect_diffs || pin_images {
+    // Images now render inline in the transcript, so the side panel only handles
+    // pinned file diffs. `pin_images` no longer feeds the side-panel surface.
+    let has_pinned_content = if collect_diffs {
         collect_pinned_content_cached(
             app.display_messages(),
             &app.side_pane_images(),
             collect_diffs,
-            pin_images,
+            false,
             app.display_messages_version(),
         )
     } else {
@@ -1973,11 +2474,23 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     let (chat_area, diff_pane_area) = if needs_side_pane {
         const MIN_DIFF_WIDTH: u16 = 30;
         const MIN_CHAT_WIDTH: u16 = 20;
+        // Pinned images live in a tall narrow column, so a wide image fits to
+        // the pane width and ends up small with empty space below it. When the
+        // pane is showing image content (and the user has not manually resized
+        // it), widen the default split so images use more of the available
+        // horizontal space. Diffs/markdown keep the standard ratio.
+        let image_dominant_pane =
+            has_pinned_content && !has_file_diff_edits && !has_side_panel_content;
+        const ADAPTIVE_IMAGE_RATIO: u32 = 55;
+        let base_ratio = app.diagram_pane_ratio().clamp(25, 100) as u32;
+        let effective_ratio = if image_dominant_pane && !app.diagram_pane_ratio_user_adjusted() {
+            base_ratio.max(ADAPTIVE_IMAGE_RATIO)
+        } else {
+            base_ratio
+        };
         let max_diff = chat_area.width.saturating_sub(MIN_CHAT_WIDTH);
         if max_diff >= MIN_DIFF_WIDTH {
-            let diff_width = (((chat_area.width as u32
-                * app.diagram_pane_ratio().clamp(25, 100) as u32)
-                / 100) as u16)
+            let diff_width = (((chat_area.width as u32 * effective_ratio) / 100) as u16)
                 .max(MIN_DIFF_WIDTH)
                 .min(max_diff);
             let new_chat_width = chat_area.width.saturating_sub(diff_width);
@@ -1999,6 +2512,50 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         }
     } else {
         (chat_area, None)
+    };
+
+    // Inline swarm gallery band: when `swarm_spawn_mode = inline`, reserve a
+    // top strip of the chat column to render a live gallery of agent viewports.
+    let swarm_gallery_lines: Vec<Line<'static>> = if app.inline_swarm_gallery_active() {
+        let members = app.inline_swarm_members();
+        // Budget a configurable share (default ~40%) of the chat height for the
+        // gallery, capped. `agents.swarm_gallery_max_pct` (1-90) lets the user
+        // shrink the band toward a thin strip or give it more room.
+        let max_pct = crate::config::config()
+            .agents
+            .swarm_gallery_max_pct
+            .map(|p| p.clamp(1, 90) as usize)
+            .unwrap_or(40);
+        let budget = ((chat_area.height as usize * max_pct) / 100).clamp(0, 18);
+        if budget >= 5 && chat_area.width >= 24 {
+            super::info_widget::swarm_gallery::render_swarm_gallery_lines(
+                &members,
+                chat_area.width as usize,
+                budget,
+            )
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+    let (swarm_gallery_area, chat_area) = if !swarm_gallery_lines.is_empty() {
+        let band_height = (swarm_gallery_lines.len() as u16 + 1).min(chat_area.height / 2);
+        let band = Rect {
+            x: chat_area.x,
+            y: chat_area.y,
+            width: chat_area.width,
+            height: band_height,
+        };
+        let rest = Rect {
+            x: chat_area.x,
+            y: chat_area.y + band_height,
+            width: chat_area.width,
+            height: chat_area.height.saturating_sub(band_height),
+        };
+        (Some(band), rest)
+    } else {
+        (None, chat_area)
     };
 
     // Calculate pending messages (queued + interleave) for numbering and layout
@@ -2034,20 +2591,45 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         })
     };
 
-    // The first-run onboarding welcome screen draws its own (prominent,
-    // top-positioned) donut, so suppress the default bottom idle donut while it
-    // is active to avoid two donuts on screen.
     let onboarding_welcome = app.onboarding_welcome_active();
+
+    // The guided onboarding phases (login import, OpenAI prompt, continue prompt)
+    // are entirely key-driven and own the whole chat column: they render their own
+    // telemetry header, a prominent donut, and the welcome body. Suppress the
+    // normal chat chrome (status line, input box, notification, idle hint) so the
+    // screen stays focused and the donut gets the full height. The resting
+    // Suggestions screen keeps the input box so the user can type to start.
+    let onboarding_takes_over = onboarding_welcome
+        && !matches!(
+            app.onboarding_welcome_kind(),
+            crate::tui::OnboardingWelcomeKind::Suggestions
+        );
+    if onboarding_takes_over {
+        onboarding::draw_onboarding_welcome(frame, app, chat_area);
+        finalize_frame_metrics(
+            app,
+            total_start,
+            prep_start.elapsed(),
+            total_start.elapsed(),
+            None,
+        );
+        return;
+    }
+
     let show_donut = !onboarding_welcome && super::idle_donut_active(app);
     let donut_height: u16 = if show_donut { 14 } else { 0 };
     let notification_height: u16 = if app.has_notification() { 1 } else { 0 };
+    // Elastic overscroll status line revealed when the user scrolls past the
+    // bottom of the transcript. Rendered directly below the input line.
+    let overscroll_height: u16 = if app.chat_overscroll_active() { 1 } else { 0 };
     let fixed_height = 1
         + queued_height
         + notification_height
         + inline_block_height
         + inline_ui_gap_height
         + input_height
-        + donut_height; // status + queued + notification + inline UI + gap + input + donut
+        + overscroll_height
+        + donut_height; // status + queued + notification + inline UI + gap + input + overscroll + donut
     let available_height = chat_area.height;
     let overflows = |prepared: &PreparedChatFrame| {
         (prepared.total_wrapped_lines().max(1) as u16) + fixed_height > available_height
@@ -2130,6 +2712,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
                 Constraint::Length(inline_block_height),   // Inline UI
                 Constraint::Length(inline_ui_gap_height),  // Inline UI/input spacing
                 Constraint::Length(input_height),          // Input
+                Constraint::Length(overscroll_height),     // Overscroll status line
                 Constraint::Length(donut_height),          // Donut animation
             ]
         } else {
@@ -2141,11 +2724,18 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
                 Constraint::Length(inline_block_height),  // Inline UI
                 Constraint::Length(inline_ui_gap_height), // Inline UI/input spacing
                 Constraint::Length(input_height),         // Input
+                Constraint::Length(overscroll_height),    // Overscroll status line
                 Constraint::Length(donut_height),         // Donut animation
             ]
         })
         .split(chat_area);
     record_status_area(chunks[2]);
+
+    // Draw the inline swarm gallery band (above the chat) if present.
+    if let Some(band) = swarm_gallery_area {
+        clear_area(frame, band);
+        frame.render_widget(Paragraph::new(swarm_gallery_lines.clone()), band);
+    }
 
     // Capture layout info for visual debug
     if let Some(ref mut capture) = debug_capture {
@@ -2240,6 +2830,7 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
             right_widths: Vec::new(),
             left_widths: Vec::new(),
             centered: app.centered_mode(),
+            ..Default::default()
         }
     } else {
         draw_messages(
@@ -2354,8 +2945,12 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
         &mut debug_capture,
     );
 
+    if overscroll_height > 0 {
+        input_ui::draw_overscroll_status(frame, app, chunks[7]);
+    }
+
     if donut_height > 0 {
-        animations::draw_idle_animation(frame, app, chunks[7]);
+        animations::draw_idle_animation(frame, app, chunks[8]);
     }
 
     // Draw info widget overlays (skip during idle animation - they look out of place)
@@ -2377,12 +2972,15 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
                 placements: placement_captures,
             });
 
-            // Detect overlaps with message area
+            // Detect overlaps with used content. Info widgets live inside the
+            // messages rectangle by design, so a whole-area overlap check is
+            // always true and useless; instead verify each placement still fits
+            // within the free margin the layout reported for the rows it covers.
             for placement in &placements {
-                if rects_overlap(placement.rect, widget_bounds) {
+                if widget_overlaps_content(placement, widget_bounds, &margins) {
                     capture.anomaly(format!(
-                        "Info widget {:?} overlaps messages area",
-                        placement.kind
+                        "Info widget {:?} intrudes into content (rect {:?})",
+                        placement.kind, placement.rect
                     ));
                 }
                 if !rect_within_bounds(placement.rect, area) {
@@ -2427,6 +3025,15 @@ fn draw_inner(frame: &mut Frame, app: &dyn TuiState) {
     if visual_debug::overlay_enabled() {
         overlays::draw_debug_overlay(frame, &placements, &chunks);
     }
+
+    // Observe the rendered messages area for the anchor-stability (smoothness)
+    // report. Runs on the final buffer so it sees exactly what the user sees.
+    smoothness::observe_frame(
+        frame.buffer_mut(),
+        messages_area,
+        app.scroll_offset(),
+        !app.auto_scroll_paused(),
+    );
 
     // Record the frame capture if enabled
     if let Some(capture) = debug_capture {

@@ -136,6 +136,11 @@ struct TestState {
     onboarding_preview: bool,
     suggestions: Vec<(String, String)>,
     compacted_hidden_user_prompts: usize,
+    side_pane_images: Vec<crate::session::RenderedImage>,
+    pin_images: bool,
+    inline_images_visible: bool,
+    chat_overscroll_active: bool,
+    cache_ttl_status: Option<crate::tui::CacheTtlInfo>,
 }
 
 impl crate::tui::TuiState for TestState {
@@ -161,7 +166,7 @@ impl crate::tui::TuiState for TestState {
         })
     }
     fn side_pane_images(&self) -> Vec<crate::session::RenderedImage> {
-        Vec::new()
+        self.side_pane_images.clone()
     }
     fn display_messages_version(&self) -> u64 {
         self.messages_version
@@ -246,6 +251,9 @@ impl crate::tui::TuiState for TestState {
     }
     fn time_since_activity(&self) -> Option<Duration> {
         self.time_since_activity
+    }
+    fn chat_overscroll_active(&self) -> bool {
+        self.chat_overscroll_active
     }
     fn total_session_tokens(&self) -> Option<(u64, u64)> {
         None
@@ -344,6 +352,9 @@ impl crate::tui::TuiState for TestState {
     fn diagram_pane_ratio(&self) -> u8 {
         50
     }
+    fn diagram_pane_ratio_user_adjusted(&self) -> bool {
+        false
+    }
     fn diagram_pane_animating(&self) -> bool {
         false
     }
@@ -374,7 +385,10 @@ impl crate::tui::TuiState for TestState {
         &EMPTY
     }
     fn pin_images(&self) -> bool {
-        false
+        self.pin_images
+    }
+    fn inline_images_visible(&self) -> bool {
+        self.inline_images_visible
     }
     fn diff_line_wrap(&self) -> bool {
         true
@@ -437,7 +451,7 @@ impl crate::tui::TuiState for TestState {
         self.onboarding_preview
     }
     fn cache_ttl_status(&self) -> Option<crate::tui::CacheTtlInfo> {
-        None
+        self.cache_ttl_status.clone()
     }
     fn chat_native_scrollbar(&self) -> bool {
         self.chat_native_scrollbar

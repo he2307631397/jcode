@@ -1,13 +1,40 @@
 use crate::id::{extract_session_name, new_id, new_memorable_session_id};
 use crate::message::{ContentBlock, Message, Role};
+pub use crate::storage::{
+    SessionCounts, SessionPresence, active_session_ids, find_active_session_id_by_pid,
+    mark_streaming, session_counts, session_presence, unmark_streaming,
+};
 use crate::storage::{active_pids_dir, register_active_pid, unregister_active_pid};
-pub use crate::storage::{active_session_ids, find_active_session_id_by_pid};
+
+/// RAII guard that marks a session as actively streaming for its lifetime.
+///
+/// Wraps the on-disk streaming marker from `jcode-storage` (cleared on every
+/// exit path so presence UIs never show a phantom streaming session) and
+/// additionally holds a macOS power assertion so the system does not
+/// idle-sleep in the middle of a streaming model response.
+pub struct StreamingGuard {
+    _marker: crate::storage::StreamingGuard,
+    #[allow(dead_code)]
+    sleep_assertion: crate::platform::PowerAssertion,
+}
+
+impl StreamingGuard {
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            _marker: crate::storage::StreamingGuard::new(session_id),
+            sleep_assertion: crate::platform::PowerAssertion::prevent_user_idle_system_sleep(
+                "Jcode streaming model response",
+            ),
+        }
+    }
+}
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
 mod crash;
 mod journal;
+mod maintenance;
 mod memory_profile;
 mod model;
 mod persistence;
@@ -22,6 +49,7 @@ pub use jcode_session_types::{
     StoredDisplayRole, StoredMemoryInjection, StoredMessage, StoredTokenUsage,
 };
 use journal::{PersistVectorMode, SessionJournalMeta, SessionPersistState};
+pub use maintenance::prune_old_session_backups;
 pub use memory_profile::SessionMemoryProfileSnapshot;
 use memory_profile::{
     ContentBlockMemoryStats, SessionMemoryProfileCache, summarize_blocks, summarize_message_content,
@@ -29,9 +57,10 @@ use memory_profile::{
 use model::SESSION_CONTEXT_PREFIX;
 pub use model::{StoredReplayEvent, StoredReplayEventKind};
 pub use render::{
-    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageSource, RenderedMessage,
-    has_rendered_images, render_images, render_messages, render_messages_and_images,
-    render_messages_and_images_with_compacted_history, summarize_tool_calls,
+    RenderedCompactedHistoryInfo, RenderedImage, RenderedImageAnchor, RenderedImageSource,
+    RenderedMessage, has_rendered_images, is_attached_image_label_text, render_images,
+    render_messages, render_messages_and_images, render_messages_and_images_with_compacted_history,
+    summarize_tool_calls,
 };
 pub use storage_paths::session_journal_path_from_snapshot;
 #[cfg(test)]
@@ -82,6 +111,10 @@ pub struct Session {
     /// Model identifier for this session (e.g., "gpt-5.2-codex")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// API method/runtime route used to select this model (e.g. "openrouter",
+    /// "openai-compatible:nvidia-nim", "openai-api").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route_api_method: Option<String>,
     /// Provider reasoning/thinking effort for this session (e.g., OpenAI low|medium|high|xhigh).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
@@ -171,6 +204,8 @@ struct SessionStartupStub {
     provider_key: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    route_api_method: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]
@@ -279,6 +314,7 @@ impl Session {
         session.provider_session_id = stub.provider_session_id;
         session.provider_key = stub.provider_key;
         session.model = stub.model;
+        session.route_api_method = stub.route_api_method;
         session.reasoning_effort = stub.reasoning_effort;
         session.subagent_model = stub.subagent_model;
         session.improve_mode = stub.improve_mode;
@@ -313,6 +349,7 @@ impl Session {
         session.provider_session_id = snapshot.provider_session_id;
         session.provider_key = snapshot.provider_key;
         session.model = snapshot.model;
+        session.route_api_method = snapshot.route_api_method;
         session.reasoning_effort = snapshot.reasoning_effort;
         session.subagent_model = snapshot.subagent_model;
         session.improve_mode = snapshot.improve_mode;
@@ -673,6 +710,7 @@ impl Session {
             provider_session_id: None,
             provider_key: None,
             model: None,
+            route_api_method: None,
             reasoning_effort: None,
             subagent_model: None,
             improve_mode: None,
@@ -719,6 +757,7 @@ impl Session {
             provider_session_id: None,
             provider_key: None,
             model: None,
+            route_api_method: None,
             reasoning_effort: None,
             subagent_model: None,
             improve_mode: None,
@@ -898,6 +937,35 @@ impl Session {
             .unwrap_or(&self.id)
     }
 
+    /// Append a model-visible notice telling the agent this session is a fork
+    /// of `parent_session_id`'s conversation.
+    ///
+    /// Forking happens when the user splits a window mid-conversation (often
+    /// while the parent agent is still streaming) and points the new window at
+    /// a clone of the transcript. Without this notice the forked agent assumes
+    /// it owns the in-flight request, duplicating the parent's work. The
+    /// notice is wrapped in `<system-reminder>` so it stays out of the visible
+    /// transcript while still reaching the model on the next turn.
+    pub fn append_fork_notice(&mut self, parent_session_id: &str, parent_display_name: &str) {
+        let text = format!(
+            "<system-reminder>\nThis session was forked (split) from session {parent} ({parent_id}) by the user. \
+The full conversation above is inherited from that session, but the original agent in {parent} \
+is still active and will continue handling whatever request or work was in progress there. \
+Do NOT continue or duplicate that in-flight work here. Treat the next user message as a fresh \
+request in this new forked session, using the inherited conversation only as context.\n</system-reminder>",
+            parent = parent_display_name,
+            parent_id = parent_session_id,
+        );
+        self.add_message_with_display_role(
+            Role::User,
+            vec![ContentBlock::Text {
+                text,
+                cache_control: None,
+            }],
+            Some(StoredDisplayRole::System),
+        );
+    }
+
     /// Mark this session as a canary tester
     pub fn set_canary(&mut self, build_hash: &str) {
         self.is_canary = true;
@@ -1007,7 +1075,9 @@ impl Session {
         for msg in &mut redacted.messages {
             for block in &mut msg.content {
                 match block {
-                    ContentBlock::Text { text, .. } | ContentBlock::Reasoning { text } => {
+                    ContentBlock::Text { text, .. }
+                    | ContentBlock::Reasoning { text }
+                    | ContentBlock::ReasoningTrace { text } => {
                         *text = crate::message::redact_secrets(text);
                     }
                     ContentBlock::AnthropicThinking { thinking, .. } => {
@@ -1162,6 +1232,30 @@ impl Session {
             self.mark_memory_profile_dirty();
             self.mark_messages_full_dirty();
         }
+    }
+
+    /// Drop oversized inline images from the stored transcript, oldest-first,
+    /// until the total remaining base64 image payload fits within
+    /// `target_total_chars`. Used to recover from provider HTTP 413
+    /// "request too large" errors, which are driven by base64 image payload size
+    /// rather than the token context window.
+    ///
+    /// Mutates and persists the authoritative transcript (replacing each dropped
+    /// image with a short text marker) and invalidates the provider-message
+    /// cache so the next API call reflects the reduced payload. Returns the
+    /// number of images that were stripped.
+    pub fn strip_oversized_images(&mut self, target_total_chars: usize) -> usize {
+        let mut contents: Vec<&mut Vec<ContentBlock>> =
+            self.messages.iter_mut().map(|m| &mut m.content).collect();
+        let stripped = jcode_compaction_core::strip_large_images_in_contents(
+            &mut contents,
+            target_total_chars,
+        );
+        if stripped > 0 {
+            self.mark_memory_profile_dirty();
+            self.mark_messages_full_dirty();
+        }
+        stripped
     }
 
     pub fn visible_conversation_message_count(&self) -> usize {
@@ -1421,6 +1515,8 @@ struct RemoteStartupSessionSnapshot {
     provider_key: Option<String>,
     #[serde(default)]
     model: Option<String>,
+    #[serde(default)]
+    route_api_method: Option<String>,
     #[serde(default)]
     reasoning_effort: Option<String>,
     #[serde(default)]

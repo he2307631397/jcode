@@ -89,6 +89,8 @@ fn test_available_models_display_uses_route_models_and_filters_placeholder_rows(
         cursor: RwLock::new(None),
         bedrock: RwLock::new(None),
         openrouter: RwLock::new(None),
+        openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+        active_openai_compatible_profile: RwLock::new(None),
         active: RwLock::new(ActiveProvider::OpenAI),
         use_claude_cli: false,
         startup_notices: RwLock::new(Vec::new()),
@@ -135,6 +137,8 @@ fn test_cerebras_model_routes_are_profile_scoped_and_unique() {
                 cursor: RwLock::new(None),
                 bedrock: RwLock::new(None),
                 openrouter: RwLock::new(Some(openrouter)),
+                openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                active_openai_compatible_profile: RwLock::new(None),
                 active: RwLock::new(ActiveProvider::OpenRouter),
                 use_claude_cli: false,
                 startup_notices: RwLock::new(Vec::new()),
@@ -142,19 +146,29 @@ fn test_cerebras_model_routes_are_profile_scoped_and_unique() {
             };
 
             let routes = provider.model_routes();
-            let qwen_routes = routes
+            // Assert against the profile's current static model list so this
+            // test tracks catalog updates instead of hardcoding a model that
+            // Cerebras may stop serving (the original fixture pinned
+            // `qwen-3-235b-a22b-instruct-2507`, which rotted when the static
+            // coverage was refreshed).
+            let static_models = crate::provider_catalog::openai_compatible_profile_static_models(
+                crate::provider_catalog::CEREBRAS_PROFILE,
+            );
+            let probe_model = static_models
+                .first()
+                .expect("Cerebras profile should have static models")
+                .clone();
+            let probe_routes = routes
                 .iter()
-                .filter(|route| {
-                    route.provider == "Cerebras" && route.model == "qwen-3-235b-a22b-instruct-2507"
-                })
+                .filter(|route| route.provider == "Cerebras" && route.model == probe_model)
                 .collect::<Vec<_>>();
             assert_eq!(
-                qwen_routes.len(),
+                probe_routes.len(),
                 1,
                 "Cerebras direct route should not appear twice in provider routes: {routes:?}"
             );
-            assert_eq!(qwen_routes[0].api_method, "openai-compatible:cerebras");
-            assert!(qwen_routes[0].available);
+            assert_eq!(probe_routes[0].api_method, "openai-compatible:cerebras");
+            assert!(probe_routes[0].available);
             assert!(
                 !routes.iter().any(|route| {
                     route.provider == "Cerebras" && route.api_method == "openai-compatible"
@@ -220,6 +234,8 @@ fn test_direct_chutes_ignores_legacy_openrouter_catalog_cache() {
                     cursor: RwLock::new(None),
                     bedrock: RwLock::new(None),
                     openrouter: RwLock::new(Some(openrouter)),
+                    openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                    active_openai_compatible_profile: RwLock::new(None),
                     active: RwLock::new(ActiveProvider::OpenRouter),
                     use_claude_cli: false,
                     startup_notices: RwLock::new(Vec::new()),
@@ -277,6 +293,8 @@ fn test_auth_changed_preserves_existing_direct_profile_session() {
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(Some(openrouter)),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::OpenRouter),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -336,6 +354,8 @@ fn test_auth_changed_replaces_template_direct_profile_for_new_logins() {
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(Some(openrouter)),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::OpenRouter),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -387,6 +407,8 @@ fn test_state_space_openrouter_default_survives_switch_to_nvidia_nim() {
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(Some(openrouter)),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::OpenRouter),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -397,16 +419,28 @@ fn test_state_space_openrouter_default_survives_switch_to_nvidia_nim() {
         provider
             .set_model("nvidia-nim:nvidia/llama-3.1-nemotron-ultra-253b-v1")
             .expect("NVIDIA NIM model should be selectable after OpenRouter default");
+        assert!(
+            std::env::var_os("JCODE_OPENROUTER_API_BASE").is_none(),
+            "profile route selection should not mutate global OpenRouter API base env"
+        );
 
         assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
         assert_eq!(provider.model(), "nvidia/llama-3.1-nemotron-ultra-253b-v1");
         let active_direct_route = provider
-            .openrouter_provider()
-            .expect("NVIDIA direct provider remains installed")
+            .active_openrouter_execution_provider()
+            .expect("NVIDIA direct provider is active")
             .direct_openai_compatible_route_parts()
             .expect("NVIDIA NIM is hosted through OpenAI-compatible runtime");
         assert_eq!(active_direct_route.0, "NVIDIA NIM");
         assert_eq!(active_direct_route.1, "openai-compatible:nvidia-nim");
+        assert!(
+            provider
+                .openrouter_provider()
+                .expect("real OpenRouter provider remains installed")
+                .direct_openai_compatible_route_parts()
+                .is_none(),
+            "compatible profile must not replace the real OpenRouter slot"
+        );
 
         let routes = provider.model_routes();
         assert!(
@@ -432,6 +466,184 @@ fn test_state_space_openrouter_default_survives_switch_to_nvidia_nim() {
             }),
             "OpenRouter model must not be relabeled as NVIDIA NIM: {routes:?}"
         );
+
+        let openrouter_route = routes
+            .iter()
+            .find(|route| route.model == "openrouter/owl-alpha" && route.api_method == "openrouter")
+            .expect("OpenRouter route should be present after switching to NVIDIA NIM");
+        let selection = crate::provider::RouteSelection::from_model_route(openrouter_route);
+        provider
+            .set_route_selection(&selection)
+            .expect("OpenRouter route should switch runtime back to OpenRouter");
+        assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
+        assert_eq!(provider.model(), "openrouter/owl-alpha");
+        let active_direct_route = provider
+            .openrouter_provider()
+            .expect("OpenRouter provider remains installed")
+            .direct_openai_compatible_route_parts();
+        assert!(
+            active_direct_route.is_none(),
+            "OpenRouter model should not remain bound to NVIDIA NIM runtime: {active_direct_route:?}"
+        );
+    });
+}
+
+#[test]
+fn test_session_route_restore_request_matrix_preserves_runtime_identity() {
+    let cases = [
+        (
+            "claude-sonnet-4-6",
+            Some("claude"),
+            Some("claude-oauth"),
+            "claude-oauth:claude-sonnet-4-6",
+        ),
+        (
+            "claude-sonnet-4-6",
+            Some("claude"),
+            Some("anthropic-api-key"),
+            "claude-api:claude-sonnet-4-6",
+        ),
+        (
+            "gpt-5.4",
+            Some("openai"),
+            Some("openai-oauth"),
+            "openai-oauth:gpt-5.4",
+        ),
+        (
+            "gpt-5.4",
+            Some("openai"),
+            Some("openai-api-key"),
+            "openai-api:gpt-5.4",
+        ),
+        (
+            "openrouter/owl-alpha",
+            Some("openrouter"),
+            Some("openrouter"),
+            "openrouter:openrouter/owl-alpha",
+        ),
+        (
+            "nvidia/example",
+            Some("openai-compatible:nvidia-nim"),
+            Some("openai-compatible:nvidia-nim"),
+            "nvidia-nim:nvidia/example",
+        ),
+        (
+            "claude-sonnet-4",
+            Some("copilot"),
+            Some("copilot"),
+            "copilot:claude-sonnet-4",
+        ),
+        (
+            "composer-2.5",
+            Some("cursor"),
+            Some("cursor"),
+            "cursor:composer-2.5",
+        ),
+        (
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            Some("bedrock"),
+            Some("bedrock"),
+            "bedrock:anthropic.claude-3-5-sonnet-20241022-v2:0",
+        ),
+        (
+            "default",
+            Some("antigravity"),
+            Some("antigravity-https"),
+            "antigravity:default",
+        ),
+    ];
+
+    for (model, provider_key, api_method, expected) in cases {
+        assert_eq!(
+            MultiProvider::model_switch_request_for_session_route(model, provider_key, api_method),
+            expected,
+            "restore request should preserve route identity for {provider_key:?}/{api_method:?}"
+        );
+    }
+}
+
+#[test]
+fn test_openrouter_and_compatible_profile_transition_invariants() {
+    with_clean_provider_test_env(|| {
+        let nvidia = crate::provider_catalog::openai_compatible_profile_by_id("nvidia-nim")
+            .expect("NVIDIA NIM profile exists");
+
+        save_test_openrouter_model_cache(
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            &["openrouter/owl-alpha"],
+        );
+
+        crate::env::set_var("OPENROUTER_API_KEY", "test-openrouter-key");
+        crate::env::set_var(nvidia.api_key_env, "test-nvidia-key");
+        crate::provider_catalog::force_apply_openai_compatible_profile_env(None);
+        let openrouter = Arc::new(
+            openrouter::OpenRouterProvider::new().expect("OpenRouter provider should initialize"),
+        );
+        openrouter
+            .set_model("openrouter/owl-alpha")
+            .expect("OpenRouter default model should be selectable");
+
+        let provider = MultiProvider {
+            claude: RwLock::new(None),
+            anthropic: RwLock::new(None),
+            openai: RwLock::new(None),
+            copilot_api: RwLock::new(None),
+            antigravity: RwLock::new(None),
+            gemini: RwLock::new(None),
+            cursor: RwLock::new(None),
+            bedrock: RwLock::new(None),
+            openrouter: RwLock::new(Some(openrouter.clone())),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
+            active: RwLock::new(ActiveProvider::OpenRouter),
+            use_claude_cli: false,
+            startup_notices: RwLock::new(Vec::new()),
+            forced_provider: None,
+        };
+
+        provider
+            .set_model("nvidia-nim:nvidia/llama-3.1-nemotron-ultra-253b-v1")
+            .expect("NVIDIA NIM model should be selectable");
+        assert_eq!(provider.model(), "nvidia/llama-3.1-nemotron-ultra-253b-v1");
+        assert!(Arc::ptr_eq(
+            &provider.openrouter_provider().expect("real OpenRouter remains"),
+            &openrouter
+        ));
+        assert_eq!(
+            provider
+                .active_openrouter_execution_provider()
+                .expect("active compatible runtime")
+                .direct_openai_compatible_route_parts()
+                .map(|(_provider, api_method, _detail)| api_method),
+            Some("openai-compatible:nvidia-nim".to_string())
+        );
+
+        provider
+            .set_model("openrouter:openrouter/owl-alpha")
+            .expect("OpenRouter switch should select real OpenRouter slot");
+        assert_eq!(provider.model(), "openrouter/owl-alpha");
+        assert!(
+            provider
+                .active_openrouter_execution_provider()
+                .expect("active OpenRouter runtime")
+                .direct_openai_compatible_route_parts()
+                .is_none(),
+            "real OpenRouter route must not inherit compatible profile state"
+        );
+
+        provider
+            .set_model("nvidia-nim:nvidia/llama-3.1-nemotron-ultra-253b-v1")
+            .expect("cached compatible runtime should be selectable again");
+        assert_eq!(provider.model(), "nvidia/llama-3.1-nemotron-ultra-253b-v1");
+        assert!(
+            provider
+                .openrouter_provider()
+                .expect("real OpenRouter remains")
+                .direct_openai_compatible_route_parts()
+                .is_none(),
+            "compatible profile route must never overwrite the real OpenRouter runtime"
+        );
     });
 }
 
@@ -453,6 +665,8 @@ fn test_set_model_accepts_bare_openai_openrouter_pin_when_openrouter_available()
                 cursor: RwLock::new(None),
                 bedrock: RwLock::new(None),
                 openrouter: RwLock::new(Some(openrouter)),
+                openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                active_openai_compatible_profile: RwLock::new(None),
                 active: RwLock::new(ActiveProvider::OpenAI),
                 use_claude_cli: false,
                 startup_notices: RwLock::new(Vec::new()),
@@ -492,6 +706,8 @@ fn test_forced_openrouter_treats_claude_like_model_as_provider_local() {
                             cursor: RwLock::new(None),
                             bedrock: RwLock::new(None),
                             openrouter: RwLock::new(Some(openrouter)),
+                            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                            active_openai_compatible_profile: RwLock::new(None),
                             active: RwLock::new(ActiveProvider::OpenRouter),
                             use_claude_cli: false,
                             startup_notices: RwLock::new(Vec::new()),
@@ -534,6 +750,8 @@ fn test_forced_openrouter_preserves_custom_at_sign_model_ids() {
                             cursor: RwLock::new(None),
                             bedrock: RwLock::new(None),
                             openrouter: RwLock::new(Some(openrouter)),
+                            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                            active_openai_compatible_profile: RwLock::new(None),
                             active: RwLock::new(ActiveProvider::OpenRouter),
                             use_claude_cli: false,
                             startup_notices: RwLock::new(Vec::new()),
@@ -579,6 +797,8 @@ fn test_config_default_provider_openai_compatible_keeps_gpt_model_provider_local
                             cursor: RwLock::new(None),
                             bedrock: RwLock::new(None),
                             openrouter: RwLock::new(Some(openrouter)),
+                            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                            active_openai_compatible_profile: RwLock::new(None),
                             active: RwLock::new(ActiveProvider::OpenRouter),
                             use_claude_cli: false,
                             startup_notices: RwLock::new(Vec::new()),
@@ -627,6 +847,8 @@ fn test_custom_compatible_model_routes_do_not_request_openrouter_rewrite() {
                             cursor: RwLock::new(None),
                             bedrock: RwLock::new(None),
                             openrouter: RwLock::new(Some(openrouter)),
+                            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                            active_openai_compatible_profile: RwLock::new(None),
                             active: RwLock::new(ActiveProvider::OpenRouter),
                             use_claude_cli: false,
                             startup_notices: RwLock::new(Vec::new()),
@@ -670,6 +892,8 @@ fn test_configured_direct_compatible_profiles_are_listed_without_openrouter_key(
                     cursor: RwLock::new(None),
                     bedrock: RwLock::new(None),
                     openrouter: RwLock::new(None),
+                    openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                    active_openai_compatible_profile: RwLock::new(None),
                     active: RwLock::new(ActiveProvider::OpenAI),
                     use_claude_cli: false,
                     startup_notices: RwLock::new(Vec::new()),
@@ -720,6 +944,8 @@ fn test_profile_prefixed_model_switch_reinitializes_direct_compatible_runtime() 
                     cursor: RwLock::new(None),
                     bedrock: RwLock::new(None),
                     openrouter: RwLock::new(None),
+                    openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                    active_openai_compatible_profile: RwLock::new(None),
                     active: RwLock::new(ActiveProvider::OpenAI),
                     use_claude_cli: false,
                     startup_notices: RwLock::new(Vec::new()),
@@ -731,20 +957,17 @@ fn test_profile_prefixed_model_switch_reinitializes_direct_compatible_runtime() 
                     .expect("DeepSeek profile-prefixed model should initialize direct provider");
                 assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
                 assert_eq!(provider.model(), "deepseek-v4-pro");
-                assert_eq!(
-                    crate::provider_catalog::runtime_provider_display_name(provider.name()),
-                    "DeepSeek"
-                );
+                // `display_name` resolves through the active execution runtime
+                // (registry), which is the production display path since the
+                // compat-profile/OpenRouter slot split.
+                assert_eq!(provider.display_name(), "DeepSeek");
 
                 provider
                     .set_model("kimi:kimi-for-coding")
                     .expect("Kimi profile-prefixed model should reinitialize direct provider");
                 assert_eq!(provider.active_provider(), ActiveProvider::OpenRouter);
                 assert_eq!(provider.model(), "kimi-for-coding");
-                assert_eq!(
-                    crate::provider_catalog::runtime_provider_display_name(provider.name()),
-                    "Kimi Code"
-                );
+                assert_eq!(provider.display_name(), "Kimi Code");
             })
         })
     });
@@ -778,6 +1001,8 @@ fn test_openai_auth_mode_prefixed_model_switch_changes_credentials() {
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::OpenAI),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -842,6 +1067,8 @@ fn test_anthropic_auth_mode_prefixed_model_switch_changes_credentials() {
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::Claude),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -853,8 +1080,10 @@ fn test_anthropic_auth_mode_prefixed_model_switch_changes_credentials() {
         assert_eq!(
             rt.block_on(anthropic.test_access_token_and_oauth_mode())
                 .expect("default token"),
-            ("sk-ant-test-api-key".to_string(), false),
-            "default Anthropic credentials should keep existing API-key-first behavior"
+            ("oauth-access-token".to_string(), true),
+            "default (Auto) Anthropic credentials prefer OAuth/subscription when an \
+             OAuth account is available, matching the canonical OAuth-first Auto \
+             behavior shared with the OpenAI provider and resolve_dual_credential_auth"
         );
 
         provider
@@ -875,6 +1104,86 @@ fn test_anthropic_auth_mode_prefixed_model_switch_changes_credentials() {
             ("sk-ant-test-api-key".to_string(), false)
         );
     });
+}
+
+#[test]
+fn test_config_default_provider_anthropic_api_pins_api_credential() {
+    use jcode_provider_core::{Provider, ResolvedCredential};
+    // A config `default_provider = "anthropic-api"` is a routing decision that
+    // also pins the OAuth-vs-API credential. Applying the default at startup
+    // must leave the provider on the API-key route so the header auth tag and
+    // model picker report "API Key", not the Auto/OAuth fallback.
+    for (default_provider, expected, expect_oauth) in [
+        ("anthropic-api", ResolvedCredential::ApiKey, false),
+        ("claude-api", ResolvedCredential::ApiKey, false),
+        ("claude", ResolvedCredential::Oauth, true),
+        ("anthropic", ResolvedCredential::Oauth, true),
+    ] {
+        with_clean_provider_test_env(|| {
+            crate::env::set_var("ANTHROPIC_API_KEY", "sk-ant-test-api-key");
+            crate::auth::claude::upsert_account(crate::auth::claude::AnthropicAccount {
+                label: "claude-1".to_string(),
+                access: "oauth-access-token".to_string(),
+                refresh: "oauth-refresh-token".to_string(),
+                expires: chrono::Utc::now().timestamp_millis() + 3_600_000,
+                email: None,
+                subscription_type: Some("max".to_string()),
+                scopes: vec!["user:inference".to_string()],
+            })
+            .expect("save Claude OAuth account");
+
+            let anthropic = Arc::new(anthropic::AnthropicProvider::new());
+            let provider = MultiProvider {
+                claude: RwLock::new(None),
+                anthropic: RwLock::new(Some(Arc::clone(&anthropic))),
+                openai: RwLock::new(None),
+                copilot_api: RwLock::new(None),
+                antigravity: RwLock::new(None),
+                gemini: RwLock::new(None),
+                cursor: RwLock::new(None),
+                bedrock: RwLock::new(None),
+                openrouter: RwLock::new(None),
+                openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                active_openai_compatible_profile: RwLock::new(None),
+                active: RwLock::new(ActiveProvider::Claude),
+                use_claude_cli: false,
+                startup_notices: RwLock::new(Vec::new()),
+                forced_provider: None,
+            };
+            let rt = enter_test_runtime();
+            let _runtime_guard = rt.enter();
+
+            provider
+                .set_config_default_model("claude-opus-4-6", Some(default_provider))
+                .unwrap_or_else(|e| {
+                    panic!("default_provider '{default_provider}' should apply: {e}")
+                });
+
+            assert_eq!(
+                provider.active_provider(),
+                ActiveProvider::Claude,
+                "default_provider '{default_provider}' routes to Claude",
+            );
+            assert_eq!(
+                provider.active_explicit_credential(),
+                (!expect_oauth).then_some(ResolvedCredential::ApiKey),
+                "default_provider '{default_provider}' explicit-pin visibility",
+            );
+            assert_eq!(
+                rt.block_on(anthropic.test_access_token_and_oauth_mode())
+                    .expect("token"),
+                (
+                    if expect_oauth {
+                        "oauth-access-token".to_string()
+                    } else {
+                        "sk-ant-test-api-key".to_string()
+                    },
+                    expect_oauth,
+                ),
+                "default_provider '{default_provider}' should resolve {expected:?}",
+            );
+        });
+    }
 }
 
 #[test]
@@ -904,6 +1213,8 @@ fn test_multi_provider_fork_switch_request_preserves_route_identity_state_space(
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::OpenAI),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -951,6 +1262,8 @@ fn test_multi_provider_fork_switch_request_preserves_route_identity_state_space(
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::Claude),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -987,6 +1300,8 @@ fn test_multi_provider_fork_switch_request_preserves_route_identity_state_space(
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::OpenAI),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -1019,6 +1334,8 @@ fn test_multi_provider_fork_switch_request_preserves_route_identity_state_space(
                 cursor: RwLock::new(None),
                 bedrock: RwLock::new(None),
                 openrouter: RwLock::new(Some(openrouter)),
+                openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                active_openai_compatible_profile: RwLock::new(None),
                 active: RwLock::new(ActiveProvider::OpenRouter),
                 use_claude_cli: false,
                 startup_notices: RwLock::new(Vec::new()),
@@ -1050,6 +1367,8 @@ fn test_deepseek_direct_profile_supports_reasoning_effort_via_multi_provider() {
                 cursor: RwLock::new(None),
                 bedrock: RwLock::new(None),
                 openrouter: RwLock::new(None),
+                openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                active_openai_compatible_profile: RwLock::new(None),
                 active: RwLock::new(ActiveProvider::OpenAI),
                 use_claude_cli: false,
                 startup_notices: RwLock::new(Vec::new()),
@@ -1088,6 +1407,8 @@ fn test_forced_copilot_treats_claude_like_model_as_provider_local() {
             cursor: RwLock::new(None),
             bedrock: RwLock::new(None),
             openrouter: RwLock::new(None),
+            openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+            active_openai_compatible_profile: RwLock::new(None),
             active: RwLock::new(ActiveProvider::Copilot),
             use_claude_cli: false,
             startup_notices: RwLock::new(Vec::new()),
@@ -1121,6 +1442,8 @@ fn test_provider_specific_model_prefix_cannot_bypass_provider_lock() {
                 cursor: RwLock::new(Some(Arc::new(cursor::CursorCliProvider::new()))),
                 bedrock: RwLock::new(None),
                 openrouter: RwLock::new(Some(openrouter)),
+                openai_compatible_profiles: RwLock::new(std::collections::HashMap::new()),
+                active_openai_compatible_profile: RwLock::new(None),
                 active: RwLock::new(ActiveProvider::OpenRouter),
                 use_claude_cli: false,
                 startup_notices: RwLock::new(Vec::new()),
@@ -1306,6 +1629,14 @@ fn test_context_limit_claude() {
             context_limit_for_model("claude-sonnet-4-6[1m]"),
             Some(1_048_576)
         );
+        // Opus 4.8 / 4.7 expose a 1M window natively (no `[1m]` opt-in needed),
+        // matching the live Anthropic catalog's `max_input_tokens: 1000000`.
+        assert_eq!(context_limit_for_model("claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(
+            context_limit_for_model("claude-opus-4-8[1m]"),
+            Some(1_000_000)
+        );
+        assert_eq!(context_limit_for_model("claude-opus-4-7"), Some(1_000_000));
     });
 }
 

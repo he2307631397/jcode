@@ -229,11 +229,12 @@ fn small_window_inline_activity_and_composer_lanes_do_not_overlap() {
     );
     app.draft = "first line\nsecond line\nthird line".to_string();
     app.draft_cursor = app.draft.len();
-    app.apply_session_event(session_launch::DesktopSessionEvent::TextDelta(
-        "streaming response while the resume picker is open".to_string(),
-    ));
+    // Activity pill (and its lane) only shows while waiting for the first
+    // streamed token, so simulate in-flight work without streamed text.
+    app.is_processing = true;
 
     assert!(app.has_activity_indicator());
+    assert!(app.streaming_activity_pill_visible());
     assert_eq!(
         app.render_inline_widget_kind(),
         Some(InlineWidgetKind::SessionSwitcher)
@@ -254,7 +255,14 @@ fn small_window_inline_activity_and_composer_lanes_do_not_overlap() {
         &typography,
         app.render_inline_widget_visible_line_count(),
         inline_width,
-        inline_widget_target_top(size, app.text_scale(), layout.body_bottom(), false, 0.0),
+        inline_widget_target_top(
+            size,
+            inline_kind,
+            app.text_scale(),
+            layout.body_bottom(),
+            false,
+            0.0,
+        ),
         app.render_inline_widget_reveal_progress(),
         activity.y,
     )
@@ -425,9 +433,35 @@ fn inline_widget_command_palettes_draw_structured_cards_not_text_boxes() {
         1.0,
     )
     .expect("model picker layout");
+    let mut app = SingleSessionApp::new(None);
+    app.handle_key(KeyInput::OpenModelPicker);
+    app.apply_session_event(session_launch::DesktopSessionEvent::ModelCatalog {
+        current_model: Some("gpt-5.4".to_string()),
+        provider_name: Some("OpenAI".to_string()),
+        models: vec![
+            session_launch::DesktopModelChoice {
+                model: "gpt-5.4".to_string(),
+                provider: Some("OpenAI".to_string()),
+                api_method: Some("chat".to_string()),
+                detail: Some("available".to_string()),
+                available: true,
+            },
+            session_launch::DesktopModelChoice {
+                model: "claude-sonnet".to_string(),
+                provider: Some("Anthropic".to_string()),
+                api_method: Some("chat".to_string()),
+                detail: Some("available".to_string()),
+                available: true,
+            },
+        ],
+        reasoning_effort: None,
+        service_tier: None,
+        compaction_mode: None,
+    });
     let mut model_vertices = Vec::new();
     push_single_session_inline_widget_structured_chrome(
         &mut model_vertices,
+        &app,
         Some(InlineWidgetKind::ModelPicker),
         &model_lines,
         model_lines.len(),
@@ -444,9 +478,11 @@ fn inline_widget_command_palettes_draw_structured_cards_not_text_boxes() {
         vertex_count_for_color(&model_vertices, INLINE_COMMAND_ROW_BACKGROUND_COLOR) > 0,
         "unselected model row should be a rendered rounded card"
     );
+    // Left accent rails were intentionally removed from the model picker
+    // (commit b8672145); selection is conveyed by the filled row card alone.
     assert!(
-        vertex_count_for_color(&model_vertices, MODEL_PICKER_ROW_ACCENT_COLOR) > 0,
-        "selected model row should use a rendered accent rail instead of selector text"
+        vertex_count_for_color(&model_vertices, MODEL_PICKER_ROW_ACCENT_COLOR) == 0,
+        "model rows should not render the removed accent rail"
     );
 
     let session_lines = vec![
@@ -491,6 +527,7 @@ fn inline_widget_command_palettes_draw_structured_cards_not_text_boxes() {
     let mut session_vertices = Vec::new();
     push_single_session_inline_widget_structured_chrome(
         &mut session_vertices,
+        &app,
         Some(InlineWidgetKind::SessionSwitcher),
         &session_lines,
         session_lines.len(),
@@ -1278,6 +1315,107 @@ fn transcript_card_motion_animates_card_exit() {
     assert!(settled.exiting().is_empty());
 }
 
+/// The scroll fast-path replaced a per-frame full-viewport reshape with a
+/// per-line cache. This guards the correctness assumption behind that change:
+/// shaping a line on its own must produce the same inline-code glyph bounds as
+/// shaping it inside a multi-line viewport buffer (true because the transcript
+/// body buffer uses `Wrap::None`, so logical lines are shaped independently).
+#[test]
+fn inline_code_span_bounds_match_full_viewport_shaping() {
+    let size = PhysicalSize::new(1200, 760);
+    let text_scale = 1.0;
+
+    let lines = vec![
+        SingleSessionStyledLine::new(
+            "plain assistant prose with no code at all",
+            SingleSessionLineStyle::Assistant,
+        ),
+        SingleSessionStyledLine::with_inline_spans(
+            "run cargo build then cargo test now".to_string(),
+            SingleSessionLineStyle::Assistant,
+            vec![
+                SingleSessionInlineSpan {
+                    start: 4,
+                    end: 15,
+                    kind: SingleSessionInlineSpanKind::Code,
+                },
+                SingleSessionInlineSpan {
+                    start: 21,
+                    end: 31,
+                    kind: SingleSessionInlineSpanKind::Code,
+                },
+            ],
+        ),
+        SingleSessionStyledLine::new("more prose in between", SingleSessionLineStyle::Assistant),
+        SingleSessionStyledLine::with_inline_spans(
+            "a single `inline` span here".to_string(),
+            SingleSessionLineStyle::Assistant,
+            vec![SingleSessionInlineSpan {
+                start: 9,
+                end: 17,
+                kind: SingleSessionInlineSpanKind::Code,
+            }],
+        ),
+    ];
+
+    // Reference: shape the whole slice in one buffer (the old behavior) and read
+    // each code span's bounds straight off the per-line layout run.
+    let reference: Vec<Vec<Option<(f32, f32)>>> = with_measurement_font_system(|font_system| {
+        let buffer =
+            single_session_body_text_buffer_from_lines(font_system, &lines, size, text_scale);
+        let layout_runs = buffer.layout_runs().collect::<Vec<_>>();
+        lines
+            .iter()
+            .enumerate()
+            .map(|(line_index, line)| {
+                let layout_run = layout_runs.get(line_index);
+                line.inline_spans
+                    .iter()
+                    .filter(|span| span.kind == SingleSessionInlineSpanKind::Code)
+                    .map(|span| {
+                        layout_run.and_then(|run| {
+                            run.highlight(
+                                glyphon::Cursor::new(run.line_i, span.start),
+                                glyphon::Cursor::new(run.line_i, span.end),
+                            )
+                            .and_then(|(left, width)| (width > 0.0).then_some((left, left + width)))
+                        })
+                    })
+                    .collect()
+            })
+            .collect()
+    });
+
+    for (line, expected) in lines.iter().zip(reference.iter()) {
+        let cached = inline_code_span_bounds_for_line(line, size, text_scale);
+        // Cache hit must return identical data on a second call.
+        let cached_again = inline_code_span_bounds_for_line(line, size, text_scale);
+        assert_eq!(cached, cached_again, "cache must be deterministic");
+        assert_eq!(
+            cached.len(),
+            expected.len(),
+            "span count mismatch for line {:?}",
+            line.text
+        );
+        for (got, want) in cached.iter().zip(expected.iter()) {
+            match (got, want) {
+                (Some((gl, gr)), Some((wl, wr))) => {
+                    assert!(
+                        (gl - wl).abs() < 0.01 && (gr - wr).abs() < 0.01,
+                        "bounds mismatch for {:?}: got {got:?} want {want:?}",
+                        line.text
+                    );
+                }
+                (None, None) => {}
+                _ => panic!(
+                    "presence mismatch for {:?}: got {got:?} want {want:?}",
+                    line.text
+                ),
+            }
+        }
+    }
+}
+
 #[test]
 fn inline_markdown_pill_motion_animates_entry_shift_and_exit() {
     let mut registry = InlineMarkdownPillMotionRegistry::default();
@@ -1828,8 +1966,10 @@ fn session_switcher_text_buffer_shapes_loaded_session_rows() {
         .collect::<Vec<_>>()
         .join("\n");
 
+    // The rail ellipsis-truncates long rows to its column budget; the row
+    // label must still be shaped, while the full title lives in the preview.
     assert!(
-        rendered_inline_text.contains("visible resume row"),
+        rendered_inline_text.contains("active session"),
         "desktop text buffer should shape session rows, got:\n{rendered_inline_text}"
     );
 
@@ -1858,21 +1998,20 @@ fn session_switcher_text_buffer_shapes_loaded_session_rows() {
         .iter()
         .find(|area| std::ptr::eq(area.buffer, &buffers[7]))
         .expect("split preview text area");
-    let preview_start_line = inline_widget_split_preview_start(
-        app.render_inline_widget_kind(),
-        &app.render_inline_widget_styled_lines(),
-    )
-    .expect("session switcher preview start line");
-    let typography = single_session_typography_for_scale(app.text_scale());
-    let expected_preview_top = inline_area.top
-        + preview_start_line as f32
-            * inline_widget_line_height(app.render_inline_widget_kind(), &typography);
+    // The preview pane is anchored to the top of its column, not to the
+    // "Preview" header row offset inside the combined line list: a long
+    // session list would push the row offset below the visible card and
+    // leave the pane empty.
     assert!(
-        (preview_area.top - expected_preview_top).abs() <= 1.0,
-        "compact preview buffer should be positioned at its visual row offset: inline_top={}, preview_top={}, expected={}",
+        preview_area.top >= inline_area.top - 16.0,
+        "preview pane should start near the top of the card: inline_top={}, preview_top={}",
         inline_area.top,
-        preview_area.top,
-        expected_preview_top
+        preview_area.top
+    );
+    assert!(
+        (preview_area.bounds.bottom as f32) <= single_session_draft_top(size),
+        "preview pane should stay above the composer: bottom={}",
+        preview_area.bounds.bottom
     );
     assert!(
         (preview_area.top - preview_area.bounds.top as f32).abs() <= 1.0,

@@ -50,6 +50,7 @@ impl Config {
 - Debug socket: {}
 - Idle animation: {}
 - Prompt entry animation: {}
+- Compact notifications: {}
 - Chat native scrollbar: {}
 - Side panel native scrollbar: {}
 - Disabled animations: {}
@@ -63,6 +64,7 @@ impl Config {
 - Swarm: {}
 - Message timestamps: {}
 - Persist memory injections: {}
+- KV cache miss notices: {}
 - Update channel: {}
 
 **Tools:**
@@ -84,9 +86,12 @@ impl Config {
 
 **Agent models:**
 - Swarm / subagent: {}
+- Swarm spawn mode: {}
+- Spawn hook: {}
 - Review: {}
 - Judge: {}
 - Memory: {}
+- Memory sidecar: {}
 - Ambient: {}
 
 **Gateway:**
@@ -158,6 +163,7 @@ impl Config {
             self.display.debug_socket,
             self.display.idle_animation,
             self.display.prompt_entry_animation,
+            self.display.compact_notifications,
             self.display.native_scrollbars.chat,
             self.display.native_scrollbars.side_panel,
             if self.display.disabled_animations.is_empty() {
@@ -181,6 +187,7 @@ impl Config {
             self.features.swarm,
             self.features.message_timestamps,
             self.features.persist_memory_injections,
+            self.features.kv_cache_miss_notices,
             self.features.update_channel,
             if self.tools.profile.trim().is_empty() {
                 "full"
@@ -229,6 +236,11 @@ impl Config {
                 .swarm_model
                 .as_deref()
                 .unwrap_or("(inherit current session)"),
+            self.agents.swarm_spawn_mode.as_str(),
+            self.terminal
+                .spawn_hook
+                .as_deref()
+                .unwrap_or("(built-in terminal detection)"),
             self.autoreview
                 .model
                 .as_deref()
@@ -241,6 +253,11 @@ impl Config {
                 .memory_model
                 .as_deref()
                 .unwrap_or("(sidecar auto-select)"),
+            if self.agents.memory_sidecar_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             self.ambient
                 .model
                 .as_deref()

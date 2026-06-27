@@ -13,6 +13,11 @@ const SELFDEV_HINT_PROMPT: &str = include_str!("prompt/selfdev_hint.txt");
 const SELFDEV_MODE_PROMPT: &str = include_str!("prompt/selfdev_mode.txt");
 const SELFDEV_FOCUS_TUI_PROMPT: &str = include_str!("prompt/selfdev_focus_tui.txt");
 const SELFDEV_FOCUS_DESKTOP_PROMPT: &str = include_str!("prompt/selfdev_focus_desktop.txt");
+/// Final todo-confidence guidance when validation is still needed.
+pub const TODO_CONFIDENCE_NEEDS_VALIDATION_PROMPT: &str =
+    include_str!("prompt/todo_confidence_needs_validation.txt");
+/// Final todo-confidence guidance when completion confidence is sufficient.
+pub const TODO_CONFIDENCE_READY_PROMPT: &str = include_str!("prompt/todo_confidence_ready.txt");
 
 /// Split system prompt for efficient caching
 /// Static content is cached, dynamic content is not
@@ -379,11 +384,13 @@ fn build_selfdev_hint_prompt() -> String {
 }
 
 /// Build self-dev tools prompt section (static version without dynamic socket path)
+#[cfg(test)]
 fn build_selfdev_prompt_static() -> String {
     build_selfdev_prompt_static_for_context(SelfDevProductContext::Tui)
 }
 
 /// Build self-dev tools prompt section
+#[cfg(test)]
 fn build_selfdev_prompt() -> String {
     build_selfdev_prompt_for_context(SelfDevProductContext::Tui)
 }

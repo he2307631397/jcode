@@ -26,6 +26,7 @@ fn session_picker_resume_action_keeps_overlay_open() {
                 status: crate::session::SessionStatus::Closed,
                 needs_catchup: false,
                 estimated_tokens: 0,
+                first_user_prompt: None,
                 messages_preview: Vec::new(),
                 search_index: "keep-open keep open".to_string(),
                 server_name: None,
@@ -76,6 +77,7 @@ fn session_picker_enter_queues_current_terminal_resume_and_closes_overlay() {
                 status: crate::session::SessionStatus::Closed,
                 needs_catchup: false,
                 estimated_tokens: 0,
+                first_user_prompt: None,
                 messages_preview: Vec::new(),
                 search_index: "here".to_string(),
                 server_name: None,
@@ -97,7 +99,7 @@ fn session_picker_enter_queues_current_terminal_resume_and_closes_overlay() {
 
     assert!(app.session_picker_overlay.is_none());
     assert_eq!(
-        crate::tui::workspace_client::take_pending_resume_session().as_deref(),
+        app.workspace_client.take_pending_resume_session().as_deref(),
         Some("session_here_123")
     );
 }
@@ -305,6 +307,119 @@ fn slash_provider_test_coverage_overlay_scrolls_with_mouse_wheel() {
 }
 
 #[test]
+fn session_picker_preview_wheel_uses_shared_scroll_momentum() {
+    use crate::tui::session_picker::{PreviewMessage, SessionInfo, SessionSource};
+    // Build a session whose preview overflows a small pane so it can scroll.
+    let mut messages = Vec::new();
+    for i in 0..40 {
+        messages.push(PreviewMessage {
+            role: "user".to_string(),
+            content: format!("prompt line {i}"),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+        messages.push(PreviewMessage {
+            role: "assistant".to_string(),
+            content: format!("assistant reply {i}"),
+            tool_calls: Vec::new(),
+            tool_data: None,
+            timestamp: None,
+        });
+    }
+    let session = SessionInfo {
+        id: "session_scroll".to_string(),
+        parent_id: None,
+        short_name: "scroll".to_string(),
+        icon: "s".to_string(),
+        title: "Scroll".to_string(),
+        message_count: messages.len(),
+        user_message_count: 40,
+        assistant_message_count: 40,
+        created_at: chrono::Utc::now(),
+        last_message_time: chrono::Utc::now(),
+        last_active_at: None,
+        working_dir: None,
+        model: None,
+        provider_key: None,
+        is_canary: false,
+        is_debug: false,
+        saved: false,
+        save_label: None,
+        status: crate::session::SessionStatus::Closed,
+        needs_catchup: false,
+        estimated_tokens: 0,
+        first_user_prompt: Some("prompt line 0".to_string()),
+        messages_preview: messages,
+        search_index: "scroll".to_string(),
+        server_name: None,
+        server_icon: None,
+        source: SessionSource::Jcode,
+        resume_target: crate::tui::session_picker::ResumeTarget::JcodeSession {
+            session_id: "session_scroll".to_string(),
+        },
+        external_path: None,
+    };
+
+    let mut picker = crate::tui::session_picker::SessionPicker::new(vec![session]);
+    // Render once so the preview pane area + max scroll are populated, and the
+    // auto-scroll-to-bottom completes (so a wheel up has room to move). Wheel
+    // routing is coordinate-based, so pane focus does not matter here.
+    let backend = ratatui::backend::TestBackend::new(120, 20);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    terminal
+        .draw(|frame| picker.render(frame))
+        .expect("render picker");
+
+    let mut app = create_test_app();
+    app.session_picker_mode = SessionPickerMode::Resume;
+    app.session_picker_overlay = Some(RefCell::new(picker));
+
+    let scroll_before = app
+        .session_picker_overlay
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .preview_scroll_offset_for_test();
+    assert!(
+        scroll_before > 0,
+        "long preview should auto-scroll to the bottom on first render"
+    );
+
+    // A wheel up over the preview pane (right ~60% of width) routes through the
+    // shared mouse-scroll momentum (enqueue + drain) instead of an instant jump,
+    // and actually moves the preview offset.
+    let scroll_only = app.handle_mouse_event(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollUp,
+        column: 90,
+        row: 10,
+        modifiers: crossterm::event::KeyModifiers::empty(),
+    });
+    assert!(
+        scroll_only,
+        "preview wheel should be classified as scroll-only"
+    );
+    // Drain any remaining queued momentum so the move completes.
+    for _ in 0..32 {
+        app.progress_mouse_scroll_animation();
+    }
+    let scroll_after = app
+        .session_picker_overlay
+        .as_ref()
+        .unwrap()
+        .borrow()
+        .preview_scroll_offset_for_test();
+    assert!(
+        scroll_after < scroll_before,
+        "wheel up should scroll the preview toward the top (before={scroll_before}, after={scroll_after})"
+    );
+    assert!(
+        !app.has_pending_mouse_scroll_animation(),
+        "momentum queue should drain to empty"
+    );
+}
+
+#[test]
 fn test_help_topic_shows_btw_command_details() {
     let mut app = create_test_app();
     app.input = "/help btw".to_string();
@@ -365,6 +480,37 @@ fn test_commit_command_starts_synthetic_user_turn() {
         .expect("missing launch notice");
     assert_eq!(notice.role, "system");
     assert!(notice.content.contains("Starting logical commits"));
+}
+
+#[test]
+fn test_commit_push_command_starts_synthetic_user_turn() {
+    let mut app = create_test_app();
+    app.input = "/commit-push".to_string();
+    app.submit_input();
+
+    assert!(app.is_processing);
+    assert!(app.pending_turn);
+    let notice = app
+        .display_messages()
+        .last()
+        .expect("missing launch notice");
+    assert_eq!(notice.role, "system");
+    assert!(notice.content.contains("Starting logical commits + push"));
+}
+
+#[test]
+fn test_help_topic_shows_commit_push_command_details() {
+    let mut app = create_test_app();
+    app.input = "/help commit-push".to_string();
+    app.submit_input();
+
+    let msg = app
+        .display_messages()
+        .last()
+        .expect("missing help response");
+    assert_eq!(msg.role, "system");
+    assert!(msg.content.contains("/commit-push"));
+    assert!(msg.content.contains("push"));
 }
 
 #[test]
@@ -630,7 +776,7 @@ fn test_goals_command_opens_overview_in_side_panel() {
         .display_messages()
         .last()
         .expect("missing goals message");
-    assert!(msg.content.contains("Opened goals overview"));
+    assert!(msg.content.contains("Opened initiatives overview"));
 
     if let Some(prev_home) = prev_home {
         crate::env::set_var("JCODE_HOME", prev_home);
@@ -972,7 +1118,7 @@ fn test_splitview_mirrors_chat_and_streaming_text() {
         DisplayMessage::assistant("We decided to ship it.".to_string()),
     ];
     app.bump_display_messages_version();
-    app.streaming_text = "Working on the follow-up now...".to_string();
+    app.streaming.streaming_text = "Working on the follow-up now...".to_string();
     app.set_split_view_enabled(true, true);
 
     let page = app
@@ -1045,8 +1191,7 @@ fn test_observe_updates_latest_tool_context_only() {
         id: "tool_1".to_string(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs", "start_line": 1, "end_line": 10}),
-        intent: None,
-    };
+        intent: None, thought_signature: None, };
     app.observe_tool_call(&tool_call);
 
     let page = app.side_panel.focused_page().expect("missing observe page");
@@ -1085,8 +1230,7 @@ fn test_observe_ignores_noise_tools_and_preserves_latest_useful_context() {
         id: "tool_read".to_string(),
         name: "read".to_string(),
         input: serde_json::json!({"file_path": "src/main.rs"}),
-        intent: None,
-    };
+        intent: None, thought_signature: None, };
     app.observe_tool_result(&read_tool, "fn main() {}", false, Some("read"));
     let before = app
         .side_panel
@@ -1099,8 +1243,7 @@ fn test_observe_ignores_noise_tools_and_preserves_latest_useful_context() {
         id: "tool_side_panel".to_string(),
         name: "side_panel".to_string(),
         input: serde_json::json!({"action": "write", "page_id": "plan"}),
-        intent: None,
-    };
+        intent: None, thought_signature: None, };
     app.observe_tool_call(&noise_tool);
     app.observe_tool_result(&noise_tool, "ok", false, Some("side_panel"));
 

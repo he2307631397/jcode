@@ -6,19 +6,26 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, RwLock};
 
-static GITHUB_TOKEN_CACHE: LazyLock<RwLock<Option<String>>> = LazyLock::new(|| RwLock::new(None));
+/// Cached GitHub token resolved from file or subprocess sources, with the
+/// time it was cached. Env vars are intentionally NOT served from this cache:
+/// they are cheap to read and must take effect immediately when they change.
+/// The TTL bounds how long a deleted/changed credential file keeps working.
+static GITHUB_TOKEN_CACHE: LazyLock<RwLock<Option<(String, std::time::Instant)>>> =
+    LazyLock::new(|| RwLock::new(None));
+const GITHUB_TOKEN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(300);
 const FAILED_VALIDATION_AUTO_USE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 fn cached_github_token() -> Option<String> {
-    GITHUB_TOKEN_CACHE
-        .read()
-        .ok()
-        .and_then(|value| value.clone())
+    GITHUB_TOKEN_CACHE.read().ok().and_then(|value| {
+        value.as_ref().and_then(|(token, cached_at)| {
+            (cached_at.elapsed() < GITHUB_TOKEN_CACHE_TTL).then(|| token.clone())
+        })
+    })
 }
 
 fn cache_github_token(token: &str) {
     if let Ok(mut cache) = GITHUB_TOKEN_CACHE.write() {
-        *cache = Some(token.to_string());
+        *cache = Some((token.to_string(), std::time::Instant::now()));
     }
 }
 
@@ -147,18 +154,19 @@ impl CopilotApiToken {
 /// 7. trusted OpenCode/pi auth.json OAuth entries
 /// 8. optional `gh auth token` fallback when JCODE_COPILOT_ALLOW_GH_AUTH_TOKEN=1
 pub fn load_github_token() -> Result<String> {
-    if let Some(token) = cached_github_token() {
-        return Ok(token);
-    }
-
+    // Env vars first: cheap to read and they must win immediately when the
+    // user changes them, so they are never served from (or shadowed by) the
+    // file-source cache below.
     for env_key in ["COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"] {
         if let Ok(token) = std::env::var(env_key)
             && !token.trim().is_empty()
         {
-            let token = token.trim().to_string();
-            cache_github_token(&token);
-            return Ok(token);
+            return Ok(token.trim().to_string());
         }
+    }
+
+    if let Some(token) = cached_github_token() {
+        return Ok(token);
     }
 
     let config_path = ExternalCopilotAuthSource::ConfigJson.path();
@@ -623,6 +631,48 @@ pub async fn exchange_github_token(
         token: token_resp.token,
         expires_at: token_resp.expires_at,
     })
+}
+
+/// Run a live Copilot auth check and persist the result as a validation record.
+///
+/// This is the only definitive way to know a discovered GitHub token is actually
+/// usable for Copilot: a token can exist locally while the account is banned,
+/// not entitled, or otherwise rejected by the Copilot token service. We exchange
+/// the GitHub OAuth token for a Copilot bearer token (the same call the live
+/// provider makes) and record success/failure so presence-based readiness
+/// surfaces (`validation_failure_blocks_auto_use`, `check_fast`) reflect reality.
+///
+/// Returns `Ok(())` when the token exchange succeeds, or the underlying error
+/// (whose message embeds the HTTP status, e.g. `HTTP 401`/`HTTP 403`) otherwise.
+pub async fn verify_copilot_credentials_live(client: &reqwest::Client) -> Result<()> {
+    let github_token = load_github_token()?;
+    let result = exchange_github_token(client, &github_token).await;
+
+    let summary = match &result {
+        Ok(_) => "copilot token exchange ok".to_string(),
+        Err(err) => format!("{err}"),
+    };
+    let record = crate::auth::validation::ProviderValidationRecord {
+        checked_at_ms: chrono::Utc::now().timestamp_millis(),
+        success: result.is_ok(),
+        provider_smoke_ok: Some(result.is_ok()),
+        tool_smoke_ok: None,
+        summary,
+    };
+    // Best-effort: a failure to persist must not change the live result.
+    let _ = crate::auth::validation::save("copilot", record);
+    // Refresh the auth snapshot so readiness surfaces pick up the new record.
+    crate::auth::AuthStatus::invalidate_cache();
+
+    result.map(|_| ())
+}
+
+/// Convenience wrapper around [`verify_copilot_credentials_live`] that builds a
+/// short-lived HTTP client. Useful for callers (e.g. the TUI crate) that do not
+/// depend on `reqwest` directly.
+pub async fn verify_copilot_credentials_live_default() -> Result<()> {
+    let client = reqwest::Client::new();
+    verify_copilot_credentials_live(&client).await
 }
 
 /// Initiate GitHub OAuth device flow for Copilot authentication.

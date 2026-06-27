@@ -117,6 +117,31 @@ impl App {
             .or_else(|| self.resume_session_id.clone())
     }
 
+    /// Resolve the session id to resume across a client reload re-exec.
+    ///
+    /// Prefers the live `remote_session_id`, then the id captured from a
+    /// History payload that was deferred for a version mismatch
+    /// (`pending_reload_session_id`), then the resume target the client was
+    /// launched with. Only when none of those is known do we fabricate a fresh
+    /// `ses_*` id. Fabricating eagerly is what caused issue #328: the re-exec
+    /// would `jcode --resume <bogus-id>` and crash with "No session found
+    /// matching ..." after an auto-update, because the version-mismatch defer
+    /// path returns before `remote_session_id` is ever assigned.
+    pub(super) fn reload_handoff_session_id(&self) -> String {
+        self.remote_session_id
+            .clone()
+            .or_else(|| self.pending_reload_session_id.clone())
+            .or_else(|| self.resume_session_id.clone())
+            .unwrap_or_else(|| {
+                let fabricated = crate::id::new_id("ses");
+                crate::logging::warn(&format!(
+                    "Reload handoff has no known session id (remote_session_id, pending reload id, and resume target all empty); fabricating {} for re-exec",
+                    fabricated
+                ));
+                fabricated
+            })
+    }
+
     pub fn runtime_mode(&self) -> AppRuntimeMode {
         self.runtime_mode
     }
@@ -155,7 +180,12 @@ impl App {
             return false;
         };
 
-        std::fs::metadata(&candidate)
+        // The candidate may be a channel symlink to a release wrapper script;
+        // compare the payload that actually runs (`client_binary_mtime` is the
+        // running payload's mtime). Comparing the wrapper's mtime reported a
+        // phantom "newer client" forever after release installs whose wrapper
+        // was written after the payload, re-execing the client in a loop.
+        std::fs::metadata(crate::build::resolve_binary_payload(&candidate))
             .ok()
             .and_then(|m| m.modified().ok())
             .is_some_and(|mtime| mtime > startup_mtime)
@@ -261,9 +291,10 @@ impl App {
             let mut restored_model = false;
             if let Some(model) = self.session.model.clone() {
                 let model_request =
-                    crate::provider::MultiProvider::model_switch_request_for_session_model(
+                    crate::provider::MultiProvider::model_switch_request_for_session_route(
                         &model,
                         self.session.provider_key.as_deref(),
+                        self.session.route_api_method.as_deref(),
                     );
                 if let Err(e) = crate::provider::set_model_with_auth_refresh(
                     self.provider.as_ref(),

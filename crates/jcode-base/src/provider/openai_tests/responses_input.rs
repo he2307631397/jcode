@@ -4,8 +4,7 @@ fn assistant_tool_use(id: &str, name: &str, input: serde_json::Value) -> ChatMes
         content: vec![ContentBlock::ToolUse {
             id: id.to_string(),
             name: name.to_string(),
-            input,
-        }],
+            input, thought_signature: None, }],
         timestamp: None,
         tool_duration_ms: None,
     }
@@ -268,6 +267,13 @@ fn test_openai_retryable_error_patterns() {
     assert!(is_retryable_error(
         "OpenAI HTTPS stream ended before message completion marker"
     ));
+    // TLS transport errors must be retryable (previously omitted from the
+    // OpenAI-specific list, causing immediate user-facing failures).
+    assert!(is_retryable_error(
+        "stream error: io error: received fatal alert: badrecordmac"
+    ));
+    assert!(is_retryable_error("io error: broken pipe (os error 32)"));
+    assert!(is_retryable_error("connection aborted"));
 }
 
 #[test]
@@ -323,6 +329,52 @@ fn test_build_response_request_for_gpt_5_4_1m_uses_base_model_without_extra_flag
             .as_array()
             .expect("tools should be an array")
             .contains(&serde_json::json!({ "type": "image_generation" }))
+    );
+}
+
+#[test]
+fn test_build_response_request_omits_image_generation_for_codex_models() {
+    // Codex models reject the hosted image_generation tool, so it must not be
+    // attached even in ChatGPT mode (issue #369).
+    let request = build_test_response_request(
+        "gpt-5.3-codex",
+        true,
+        Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        !request["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .contains(&serde_json::json!({ "type": "image_generation" })),
+        "codex models must not receive the image_generation tool"
+    );
+}
+
+#[test]
+fn test_build_response_request_keeps_image_generation_for_non_codex_chatgpt_models() {
+    let request = build_test_response_request(
+        "gpt-5.5",
+        true,
+        Some(DEFAULT_MAX_OUTPUT_TOKENS),
+        None,
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert!(
+        request["tools"]
+            .as_array()
+            .expect("tools should be an array")
+            .contains(&serde_json::json!({ "type": "image_generation" })),
+        "non-codex ChatGPT models should still receive image_generation"
     );
 }
 

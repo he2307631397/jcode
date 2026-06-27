@@ -2,7 +2,8 @@
 
 use super::{
     App, ContentBlock, DisplayMessage, Message, ProcessingStatus, Role, SendAction, SkillRegistry,
-    commands, ctrl_bracket_fallback_to_esc, is_context_limit_error, remote,
+    commands, ctrl_bracket_fallback_to_esc, is_context_limit_error,
+    is_request_payload_too_large_error, remote,
 };
 use crate::bus::{
     Bus, BusEvent, ClipboardPasteCompleted, ClipboardPasteContent, ClipboardPasteKind,
@@ -11,72 +12,41 @@ use crate::bus::{
 use crate::util::truncate_str;
 use anyhow::Result;
 use crossterm::event::{EventStream, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
 use ratatui::DefaultTerminal;
-use std::io::{Read, Write};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const INPUT_SHELL_MAX_OUTPUT_LEN: usize = 30_000;
 
-pub(super) fn edit_input_in_external_editor(app: &mut App) {
-    match edit_text_in_external_editor(&app.input) {
-        Ok(edited) => {
-            if edited != app.input {
-                app.remember_input_undo_state();
-                app.input = edited;
-                app.cursor_pos = app.input.len();
-                app.sync_model_picker_preview_from_input();
-            }
-            app.set_status_notice("Prompt edited in $EDITOR");
+/// Remove reasoning-marked lines from committed transcript text. Reasoning lines
+/// are wrapped in emphasis containing the invisible [`REASONING_SENTINEL`]
+/// (see `jcode_tui_markdown::reasoning_line_markup`). Trailing blank lines left
+/// behind are trimmed so the remaining answer renders cleanly.
+pub(super) fn strip_reasoning_lines(content: &str) -> String {
+    let sentinel = jcode_tui_markdown::REASONING_SENTINEL;
+    let mut out_lines: Vec<&str> = Vec::new();
+    for line in content.split('\n') {
+        if line.contains(sentinel) {
+            continue;
         }
-        Err(err) => app.set_status_notice(&format!("Failed to open $EDITOR: {err}")),
+        out_lines.push(line);
     }
-}
-
-fn edit_text_in_external_editor(initial_text: &str) -> Result<String> {
-    let mut file = tempfile::Builder::new()
-        .prefix("jcode-prompt-")
-        .suffix(".md")
-        .tempfile()?;
-    file.write_all(initial_text.as_bytes())?;
-    file.flush()?;
-    let path = file.path().to_path_buf();
-
-    let raw_was_enabled = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
-    if raw_was_enabled {
-        let _ = crossterm::terminal::disable_raw_mode();
+    // Collapse runs of blank lines created by removed reasoning blocks, and trim
+    // leading/trailing blank lines.
+    let mut result = String::with_capacity(content.len());
+    let mut prev_blank = true; // suppress leading blanks
+    for line in out_lines {
+        let is_blank = line.trim().is_empty();
+        if is_blank && prev_blank {
+            continue;
+        }
+        if !result.is_empty() {
+            result.push('\n');
+        }
+        result.push_str(line);
+        prev_blank = is_blank;
     }
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    );
-
-    let status_result = std::process::Command::new("sh")
-        .arg("-c")
-        .arg("exec ${VISUAL:-${EDITOR:-vi}} \"$@\"")
-        .arg("jcode-editor")
-        .arg(&path)
-        .status();
-
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        EnterAlternateScreen,
-        crossterm::cursor::Hide
-    );
-    if raw_was_enabled {
-        let _ = crossterm::terminal::enable_raw_mode();
-    }
-
-    let status = status_result?;
-    if !status.success() {
-        anyhow::bail!("editor exited with status {status}");
-    }
-
-    let mut edited = String::new();
-    std::fs::File::open(&path)?.read_to_string(&mut edited)?;
-    Ok(edited)
+    result.trim_end().to_string()
 }
 
 fn mission_turn_reminder(session_id: &str) -> Option<String> {
@@ -350,7 +320,11 @@ where
 {
     match kind {
         ClipboardPasteKind::Smart => {
-            if let Some(text) = read_text() {
+            // Only treat the clipboard as text when it has *non-empty* text.
+            // Image-only clipboards (especially on Wayland/arboard) frequently
+            // expose an empty text target, which previously short-circuited the
+            // image path and produced a silent "0 char" paste.
+            if let Some(text) = read_text().filter(|t| !t.trim().is_empty()) {
                 if let Some(url) = super::extract_image_url(&text)
                     && let Some(content) = download_image_url(&url)
                 {
@@ -442,6 +416,29 @@ mod tests {
             matches!(content, ClipboardPasteContent::Empty),
             "expected empty paste, got {content:?}"
         );
+    }
+
+    #[test]
+    fn smart_paste_uses_image_when_text_target_is_blank() {
+        // Image-only clipboards can advertise an empty text target; the image
+        // must still be pasted instead of producing a silent empty text paste.
+        let content = read_clipboard_for_paste_with(
+            &ClipboardPasteKind::Smart,
+            || Some("   ".to_string()),
+            || Some(("image/png".to_string(), "base64".to_string())),
+            |_| None,
+        );
+
+        match content {
+            ClipboardPasteContent::Image {
+                media_type,
+                base64_data,
+            } => {
+                assert_eq!(media_type, "image/png");
+                assert_eq!(base64_data, "base64");
+            }
+            other => panic!("expected image paste, got {other:?}"),
+        }
     }
 
     #[test]
@@ -710,6 +707,7 @@ pub(super) fn handle_text_input(app: &mut App, text: &str) -> bool {
                     app.input = prompt.clone();
                     app.cursor_pos = app.input.len();
                     app.follow_chat_bottom_for_typing();
+                    app.submit_input();
                     return true;
                 }
             }
@@ -794,6 +792,17 @@ pub(super) fn handle_multiline_input_navigation(
 
     app.cursor_pos = target;
     true
+}
+
+/// True when `modifiers` is exactly one of Ctrl, Alt(Option) or Cmd(Super),
+/// the set of single modifiers we treat as "recall queued prompts / browse
+/// history" when combined with Up/Down. Shift or any combination is excluded so
+/// it doesn't shadow selection-extension or other chords.
+pub(super) fn is_prompt_recall_modifier(modifiers: KeyModifiers) -> bool {
+    matches!(
+        modifiers,
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER
+    )
 }
 
 pub(super) fn handle_prompt_history_navigation(
@@ -1016,6 +1025,18 @@ impl App {
             || !self.hidden_queued_system_messages.is_empty()
     }
 
+    /// True when a startup submission is staged and ready to auto-send.
+    ///
+    /// Headed spawns (and reloads with a resume prompt) stage their initial
+    /// prompt into `self.input` and set `submit_input_on_startup`, rather than
+    /// pushing onto `queued_messages`. The post-connect dispatcher must treat
+    /// this as pending work so the prompt is actually submitted once the remote
+    /// session history loads. See issues #267/#268/#76.
+    pub(super) fn has_pending_startup_submission(&self) -> bool {
+        self.submit_input_on_startup
+            && (!self.input.trim().is_empty() || !self.pending_images.is_empty())
+    }
+
     pub(super) fn schedule_auto_poke_followup_if_needed(&mut self) -> bool {
         if !self.auto_poke_incomplete_todos
             || self.pending_queued_dispatch
@@ -1079,12 +1100,52 @@ impl App {
             self.set_status_notice("Next-prompt new session canceled");
         }
     }
+
+    /// Whether the configured `keybindings.new_terminal` chord matches this key.
+    pub(crate) fn new_terminal_key_matches(&self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        self.new_terminal_key
+            .binding
+            .as_ref()
+            .map(|binding| binding.matches(code, modifiers))
+            .unwrap_or(false)
+    }
+
+    /// Whether the configured `keybindings.open_resume` chord matches this key.
+    pub(crate) fn open_resume_key_matches(&self, code: KeyCode, modifiers: KeyModifiers) -> bool {
+        self.open_resume_key
+            .binding
+            .as_ref()
+            .map(|binding| binding.matches(code, modifiers))
+            .unwrap_or(false)
+    }
+
+    /// Spawn a brand-new jcode session in a new terminal window.
+    pub(crate) fn handle_new_terminal_hotkey(&mut self) {
+        let cwd = commands::active_working_dir(self)
+            .filter(|path| path.is_dir())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        match super::spawn_fresh_session_in_new_terminal(&cwd) {
+            Ok(true) => self.set_status_notice("↗ New terminal opened"),
+            Ok(false) => {
+                self.set_status_notice("No supported terminal found; run `jcode` manually")
+            }
+            Err(error) => self.set_status_notice(format!("New terminal failed: {}", error)),
+        }
+    }
 }
 
 pub(super) fn is_next_prompt_new_session_hotkey(code: KeyCode, modifiers: KeyModifiers) -> bool {
-    code == KeyCode::Char(' ')
-        && modifiers.contains(KeyModifiers::SUPER)
-        && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::HYPER)
+    if code != KeyCode::Char(' ') {
+        return false;
+    }
+    // Accept either Command/Super+Space (macOS Cmd, often eaten by Spotlight) or
+    // Option/Alt+Space (macOS Option) so the fork-to-new-session arming hotkey is
+    // reachable across terminals. Reject Ctrl/Hyper combos so other chords still
+    // route to their own handlers.
+    let has_super = modifiers.contains(KeyModifiers::SUPER);
+    let has_alt = modifiers.contains(KeyModifiers::ALT);
+    (has_super || has_alt) && !modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::HYPER)
 }
 
 fn input_routes_to_new_session(app: &App) -> bool {
@@ -1166,7 +1227,7 @@ pub(super) fn handle_control_key(app: &mut App, code: KeyCode) -> bool {
             true
         }
         KeyCode::Char('e') => {
-            edit_input_in_external_editor(app);
+            app.cursor_pos = app.input.len();
             true
         }
         KeyCode::Char('b') => {
@@ -1289,11 +1350,12 @@ pub(super) fn delete_input_word_back(app: &mut App) {
 
 pub(super) fn handle_alt_key(app: &mut App, code: KeyCode) -> bool {
     match code {
-        KeyCode::Char('b') => {
+        // Alt/Option+Left/Right move by word, matching Alt+B / Alt+F.
+        KeyCode::Left | KeyCode::Char('b') => {
             app.cursor_pos = app.find_word_boundary_back();
             true
         }
-        KeyCode::Char('f') => {
+        KeyCode::Right | KeyCode::Char('f') => {
             app.cursor_pos = app.find_word_boundary_forward();
             true
         }
@@ -1462,7 +1524,12 @@ pub(super) fn handle_pre_control_shortcuts(
     code: KeyCode,
     modifiers: KeyModifiers,
 ) -> bool {
+    // Plain Ctrl+K kills to end of line (emacs habit). Ctrl+Shift+K must fall
+    // through to the scroll handler: with the Kitty keyboard protocol enabled,
+    // terminals report Ctrl+Shift+K as Char('k') + CONTROL|SHIFT, so without the
+    // Shift guard this would swallow the scroll-up chord and wipe the draft.
     if modifiers.contains(KeyModifiers::CONTROL)
+        && !modifiers.contains(KeyModifiers::SHIFT)
         && matches!(code, KeyCode::Char('k'))
         && !app.input.is_empty()
     {
@@ -1512,6 +1579,14 @@ pub(super) fn handle_pre_control_shortcuts(
         app.handle_dictation_trigger();
         return true;
     }
+    if app.new_terminal_key_matches(code, modifiers) {
+        app.handle_new_terminal_hotkey();
+        return true;
+    }
+    if app.open_resume_key_matches(code, modifiers) {
+        app.open_session_picker();
+        return true;
+    }
     if let Some(direction) = app.model_switch_keys.direction_for(code, modifiers) {
         app.cycle_model(direction);
         return true;
@@ -1529,7 +1604,7 @@ pub(super) fn handle_pre_control_shortcuts(
         app.cycle_effort(direction);
         return true;
     }
-    if app.centered_toggle_keys.toggle.matches(code, modifiers) {
+    if app.centered_toggle_keys.matches(code, modifiers) {
         app.toggle_centered_mode();
         return true;
     }
@@ -1587,6 +1662,10 @@ pub(super) fn handle_visible_copy_shortcut(
         return true;
     }
 
+    if handle_inline_image_toggle_shortcut(app, c) {
+        return true;
+    }
+
     if let Some(target) = crate::tui::ui::recent_flicker_copy_target_for_key(c)
         .or_else(|| crate::tui::ui::visible_copy_target_for_key(c))
     {
@@ -1616,6 +1695,22 @@ fn visible_copy_shortcut_key(code: KeyCode, modifiers: KeyModifiers) -> Option<c
     };
 
     modifiers.contains(KeyModifiers::ALT).then_some(c)
+}
+
+/// Alt+Shift+I toggles inline transcript images between expanded and
+/// collapsed label stubs. Only active when the transcript actually has
+/// inline images, so the chord stays inert otherwise.
+fn handle_inline_image_toggle_shortcut(app: &mut App, key: char) -> bool {
+    if !key.eq_ignore_ascii_case(&'i') {
+        return false;
+    }
+    use crate::tui::TuiState as _;
+    if app.side_pane_images_signature().0 == 0 {
+        return false;
+    }
+    app.record_copy_badge_key_press('i');
+    app.toggle_inline_images();
+    true
 }
 
 fn handle_expand_edit_badge_shortcut(app: &mut App, key: char) -> bool {
@@ -1990,6 +2085,14 @@ impl App {
             return Ok(());
         }
 
+        // While the model picker preview is visible, route its favorite/default
+        // hotkeys (Ctrl+B, Ctrl+F, Alt+F) to the focused picker handler before the
+        // global control shortcuts can claim them. This makes the hotkeys work
+        // directly in the preview list the user always sees.
+        if self.model_picker_preview_hotkey(code, modifiers)? {
+            return Ok(());
+        }
+
         if self.pending_provider_failover.is_some() && !self.is_processing {
             if code == KeyCode::Esc {
                 self.cancel_pending_provider_failover("Provider auto-switch canceled");
@@ -2016,16 +2119,23 @@ impl App {
         self.normalize_diagram_state();
         let diagram_available = self.diagram_available();
 
-        if modifiers == KeyModifiers::CONTROL && code == KeyCode::Up {
+        // Ctrl / Alt(Option) / Cmd(Super) + Up all recall queued/pending messages
+        // for editing and then walk prompt history. We accept any of the three
+        // single modifiers so the gesture works regardless of which one a given
+        // terminal forwards (some send Option as Alt, some forward Command as
+        // Super), without the user having to rebind anything.
+        if code == KeyCode::Up && is_prompt_recall_modifier(modifiers) {
             if retrieve_pending_message_for_edit(self) {
                 return Ok(());
             }
-            handle_prompt_history_navigation(self, code, modifiers);
+            // Normalize to CONTROL so handle_prompt_history_navigation takes its
+            // explicit-history path (jump straight into history even mid-draft).
+            handle_prompt_history_navigation(self, KeyCode::Up, KeyModifiers::CONTROL);
             return Ok(());
         }
 
-        if modifiers == KeyModifiers::CONTROL && code == KeyCode::Down {
-            handle_prompt_history_navigation(self, code, modifiers);
+        if code == KeyCode::Down && is_prompt_recall_modifier(modifiers) {
+            handle_prompt_history_navigation(self, KeyCode::Down, KeyModifiers::CONTROL);
             return Ok(());
         }
 
@@ -2036,8 +2146,10 @@ impl App {
             return Ok(());
         }
 
-        // Ctrl+Enter: does opposite of queue_mode during processing
-        if code == KeyCode::Enter && modifiers.contains(KeyModifiers::CONTROL) {
+        // Ctrl+Enter / Cmd+Enter: does opposite of queue_mode during processing
+        if code == KeyCode::Enter
+            && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        {
             handle_alternate_enter(self);
             return Ok(());
         }
@@ -2290,37 +2402,412 @@ impl App {
             prefix.push('\n');
         }
         prefix.push('\n');
-        if self.streaming_text.is_empty() {
+        if self.streaming.streaming_text.is_empty() {
             self.replace_streaming_text(prefix);
         } else {
-            self.replace_streaming_text(format!("{}{}", prefix, self.streaming_text));
+            self.replace_streaming_text(format!("{}{}", prefix, self.streaming.streaming_text));
         }
+    }
+
+    /// Begin a reasoning region. Reasoning renders as dim, italic text (no
+    /// blockquote gutter, no header, no footer). Idempotent while open.
+    pub(super) fn open_reasoning_region(&mut self) {
+        if self.reasoning_streaming {
+            return;
+        }
+        // Separate the reasoning block from any prior content with a blank line.
+        if !self.streaming.streaming_text.is_empty() {
+            if self.streaming.streaming_text.ends_with("\n\n") {
+                // already separated
+            } else if self.streaming.streaming_text.ends_with('\n') {
+                self.append_streaming_text("\n");
+            } else {
+                self.append_streaming_text("\n\n");
+            }
+        }
+        self.reasoning_streaming = true;
+        self.reasoning_pending_line.clear();
+        self.reasoning_partial_len = 0;
+        // Remember where this reasoning block starts in the stream so `current`
+        // mode can later slice it back out in place (without disturbing any
+        // preceding answer text) once the model starts answering.
+        self.reasoning_block_start = Some(self.streaming.streaming_text.len());
+    }
+
+    /// Remove the live partial-reasoning tail (the rendered, not-yet-committed
+    /// in-progress line) from the streaming buffer so it can be rebuilt. No-op
+    /// when there is no live partial.
+    fn strip_reasoning_partial_tail(&mut self) {
+        if self.reasoning_partial_len > 0 {
+            let new_len = self
+                .streaming
+                .streaming_text
+                .len()
+                .saturating_sub(self.reasoning_partial_len);
+            self.streaming.streaming_text.truncate(new_len);
+            self.reasoning_partial_len = 0;
+        }
+    }
+
+    /// Append streamed reasoning text, rendering the in-progress line live so
+    /// reasoning trickles in token-by-token (like normal output) rather than one
+    /// whole line at a time. Complete lines (terminated by `\n`) are committed as
+    /// dim+italic markdown; the trailing partial line is rendered as a live tail
+    /// that is re-emitted in place on each delta. The whole-line emphasis run is
+    /// preserved (each line is its own `*…*`) so styling never breaks mid-line.
+    pub(super) fn append_reasoning_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if !self.reasoning_streaming {
+            self.open_reasoning_region();
+        }
+        // Drop the previous live tail; we rebuild committed lines + a fresh tail.
+        self.strip_reasoning_partial_tail();
+        let mut committed = String::new();
+        for ch in text.chars() {
+            if ch == '\n' {
+                let line = std::mem::take(&mut self.reasoning_pending_line);
+                committed.push_str(&jcode_tui_markdown::reasoning_line_markup(&line));
+            } else {
+                self.reasoning_pending_line.push(ch);
+            }
+        }
+        if !committed.is_empty() {
+            self.streaming.streaming_text.push_str(&committed);
+        }
+        // Re-append the live tail for the in-progress (partial) line.
+        let partial = jcode_tui_markdown::reasoning_partial_markup(&self.reasoning_pending_line);
+        self.reasoning_partial_len = partial.len();
+        self.streaming.streaming_text.push_str(&partial);
+        self.refresh_split_view_if_needed();
+    }
+
+    /// Promote the live partial line to a committed line and end the region. The
+    /// `_footer` argument is ignored (the "Thought for Xs" footer was removed);
+    /// it is kept for call-site compatibility.
+    pub(super) fn close_reasoning_region(&mut self, _footer: Option<String>) {
+        if !self.reasoning_streaming {
+            return;
+        }
+        // Replace the live tail with the committed (newline-terminated) line.
+        self.strip_reasoning_partial_tail();
+        let pending = std::mem::take(&mut self.reasoning_pending_line);
+        if !pending.is_empty() {
+            self.streaming
+                .streaming_text
+                .push_str(&jcode_tui_markdown::reasoning_line_markup(&pending));
+        }
+        self.reasoning_streaming = false;
+
+        // In `current` mode, reasoning is ephemeral: it is never written to the
+        // persistent transcript. The closed block is sliced out of the live
+        // stream and anchored *in place* as a display-only reasoning message in
+        // the transcript flow: it never moves again (no bottom-following, no
+        // hoisting), stays readable for the rest of the turn, and is removed
+        // when the next user prompt starts a new turn.
+        if self.reasoning_current_mode() {
+            self.anchor_current_reasoning_block();
+            return;
+        }
+
+        // Terminate the reasoning block with a blank line so following output
+        // renders as a normal paragraph.
+        if !self.streaming.streaming_text.ends_with("\n\n") {
+            if self.streaming.streaming_text.ends_with('\n') {
+                self.streaming.streaming_text.push('\n');
+            } else {
+                self.streaming.streaming_text.push_str("\n\n");
+            }
+        }
+        self.refresh_split_view_if_needed();
+    }
+
+    /// True when the active reasoning-display mode is `current` (live-only,
+    /// ephemeral reasoning).
+    pub(super) fn reasoning_current_mode(&self) -> bool {
+        matches!(
+            crate::config::config().display.reasoning_display(),
+            crate::config::ReasoningDisplayMode::Current
+        )
+    }
+
+    /// Slice the just-closed reasoning block out of `streaming_text` and anchor
+    /// it as a display-only reasoning message in the transcript flow, exactly
+    /// where it streamed. Used in `current` mode: the trace keeps its position
+    /// (content below it can only be appended, never inserted above), so the
+    /// thought stays readable and anchored until the next user prompt removes
+    /// the turn's traces.
+    pub(super) fn anchor_current_reasoning_block(&mut self) {
+        let block_start = self
+            .reasoning_block_start
+            .take()
+            .unwrap_or(0)
+            .min(self.streaming.streaming_text.len());
+        // Everything from the block start onward is the reasoning markup. Split it
+        // off so the preceding answer text (if any) stays in the live stream.
+        let block = self.streaming.streaming_text.split_off(block_start);
+        // Drop the separator the open path added before the reasoning block so the
+        // surrounding answer text rejoins cleanly.
+        while self.streaming.streaming_text.ends_with('\n') {
+            self.streaming.streaming_text.pop();
+        }
+        let block = block.trim_matches('\n').to_string();
+        if block.is_empty() {
+            self.refresh_split_view_if_needed();
+            return;
+        }
+        // Answer text that streamed *before* the block must commit first so the
+        // anchored trace lands after it in the transcript (chronological order).
+        if !self.streaming.streaming_text.trim().is_empty() {
+            let preceding = self.take_streaming_text();
+            let preceding = self.collapse_reasoning_for_commit(preceding);
+            if !preceding.trim().is_empty() {
+                self.push_display_message(DisplayMessage::assistant(preceding));
+            }
+        }
+        self.turn_reasoning_traces
+            .push(crate::tui::app::TurnReasoningTrace {
+                display_index: self.display_messages.len(),
+                // Snapshot the transcript height when this trace anchors. The trace
+                // begins life at the viewport tail; once the transcript grows a
+                // full viewport beyond this point the trace is provably off-screen
+                // (while tail-following) and can be GC'd without visible motion.
+                wrapped_lines_at_anchor: crate::tui::ui::last_total_wrapped_lines(),
+            });
+        self.push_display_message(DisplayMessage::reasoning(block));
+        self.refresh_split_view_if_needed();
+    }
+
+    /// Remove the current turn's anchored reasoning traces from the transcript.
+    /// Called when the next user prompt is submitted so `current` mode stays
+    /// ephemeral across turns: the trace never moves while on screen, it is
+    /// simply gone the next time the user acts (a moment when the transcript
+    /// reflows anyway).
+    pub(super) fn clear_turn_reasoning_traces(&mut self) {
+        if self.turn_reasoning_traces.is_empty() {
+            return;
+        }
+        let traces = std::mem::take(&mut self.turn_reasoning_traces);
+        let removed = self.remove_reasoning_trace_messages(traces.iter().map(|t| t.display_index));
+        if removed > 0 {
+            self.bump_display_messages_version();
+            self.refresh_split_view_if_needed();
+        }
+    }
+
+    /// Garbage-collect *stale* reasoning traces (every anchored trace except
+    /// the most recent one) that are provably above the tail-following
+    /// viewport, so their removal causes zero visible motion. Keeps `current`
+    /// mode meaning "the current thought": old thoughts dissolve once they
+    /// scroll out of view instead of accumulating across a long agentic turn.
+    /// Skipped entirely while the user has scrolled up (their reading position
+    /// must not shift).
+    pub(super) fn gc_offscreen_reasoning_traces(&mut self) -> bool {
+        // Only the traces *before* the most recent one are stale.
+        if self.turn_reasoning_traces.len() < 2 {
+            return false;
+        }
+        if self.auto_scroll_paused {
+            // User is reading history; never remove anything they might see.
+            return false;
+        }
+        let total = crate::tui::ui::last_total_wrapped_lines();
+        let viewport = crate::tui::ui::last_layout_snapshot()
+            .map(|l| l.messages_area.height as usize)
+            .unwrap_or(0);
+        if total == 0 || viewport == 0 {
+            return false;
+        }
+        // A trace anchored when the transcript was `at_anchor` lines tall sits
+        // entirely above wrapped line `at_anchor`. While tail-following, the
+        // viewport shows the last `viewport` lines, so once the transcript has
+        // grown a full viewport past the anchor point (with margin for the
+        // separator blank line), the trace cannot be on screen.
+        let last = self.turn_reasoning_traces.len() - 1;
+        let stale: Vec<usize> = self.turn_reasoning_traces[..last]
+            .iter()
+            .filter(|t| total.saturating_sub(t.wrapped_lines_at_anchor) > viewport + 2)
+            .map(|t| t.display_index)
+            .collect();
+        if stale.is_empty() {
+            return false;
+        }
+        let removed = self.remove_reasoning_trace_messages(stale.iter().copied());
+        if removed > 0 {
+            // Re-track surviving traces with adjusted display indices.
+            self.turn_reasoning_traces.retain_mut(|t| {
+                if stale.contains(&t.display_index) {
+                    return false;
+                }
+                let shift = stale.iter().filter(|&&s| s < t.display_index).count();
+                t.display_index -= shift;
+                true
+            });
+            self.bump_display_messages_version();
+            self.refresh_split_view_if_needed();
+            return true;
+        }
+        false
+    }
+
+    /// Remove reasoning display messages at the given (pre-removal) indices.
+    /// Returns how many were removed.
+    fn remove_reasoning_trace_messages(&mut self, indices: impl Iterator<Item = usize>) -> usize {
+        let mut sorted: Vec<usize> = indices.collect();
+        sorted.sort_unstable();
+        let mut removed = 0usize;
+        for idx in sorted {
+            let idx = idx.saturating_sub(removed);
+            if idx < self.display_messages.len() && self.display_messages[idx].role == "reasoning" {
+                self.display_messages.remove(idx);
+                removed += 1;
+            }
+        }
+        removed
     }
 
     pub(super) fn append_streaming_text(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
-        self.streaming_text.push_str(text);
+        // Invariant: answer text is never appended *into* an open reasoning
+        // region. If a region is still open when real (non-whitespace) answer
+        // text arrives, close it first so the next `open_reasoning_region` still
+        // inserts its blank-line separator. Without this, a stale
+        // `reasoning_streaming` flag makes `open_reasoning_region` early-return
+        // and the answer tail gets glued directly onto the next reasoning run
+        // (e.g. `...patch + build.Ah, I see...`). Whitespace-only appends (the
+        // separators emitted by the reasoning helpers themselves) never trip
+        // this. `open_reasoning_region` only appends its separator *before*
+        // setting the flag, so this cannot recurse.
+        if self.reasoning_streaming && !text.trim().is_empty() {
+            self.close_reasoning_region(None);
+        }
+        self.streaming.streaming_text.push_str(text);
         self.refresh_split_view_if_needed();
     }
 
+    /// Apply a batch of paced [`StreamOp`]s from the segment-aware
+    /// [`StreamBuffer`](crate::tui::stream_buffer::StreamBuffer) to the live
+    /// streaming view, preserving arrival order across answer text, reasoning
+    /// text, and reasoning-region boundaries. Returns true when anything
+    /// visible changed.
+    pub(super) fn apply_stream_ops(
+        &mut self,
+        ops: Vec<crate::tui::stream_buffer::StreamOp>,
+    ) -> bool {
+        use crate::tui::stream_buffer::StreamOp;
+        let mut changed = false;
+        for op in ops {
+            match op {
+                StreamOp::Text(text) => {
+                    if !text.is_empty() {
+                        // `append_streaming_text` enforces the invariant that real
+                        // answer text closes any still-open reasoning region first
+                        // (so the region's blank-line separator is preserved). The
+                        // buffer also queues an explicit CloseReasoning before
+                        // non-whitespace text, so this is normally already closed.
+                        self.append_streaming_text(&text);
+                        changed = true;
+                    }
+                }
+                StreamOp::Reasoning(text) => {
+                    if !text.is_empty() {
+                        self.append_reasoning_text(&text);
+                        changed = true;
+                    }
+                }
+                StreamOp::CloseReasoning => {
+                    if self.reasoning_streaming {
+                        self.close_reasoning_region(None);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// In `current` reasoning display mode, reasoning is shown live but collapsed
+    /// once the assistant commits a message or runs a tool. Strip any
+    /// reasoning-marked lines (identified by [`REASONING_SENTINEL`]) from text
+    /// about to be committed to the transcript. Other modes pass through.
+    pub(super) fn collapse_reasoning_for_commit(&self, content: String) -> String {
+        if !matches!(
+            crate::config::config().display.reasoning_display(),
+            crate::config::ReasoningDisplayMode::Current
+        ) {
+            return content;
+        }
+        strip_reasoning_lines(&content)
+    }
+
     pub(super) fn replace_streaming_text(&mut self, text: String) {
-        self.streaming_text = text;
+        self.streaming.streaming_text = text;
         self.refresh_split_view_if_needed();
     }
 
     pub(super) fn clear_streaming_render_state(&mut self) {
-        self.streaming_text.clear();
+        self.streaming.streaming_text.clear();
         self.stream_message_ended = false;
+        self.reasoning_streaming = false;
+        self.reasoning_pending_line.clear();
+        self.reasoning_partial_len = 0;
+        // The stream (and any block offset into it) is gone.
+        self.reasoning_block_start = None;
         self.refresh_split_view_if_needed();
         self.streaming_md_renderer.borrow_mut().reset();
         crate::tui::mermaid::clear_streaming_preview_diagram();
     }
 
+    /// Discard all client-side render state for the current streaming attempt:
+    /// the live streaming buffer, in-progress tool calls, thinking-line state,
+    /// and any assistant transcript messages that were already committed
+    /// mid-attempt at tool-call boundaries.
+    ///
+    /// Used when the provider reports a `RetryRollback`: a transient transport
+    /// fault interrupted the response mid-stream and the request is being
+    /// replayed from the top, so everything from the aborted attempt must
+    /// disappear or the replay would render duplicated output.
+    pub(super) fn rollback_streaming_attempt(&mut self) {
+        self.stream_buffer.clear();
+        self.clear_streaming_render_state();
+        self.streaming_tool_calls.clear();
+        self.batch_progress = None;
+        self.thought_line_inserted = false;
+        self.thinking_prefix_emitted = false;
+        self.thinking_buffer.clear();
+        self.thinking_start = None;
+        // Assistant text committed to the transcript during this attempt (a
+        // ToolStart boundary commits the pending streamed text) must also go;
+        // the retry re-streams the entire response. `push_display_message`
+        // counts the trailing run of assistant messages and resets on any
+        // user/tool/system fence, so this removes exactly the current
+        // attempt's committed segments and never touches earlier turns.
+        let to_remove = self.attempt_committed_assistant_messages;
+        for _ in 0..to_remove {
+            if self
+                .display_messages
+                .last()
+                .is_some_and(|m| m.role == "assistant")
+            {
+                let idx = self.display_messages.len() - 1;
+                self.remove_display_message(idx);
+            } else {
+                break;
+            }
+        }
+        self.attempt_committed_assistant_messages = 0;
+    }
+
     pub(super) fn take_streaming_text(&mut self) -> String {
-        let content = std::mem::take(&mut self.streaming_text);
+        let content = std::mem::take(&mut self.streaming.streaming_text);
         self.stream_message_ended = false;
+        self.reasoning_streaming = false;
+        self.reasoning_pending_line.clear();
+        self.reasoning_partial_len = 0;
+        self.reasoning_block_start = None;
         self.refresh_split_view_if_needed();
         self.streaming_md_renderer.borrow_mut().reset();
         crate::tui::mermaid::clear_streaming_preview_diagram();
@@ -2328,16 +2815,30 @@ impl App {
     }
 
     pub(super) fn commit_pending_streaming_assistant_message(&mut self) -> bool {
-        if let Some(chunk) = self.stream_buffer.flush() {
-            self.append_streaming_text(&chunk);
+        let ops = self.stream_buffer.flush();
+        self.apply_stream_ops(ops);
+        // A commit is a hard message boundary: end any still-open reasoning
+        // region so `current` mode retains/discards the trace correctly.
+        if self.reasoning_streaming {
+            self.close_reasoning_region(None);
         }
 
-        if self.streaming_text.is_empty() {
+        if self.streaming.streaming_text.is_empty() {
             self.stream_buffer.clear();
+            // Tool-only boundary (no answer text): keep the retained trace on
+            // screen so the thought stays readable while the tool runs. It
+            // folds when superseded by the next trace or at end of turn.
             return false;
         }
 
         let content = self.take_streaming_text();
+        let content = self.collapse_reasoning_for_commit(content);
+        if content.trim().is_empty() {
+            // Nothing left after collapsing reasoning-only content; same
+            // tool-only situation as above, keep the trace readable.
+            self.stream_buffer.clear();
+            return false;
+        }
         self.push_display_message(DisplayMessage::assistant(content));
         self.stream_buffer.clear();
         true
@@ -2355,8 +2856,8 @@ impl App {
             // treat this as a reset and count the full value once.
             output_tokens
         };
-        if self.streaming_tps_collect_output {
-            self.streaming_total_output_tokens += delta;
+        if self.streaming.streaming_tps_collect_output {
+            self.streaming.streaming_total_output_tokens += delta;
             if delta > 0 {
                 self.snapshot_streaming_tps();
             }
@@ -2407,6 +2908,7 @@ impl App {
 
         let trimmed = input.trim();
         let handled = commands::handle_help_command(self, trimmed)
+            || commands::handle_keys_command(self, trimmed)
             || commands::handle_ssh_command(self, trimmed)
             || commands::handle_session_command(self, trimmed)
             || commands::handle_dictation_command(self, trimmed)
@@ -2417,6 +2919,7 @@ impl App {
             || super::debug::handle_debug_command(self, trimmed)
             || super::model_context::handle_model_command(self, trimmed)
             || super::commands::handle_usage_command(self, trimmed)
+            || super::productivity::handle_productivity_command(self, trimmed)
             || super::commands::handle_feedback_command(self, trimmed)
             || super::state_ui::handle_info_command(self, trimmed)
             || super::auth::handle_auth_command(self, trimmed)
@@ -2511,6 +3014,9 @@ impl App {
         self.onboarding_preview_mode = false;
 
         // Add user message to display (show placeholder to user, not full paste)
+        // Remember the typed prompt so we can restore it to the input box if this
+        // turn fails (e.g. "token refresh needed"), instead of dropping it.
+        self.last_submitted_input = Some(raw_input.clone());
         self.push_display_message(DisplayMessage {
             role: "user".to_string(),
             content: raw_input, // Show placeholder to user (condensed view)
@@ -2562,24 +3068,27 @@ impl App {
         self.is_processing = true;
         self.status = ProcessingStatus::Sending;
         self.clear_streaming_render_state();
+        // A new prompt starts a new turn: the previous turn's anchored
+        // reasoning traces leave the transcript (ephemeral `current` mode).
+        self.clear_turn_reasoning_traces();
         self.stream_buffer.clear();
         self.thought_line_inserted = false;
         self.thinking_prefix_emitted = false;
         self.thinking_buffer.clear();
         self.streaming_tool_calls.clear();
-        self.streaming_input_tokens = 0;
-        self.streaming_output_tokens = 0;
-        self.streaming_cache_read_tokens = None;
-        self.streaming_cache_creation_tokens = None;
-        self.current_api_usage_recorded = false;
+        self.streaming.streaming_input_tokens = 0;
+        self.streaming.streaming_output_tokens = 0;
+        self.streaming.streaming_cache_read_tokens = None;
+        self.streaming.streaming_cache_creation_tokens = None;
+        self.kv_cache.current_api_usage_recorded = false;
         self.upstream_provider = None;
         self.status_detail = None;
-        self.streaming_tps_start = None;
-        self.streaming_tps_elapsed = Duration::ZERO;
-        self.streaming_tps_collect_output = false;
-        self.streaming_total_output_tokens = 0;
-        self.streaming_tps_observed_output_tokens = 0;
-        self.streaming_tps_observed_elapsed = Duration::ZERO;
+        self.streaming.streaming_tps_start = None;
+        self.streaming.streaming_tps_elapsed = Duration::ZERO;
+        self.streaming.streaming_tps_collect_output = false;
+        self.streaming.streaming_total_output_tokens = 0;
+        self.streaming.streaming_tps_observed_output_tokens = 0;
+        self.streaming.streaming_tps_observed_elapsed = Duration::ZERO;
         self.processing_started = Some(Instant::now());
         self.visible_turn_started = Some(Instant::now());
         self.pending_turn = true;
@@ -2635,19 +3144,19 @@ impl App {
             self.thinking_prefix_emitted = false;
             self.thinking_buffer.clear();
             self.streaming_tool_calls.clear();
-            self.streaming_input_tokens = 0;
-            self.streaming_output_tokens = 0;
-            self.streaming_cache_read_tokens = None;
-            self.streaming_cache_creation_tokens = None;
-            self.current_api_usage_recorded = false;
+            self.streaming.streaming_input_tokens = 0;
+            self.streaming.streaming_output_tokens = 0;
+            self.streaming.streaming_cache_read_tokens = None;
+            self.streaming.streaming_cache_creation_tokens = None;
+            self.kv_cache.current_api_usage_recorded = false;
             self.upstream_provider = None;
             self.status_detail = None;
-            self.streaming_tps_start = None;
-            self.streaming_tps_elapsed = Duration::ZERO;
-            self.streaming_tps_collect_output = false;
-            self.streaming_total_output_tokens = 0;
-            self.streaming_tps_observed_output_tokens = 0;
-            self.streaming_tps_observed_elapsed = Duration::ZERO;
+            self.streaming.streaming_tps_start = None;
+            self.streaming.streaming_tps_elapsed = Duration::ZERO;
+            self.streaming.streaming_tps_collect_output = false;
+            self.streaming.streaming_total_output_tokens = 0;
+            self.streaming.streaming_tps_observed_output_tokens = 0;
+            self.streaming.streaming_tps_observed_elapsed = Duration::ZERO;
             self.processing_started = Some(Instant::now());
             if has_combined {
                 if preserve_visible_turn {
@@ -2665,10 +3174,18 @@ impl App {
             {
                 Ok(()) => {
                     self.last_stream_error = None;
+                    self.last_submitted_input = None;
                 }
                 Err(e) => {
                     let err_str = crate::util::format_error_chain(&e);
-                    if is_context_limit_error(&err_str) {
+                    if is_request_payload_too_large_error(&err_str) {
+                        if !self
+                            .try_recover_payload_too_large_and_retry(terminal, event_stream)
+                            .await
+                        {
+                            self.handle_turn_error(err_str);
+                        }
+                    } else if is_context_limit_error(&err_str) {
                         if self
                             .try_auto_compact_and_retry(terminal, event_stream)
                             .await

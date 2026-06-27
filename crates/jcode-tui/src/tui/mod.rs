@@ -11,6 +11,7 @@ pub struct ContextSnapshot {
 pub mod backend;
 pub(crate) mod color_support;
 mod core;
+pub(crate) mod fuzzy;
 // Terminal image display + metadata helpers now live in the dependency-free
 // `jcode-terminal-image` crate (shared with the `read` tool). Re-exported here
 // so existing `crate::tui::image` / `crate::tui::image_metadata` paths keep working.
@@ -19,15 +20,19 @@ use jcode_terminal_image::metadata as image_metadata;
 pub mod info_widget;
 mod info_widget_layout;
 mod info_widget_overview;
-mod keybind;
+pub mod info_widget_stability;
+pub mod keybind;
 mod layout_utils;
 pub mod login_picker;
 pub mod markdown;
 mod memory_profile;
 pub mod mermaid;
-pub mod permissions;
+pub mod permissions {
+    pub use jcode_tui_permissions::*;
+}
 mod remote_diff;
 pub mod screenshot;
+pub(crate) mod session_facts;
 pub mod session_picker;
 mod stream_buffer;
 pub mod test_harness;
@@ -111,8 +116,37 @@ pub fn disable_keyboard_enhancement() {
     );
 }
 
+/// Hash a rendered image's transcript anchor into `hasher`. Shared by the
+/// default and `App` implementations of `side_pane_images_signature` so both
+/// stay in lockstep.
+pub(crate) fn hash_rendered_image_anchor(
+    anchor: Option<&crate::session::RenderedImageAnchor>,
+    hasher: &mut impl std::hash::Hasher,
+) {
+    use std::hash::Hash;
+    match anchor {
+        None => 0u8.hash(hasher),
+        Some(crate::session::RenderedImageAnchor::ToolCall { id }) => {
+            1u8.hash(hasher);
+            id.hash(hasher);
+        }
+        Some(crate::session::RenderedImageAnchor::UserPrompt { ordinal }) => {
+            2u8.hash(hasher);
+            ordinal.hash(hasher);
+        }
+    }
+}
+
 /// Trait for TUI state consumed by the shared renderer.
+///
+/// This is a wide (114-method) presentation interface: the read-only surface the
+/// renderer needs from `App`. The methods are grouped into the domain sections
+/// below (transcript, input, scroll, stream/status, provider, session/server,
+/// workspace, diagram pane, diff pane, side panel, inline, overlay, copy
+/// selection, onboarding, misc). See `docs/TUISTATE_TRAIT_DECOMPOSITION.md` for
+/// the incremental plan to split these into composable sub-traits.
 pub trait TuiState {
+    // ---- Transcript ----
     fn display_messages(&self) -> &[DisplayMessage];
     fn display_user_message_count(&self) -> usize;
     /// Number of user prompts hidden before the first visible message because of
@@ -122,9 +156,36 @@ pub trait TuiState {
     }
     fn has_display_edit_tool_messages(&self) -> bool;
     fn side_pane_images(&self) -> Vec<crate::session::RenderedImage>;
+    /// Cheap signature of the current inline-image set: `(count, content_hash)`.
+    /// Used by the prepared-frame cache so the inline image section invalidates
+    /// when images are added/removed without cloning the payloads every frame.
+    /// The default implementation derives it from `side_pane_images`; overrides
+    /// can provide a cheaper path.
+    fn side_pane_images_signature(&self) -> (usize, u64) {
+        use std::hash::{Hash, Hasher};
+        let images = self.side_pane_images();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for image in &images {
+            image.media_type.hash(&mut hasher);
+            image.data.len().hash(&mut hasher);
+            // A short prefix is enough to distinguish distinct payloads cheaply.
+            image
+                .data
+                .as_bytes()
+                .iter()
+                .take(64)
+                .for_each(|b| b.hash(&mut hasher));
+            // The anchor determines where the image renders in the transcript,
+            // so anchor changes must invalidate prepared frames too.
+            hash_rendered_image_anchor(image.anchor.as_ref(), &mut hasher);
+        }
+        (images.len(), hasher.finish())
+    }
     /// Version counter for display_messages (monotonic, increments on mutation)
     fn display_messages_version(&self) -> u64;
     fn streaming_text(&self) -> &str;
+
+    // ---- Input ----
     fn input(&self) -> &str;
     fn cursor_pos(&self) -> usize;
     fn is_processing(&self) -> bool;
@@ -132,9 +193,38 @@ pub trait TuiState {
     fn interleave_message(&self) -> Option<&str>;
     /// Messages sent as soft interrupt but not yet injected (shown in queue preview)
     fn pending_soft_interrupts(&self) -> &[String];
+
+    // ---- Scroll ----
     fn scroll_offset(&self) -> usize;
     /// Whether auto-scroll to bottom is paused (user scrolled up during streaming)
     fn auto_scroll_paused(&self) -> bool;
+    /// When older compacted history is being loaded in, this is the reader's
+    /// captured distance (in wrapped lines) from the bottom of the transcript.
+    /// The renderer uses it to keep the viewport anchored to the same content as
+    /// older messages are prepended above, instead of snapping to the new top.
+    fn pending_history_anchor_lines_from_bottom(&self) -> Option<usize> {
+        None
+    }
+    /// Whether the elastic overscroll status line (revealed by scrolling past
+    /// the bottom of the transcript) is currently shown.
+    fn chat_overscroll_active(&self) -> bool {
+        false
+    }
+    /// Seconds remaining in the overscroll dwell window, used to render the
+    /// `(overscroll x.x)` countdown. `None` when not shown.
+    fn chat_overscroll_remaining(&self) -> Option<f32> {
+        None
+    }
+    /// Whether a mouse drag-selection is currently held at the top/bottom edge of
+    /// a pane and should keep auto-scrolling on every tick (browser-style). When
+    /// true the redraw loop must stay responsive even if the transcript is
+    /// otherwise idle, since the terminal sends no further events while the mouse
+    /// is held still.
+    fn copy_selection_edge_autoscroll_active(&self) -> bool {
+        false
+    }
+
+    // ---- Provider ----
     fn provider_name(&self) -> String;
     fn provider_model(&self) -> String;
     /// Upstream provider (e.g., which provider OpenRouter routed to)
@@ -145,6 +235,8 @@ pub trait TuiState {
     fn status_detail(&self) -> Option<String>;
     fn mcp_servers(&self) -> Vec<(String, usize)>;
     fn available_skills(&self) -> Vec<String>;
+
+    // ---- Stream / status ----
     fn streaming_tokens(&self) -> (u64, u64);
     fn streaming_cache_tokens(&self) -> (Option<u64>, Option<u64>);
     /// Output tokens per second during streaming (for status bar)
@@ -161,6 +253,12 @@ pub trait TuiState {
     /// Progress of a currently-running batch tool call.
     fn batch_progress(&self) -> Option<crate::bus::BatchProgress>;
     fn time_since_activity(&self) -> Option<Duration>;
+    /// Whether the client terminal currently has focus. Decorative animations and
+    /// periodic idle redraws pause while unfocused so backgrounded windows/tabs do
+    /// not burn CPU. Defaults to true for state impls that do not track focus.
+    fn client_focused(&self) -> bool {
+        true
+    }
     /// Whether the provider/server has ended the visible assistant message while turn cleanup
     /// still finishes in the background.
     fn stream_message_ended(&self) -> bool {
@@ -172,6 +270,8 @@ pub trait TuiState {
     fn session_compaction_count(&self) -> usize {
         0
     }
+
+    // ---- Session / server ----
     /// Whether running in remote (client-server) mode
     fn is_remote_mode(&self) -> bool;
     /// Whether running in canary/self-dev mode
@@ -188,6 +288,10 @@ pub trait TuiState {
     fn server_display_name(&self) -> Option<String>;
     /// Server icon (e.g., "🔥", "🌫️") - only set in remote mode
     fn server_display_icon(&self) -> Option<String>;
+    /// Server binary version (e.g., "v0.25.19-dev (abc1234)") - remote mode only
+    fn server_display_version(&self) -> Option<String> {
+        None
+    }
     /// List of all session IDs on the server (remote mode only)
     fn server_sessions(&self) -> Vec<String>;
     /// Number of connected clients (remote mode only)
@@ -237,6 +341,18 @@ pub trait TuiState {
     fn server_update_available(&self) -> Option<bool>;
     /// Get info widget data (todos, client count, etc.)
     fn info_widget_data(&self) -> info_widget::InfoWidgetData;
+
+    /// Whether the inline swarm gallery band should be shown above the chat.
+    /// Active when `agents.swarm_spawn_mode = inline` and the swarm has members.
+    fn inline_swarm_gallery_active(&self) -> bool {
+        false
+    }
+    /// Members to render in the inline swarm gallery band.
+    fn inline_swarm_members(&self) -> Vec<crate::protocol::SwarmMemberStatus> {
+        Vec::new()
+    }
+
+    // ---- Workspace ----
     /// Whether workspace mode is enabled for this client.
     fn workspace_mode_enabled(&self) -> bool {
         false
@@ -259,6 +375,7 @@ pub trait TuiState {
     /// Update cost calculation based on token usage (for API-key providers)
     fn update_cost(&mut self);
     /// Diagram display mode (none/margin/pinned)
+    // ---- Diagram pane ----
     fn diagram_mode(&self) -> crate::config::DiagramDisplayMode;
     /// Whether the diagram pane is focused (pinned mode)
     fn diagram_focus(&self) -> bool;
@@ -268,6 +385,8 @@ pub trait TuiState {
     fn diagram_scroll(&self) -> (i32, i32);
     /// Diagram pane width ratio percentage
     fn diagram_pane_ratio(&self) -> u8;
+    /// Whether the user has manually resized the diagram/side pane width.
+    fn diagram_pane_ratio_user_adjusted(&self) -> bool;
     /// Whether the diagram pane ratio is currently animating
     fn diagram_pane_animating(&self) -> bool;
     /// Whether the pinned diagram pane is visible
@@ -277,6 +396,7 @@ pub trait TuiState {
     /// Diagram zoom percentage (100 = normal)
     fn diagram_zoom(&self) -> u8;
     /// Scroll offset for pinned diff pane (line index)
+    // ---- Diff pane ----
     fn diff_pane_scroll(&self) -> usize;
     /// Horizontal pan offset for the shared right pane (side-panel diagrams)
     fn diff_pane_scroll_x(&self) -> i32;
@@ -285,9 +405,26 @@ pub trait TuiState {
     /// Whether the pinned diff pane is focused
     fn diff_pane_focus(&self) -> bool;
     /// Session-scoped side panel state managed by the side_panel tool
+    // ---- Side panel ----
     fn side_panel(&self) -> &crate::side_panel::SidePanelSnapshot;
     /// Whether to pin read images to a side pane
     fn pin_images(&self) -> bool;
+    /// Whether inline transcript images render expanded. When false, each
+    /// image collapses to a one-line label stub with a `show image` badge.
+    /// Persisted across restarts/resume via UI preferences.
+    fn inline_images_visible(&self) -> bool {
+        true
+    }
+    /// Per-image inline expand level for `image_id` (Fit when never expanded).
+    /// Cycled by clicking the per-image `expand` badge.
+    fn image_expand_level(&self, _image_id: u64) -> ImageExpandLevel {
+        ImageExpandLevel::Fit
+    }
+    /// Monotonic counter bumped whenever any image's expand level changes, so
+    /// prepared-frame caches that embed anchored image geometry invalidate.
+    fn expanded_images_version(&self) -> u64 {
+        0
+    }
     /// Remaining seconds before the pinned image side pane auto-hides.
     fn pinned_images_auto_hide_remaining_secs(&self) -> Option<u64> {
         None
@@ -299,6 +436,7 @@ pub trait TuiState {
     /// Whether to wrap lines in the pinned diff pane
     fn diff_line_wrap(&self) -> bool;
     /// Interactive inline UI state (picker-like flows shown above input)
+    // ---- Inline ----
     fn inline_interactive_state(&self) -> Option<&InlineInteractiveState>;
     /// Passive inline UI state (informational views shown above input)
     fn inline_view_state(&self) -> Option<&InlineViewState> {
@@ -311,6 +449,7 @@ pub trait TuiState {
             .or_else(|| self.inline_view_state().map(InlineUiStateRef::View))
     }
     /// Changelog overlay scroll offset (None = not showing)
+    // ---- Overlay ----
     fn changelog_scroll(&self) -> Option<usize>;
     /// Help overlay scroll offset (None = not showing)
     fn help_scroll(&self) -> Option<usize>;
@@ -327,10 +466,12 @@ pub trait TuiState {
     /// Usage overlay for /usage command
     fn usage_overlay(&self) -> Option<&std::cell::RefCell<usage_overlay::UsageOverlay>>;
     /// Working directory for this session
+    // ---- Misc ----
     fn working_dir(&self) -> Option<String>;
     /// Monotonic clock for viewport animations
     fn now_millis(&self) -> u64;
     /// UI state for live copy badge highlighting / feedback
+    // ---- Copy selection ----
     fn copy_badge_ui(&self) -> crate::tui::CopyBadgeUiState;
     /// Whether modal in-app copy selection mode is active.
     fn copy_selection_mode(&self) -> bool;
@@ -339,6 +480,7 @@ pub trait TuiState {
     /// Persistent status for in-app copy selection mode.
     fn copy_selection_status(&self) -> Option<CopySelectionStatus>;
     /// Whether the first-run onboarding empty state is being previewed in this session.
+    // ---- Onboarding ----
     fn onboarding_preview_mode(&self) -> bool {
         false
     }
@@ -575,17 +717,27 @@ pub enum OnboardingWelcomeKind {
     ///
     /// When `import` is `Some`, we detected importable external logins and are
     /// walking the user through them one at a time (a yes/no prompt per login).
-    /// When `None`, there was nothing to import and the card points the user at
-    /// the provider picker.
-    Login { import: Option<LoginImportPrompt> },
-    /// Ask whether to share prompt/transcript content with telemetry, with a
-    /// live decision countdown. `yes_highlighted` reflects the current choice.
-    TelemetryConsent {
-        yes_highlighted: bool,
-        seconds_left: u64,
+    /// When `None` and `importing` is false, there was nothing to import and the
+    /// card points the user at the provider picker. When `None` and `importing`
+    /// is true, the user just committed the import and it is running, so the card
+    /// shows an "Importing your logins..." progress state. When `error` is
+    /// `Some`, a prior import failed and the recovery copy explains what went
+    /// wrong plus the concrete next step.
+    Login {
+        import: Option<LoginImportPrompt>,
+        importing: bool,
+        error: Option<String>,
+        /// When a prior import failed and we detected a coding agent the user
+        /// recently used, its display label (e.g. "Codex"). The recovery screen
+        /// offers "Press H to have <label> help fix this". `None` hides that
+        /// option.
+        repair_agent_label: Option<String>,
     },
-    /// Ask the user to pick a model first (press Enter to open the picker).
-    ModelSelect,
+    /// Ask the user whether to log in to OpenAI (no detected imports). A
+    /// highlightable Yes/No selector; `yes_highlighted` reflects the current
+    /// choice. Yes starts the OpenAI sign-in, No skips login and finishes
+    /// onboarding (the user can run `/login` later).
+    LoginOpenAi { yes_highlighted: bool },
     /// "Continue where you left off in <cli>?" with a highlightable Yes/No
     /// selector and a live decision countdown (seconds remaining).
     ContinuePrompt {
@@ -597,23 +749,34 @@ pub enum OnboardingWelcomeKind {
     Suggestions,
 }
 
-/// Render-friendly snapshot of the current step in the per-candidate login
-/// import walkthrough. Describes which detected login is being reviewed and
-/// which Yes/No option is currently highlighted.
+/// Render-friendly snapshot of the single-screen login-import checkbox list.
+/// Carries every detected login plus which ones are checked and which row the
+/// cursor is on, so the welcome card can draw the whole list at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginImportPrompt {
+    /// One entry per detected login, in display order.
+    pub rows: Vec<LoginImportRow>,
+    /// Index of the row the cursor is currently on.
+    pub cursor: usize,
+    /// When `true`, the navigable "Continue" pill (above and below the list) is
+    /// focused instead of a login row, so it renders highlighted and Enter
+    /// commits the import.
+    pub continue_focused: bool,
+    /// How many rows are currently checked for import.
+    pub checked_count: usize,
+    /// Seconds left before the screen auto-imports all checked logins.
+    pub seconds_left: u64,
+}
+
+/// One row in the login-import checkbox list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoginImportRow {
     /// Human-readable provider summary (e.g. "OpenAI/Codex").
     pub provider_summary: String,
     /// Where the credentials came from (e.g. "Codex auth.json").
     pub source_name: String,
-    /// 1-based position of this candidate.
-    pub position: usize,
-    /// Total number of detected candidates.
-    pub total: usize,
-    /// Whether the "Yes" option is currently highlighted (vs. "No").
-    pub yes_highlighted: bool,
-    /// Seconds left before this candidate auto-commits its default.
-    pub seconds_left: u64,
+    /// Whether this login is checked for import.
+    pub checked: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1119,6 +1282,13 @@ fn idle_donut_active_with_policy(
         return false;
     }
 
+    // Decorative animations are purely visual; never spin them while the terminal
+    // window/tab is backgrounded. A swarm of unfocused sessions would otherwise
+    // each render a full-screen 3D scene at animation FPS, saturating every core.
+    if !state.client_focused() {
+        return false;
+    }
+
     // The onboarding welcome screen draws the same live donut, but it also
     // shows a welcome/login card so `display_messages()` is not empty.  Keep the
     // animation loop running smoothly while that screen is up (even past the
@@ -1144,10 +1314,22 @@ fn idle_donut_active_with_policy(
     policy.enable_decorative_animations
         && crate::config::config().display.idle_animation
         && policy.tier.idle_animation_enabled()
-        && state.display_messages().is_empty()
+        && !has_started_conversation(state)
         && !state.is_processing()
         && state.streaming_text().is_empty()
         && state.queued_messages().is_empty()
+}
+
+/// Whether the transcript contains any real conversation yet (a user prompt or
+/// an assistant/tool/reasoning reply). A fresh screen that only holds
+/// non-conversational notices (e.g. the "run /login when you're ready" system
+/// message left after onboarding is declined) is still "idle", so the decorative
+/// donut should keep spinning until the user actually starts chatting.
+fn has_started_conversation(state: &dyn TuiState) -> bool {
+    state
+        .display_messages()
+        .iter()
+        .any(|m| matches!(m.role.as_str(), "user" | "assistant" | "tool" | "reasoning"))
 }
 
 pub(crate) fn idle_donut_active(state: &dyn TuiState) -> bool {
@@ -1159,6 +1341,22 @@ fn rate_limit_countdown_redraw_active(state: &dyn TuiState) -> bool {
     state
         .rate_limit_remaining()
         .map(|remaining| remaining <= Duration::from_secs(60))
+        .unwrap_or(false)
+}
+
+/// The notification line shows a live prompt-cache indicator (`⏳ cache Ns`
+/// while warm in the final minute, `🧊 cache cold` once expired). Both states
+/// emerge long after the 30s deep-idle cutoff, so without a dedicated wakeup
+/// the idle loop never repaints to reveal them. Keep redrawing whenever the
+/// cache is within the last-minute countdown window or has just gone cold so
+/// the warning actually appears before the next prompt.
+fn cache_cold_countdown_redraw_active(state: &dyn TuiState) -> bool {
+    if state.is_processing() {
+        return false;
+    }
+    state
+        .cache_ttl_status()
+        .map(|info| info.is_cold || info.remaining_secs <= 60)
         .unwrap_or(false)
 }
 
@@ -1180,10 +1378,13 @@ fn full_frame_status_animation_active_with_policy(
 
 fn primary_status_spinner_fast_path_available_with_policy(
     state: &dyn TuiState,
-    policy: &crate::perf::TuiPerfPolicy,
+    _policy: &crate::perf::TuiPerfPolicy,
 ) -> bool {
-    policy.enable_decorative_animations
-        && state.is_processing()
+    // The single-cell spinner fast path is available in every performance tier,
+    // including Minimal/SSH/WSL where decorative animations are off. Keep these
+    // conditions in sync with `app::run_shell::status_spinner_only_symbol`, which
+    // is what actually gates the spinner-only tick in the run loop.
+    state.is_processing()
         && app::run_shell::status_uses_primary_spinner(&state.status())
         && state.streaming_text().is_empty()
         && !state.centered_mode()
@@ -1195,8 +1396,11 @@ fn primary_status_spinner_needs_full_redraw_with_policy(
     state: &dyn TuiState,
     policy: &crate::perf::TuiPerfPolicy,
 ) -> bool {
-    policy.enable_decorative_animations
-        && state.is_processing()
+    // The primary spinner only needs the more expensive full-redraw cadence when
+    // the cheap single-cell fast path cannot run (e.g. centered composer). When
+    // the fast path is available we keep full redraws at the slow passive-liveness
+    // rate and let the one-cell renderer animate the spinner.
+    state.is_processing()
         && app::run_shell::status_uses_primary_spinner(&state.status())
         && state.streaming_text().is_empty()
         && !primary_status_spinner_fast_path_available_with_policy(state, policy)
@@ -1213,6 +1417,45 @@ pub(crate) fn redraw_interval_with_policy(
     let animation_interval = fps_to_duration(policy.animation_fps);
     let fast_interval = fps_to_duration(policy.redraw_fps);
 
+    // A retained/collapsing reasoning trace used to need animation cadence here;
+    // anchored traces are static transcript messages now. The tail-follow
+    // catch-up slide still needs smooth frames and must skip the deep-idle
+    // short-circuits below.
+    if ui::tail_catchup_active() {
+        return match policy.tier {
+            crate::perf::PerformanceTier::Minimal => fast_interval,
+            _ => animation_interval,
+        };
+    }
+
+    // The elastic overscroll line shows a live `(overscroll x.x)` countdown that
+    // depletes over ~1.5s. Without a dedicated branch it falls through to the
+    // 250ms idle cadence and ticks in coarse, steppy jumps. Drive it at the
+    // smooth animation cadence so the countdown reads as continuous.
+    if state.chat_overscroll_active() {
+        return match policy.tier {
+            crate::perf::PerformanceTier::Minimal => fast_interval,
+            _ => animation_interval,
+        };
+    }
+
+    // While the terminal is backgrounded (FocusLost), an idle session has nothing
+    // worth a fast tick: decorative animations are paused and the run loop only
+    // repaints throttled idle frames. Use the slow deep-idle interval so the
+    // event loop sleeps instead of spinning on shared-server bus chatter. Sessions
+    // with live output keep a responsive cadence below.
+    if !state.client_focused()
+        && !state.is_processing()
+        && state.streaming_text().is_empty()
+        && !state.has_pending_mouse_scroll_animation()
+        && !state.copy_selection_edge_autoscroll_active()
+        && !state.remote_startup_phase_active()
+        && !rate_limit_countdown_redraw_active(state)
+        && crate::build::read_build_progress().is_none()
+    {
+        return REDRAW_DEEP_IDLE;
+    }
+
     let deep_idle = state
         .time_since_activity()
         .map(|d| d >= REDRAW_DEEP_IDLE_AFTER)
@@ -1222,8 +1465,10 @@ pub(crate) fn redraw_interval_with_policy(
         && !state.is_processing()
         && state.streaming_text().is_empty()
         && !state.has_pending_mouse_scroll_animation()
+        && !state.copy_selection_edge_autoscroll_active()
         && !state.remote_startup_phase_active()
         && !rate_limit_countdown_redraw_active(state)
+        && !cache_cold_countdown_redraw_active(state)
         && crate::build::read_build_progress().is_none()
         && !state.onboarding_welcome_active()
     {
@@ -1262,6 +1507,7 @@ pub(crate) fn redraw_interval_with_policy(
         || !state.streaming_text().is_empty()
         || state.status_notice().is_some()
         || state.has_pending_mouse_scroll_animation()
+        || state.copy_selection_edge_autoscroll_active()
         || state.has_notification()
         || rate_limit_countdown_redraw_active(state)
     {
@@ -1299,8 +1545,11 @@ pub(crate) fn periodic_redraw_required(state: &dyn TuiState) -> bool {
         && !state.is_processing()
         && state.streaming_text().is_empty()
         && !state.has_pending_mouse_scroll_animation()
+        && !state.copy_selection_edge_autoscroll_active()
+        && !state.chat_overscroll_active()
         && !state.remote_startup_phase_active()
         && !rate_limit_countdown_redraw_active(state)
+        && !cache_cold_countdown_redraw_active(state)
         && crate::build::read_build_progress().is_none()
         && !state.onboarding_welcome_active()
     {
@@ -1317,8 +1566,11 @@ pub(crate) fn periodic_redraw_required(state: &dyn TuiState) -> bool {
 
     if state.is_processing()
         || !state.streaming_text().is_empty()
+        || ui::tail_catchup_active()
         || state.status_notice().is_some()
         || state.has_pending_mouse_scroll_animation()
+        || state.copy_selection_edge_autoscroll_active()
+        || state.chat_overscroll_active()
         || state.has_notification()
         || rate_limit_countdown_redraw_active(state)
         || state.remote_startup_phase_active()
@@ -1353,6 +1605,7 @@ pub fn render_frame(frame: &mut Frame<'_>, state: &dyn TuiState) {
     ui::draw(frame, state);
 }
 
+pub use ui::inline_image_ui::ImageExpandLevel;
 pub use ui::{
     PinnedDiagramLiveDebugSnapshot, PinnedDiagramProbeRect, SidePanelDebugStats,
     SidePanelMermaidProbe, SidePanelMermaidProbeRect, debug_probe_pinned_diagram,

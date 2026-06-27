@@ -124,6 +124,12 @@ pub(crate) enum Command {
     /// Run as an Agent Client Protocol (ACP) adapter backed by the Jcode daemon
     Acp,
 
+    /// Manage the background server daemon (e.g. `jcode server stop`).
+    Server {
+        #[command(subcommand)]
+        action: ServerCommand,
+    },
+
     /// Connect to a running server
     Connect,
 
@@ -144,7 +150,11 @@ pub(crate) enum Command {
     /// Login to a provider via OAuth, API key, or local credentials
     Login {
         /// Provider to log in to. Equivalent to --provider for this command, e.g. `jcode login google`.
-        #[arg(value_enum)]
+        // Distinct clap id: the global `--provider` flag also has id "provider";
+        // sharing the id makes clap drop the flag inside `login` (so
+        // `jcode login --provider x` errors) and propagate the global default
+        // into this positional.
+        #[arg(value_enum, id = "login_provider", value_name = "PROVIDER")]
         provider: Option<ProviderChoice>,
 
         /// Account label for multi-account support (stored labels are auto-numbered)
@@ -393,8 +403,8 @@ pub(crate) enum Command {
         #[arg(long)]
         coverage_file: Option<String>,
 
-        /// Maximum uncovered provider/model gaps to show in the full summary
-        #[arg(long, default_value_t = 50)]
+        /// Maximum provider/model pairs to list in the full summary (0 = show all)
+        #[arg(long, default_value_t = 0)]
         coverage_limit: usize,
     },
 
@@ -467,6 +477,54 @@ pub(crate) enum Command {
     Restart {
         #[command(subcommand)]
         action: RestartCommand,
+    },
+
+    /// Show a live macOS menu bar indicator with running/streaming session counts
+    #[command(alias = "menu-bar", alias = "statusbar")]
+    Menubar {
+        /// Print the current counts once as text and exit (no menu bar item)
+        #[arg(long)]
+        once: bool,
+
+        /// Emit the current counts as JSON and exit
+        #[arg(long, conflicts_with = "once")]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub(crate) enum ServerCommand {
+    /// Gracefully reload the running background server onto the newest binary.
+    ///
+    /// This is the preferred way to pick up an upgrade: the daemon hands its
+    /// live sessions off to a freshly exec'd server (the same path `/reload`
+    /// uses), so headless/swarm work is preserved instead of being killed. If
+    /// no server is running, this is a no-op. Use `server stop --force` only
+    /// when you need to hard-retire a wedged daemon.
+    Reload {
+        /// Reload even if the running server is already on the newest binary.
+        #[arg(long)]
+        force: bool,
+
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Stop the running background server and clear its socket.
+    ///
+    /// Prefer `server reload` after an upgrade; it preserves live sessions.
+    /// `stop` terminates the daemon (SIGTERM, escalating to SIGKILL), which
+    /// drops any in-flight headless/swarm sessions, so it requires `--force`
+    /// as a deliberate acknowledgement.
+    Stop {
+        /// Confirm that terminating the daemon (and dropping live sessions) is intended.
+        #[arg(long)]
+        force: bool,
+
+        /// Emit JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 }
 

@@ -419,6 +419,7 @@ impl AmbientRunnerHandle {
                 child.replace_messages(parent.messages.clone());
                 child.compaction = parent.compaction.clone();
                 child.provider_key = parent.provider_key.clone();
+                child.route_api_method = parent.route_api_method.clone();
                 child.model = parent.model.clone();
                 child.subagent_model = parent.subagent_model.clone();
                 child.improve_mode = parent.improve_mode;
@@ -868,7 +869,7 @@ impl AmbientRunnerHandle {
             active_sessions,
         );
 
-        let initial_message = "Begin your ambient cycle. Check the scheduled queue, assess memory graph health, and plan your work using the todos tool.".to_string();
+        let initial_message = "Begin your ambient cycle. Check the scheduled queue, assess memory graph health, and plan your work using the `todo` tool.".to_string();
 
         Ok((system_prompt, initial_message))
     }

@@ -115,6 +115,27 @@ impl App {
             })
             .to_string();
         }
+        if cmd == "stream-jitter" {
+            // Arrival-vs-reveal smoothness report for the paced stream buffer.
+            // `reveals.bucket_100ms_cv` well below `arrivals.bucket_100ms_cv`
+            // means pacing is smoothing provider bursts (text and reasoning).
+            return serde_json::to_string_pretty(&self.stream_buffer.jitter_profile())
+                .unwrap_or_else(|_| "{}".to_string());
+        }
+        if cmd == "stream-jitter:reset" {
+            self.stream_buffer.reset_jitter();
+            return "OK: stream jitter stats reset".to_string();
+        }
+        if cmd == "smoothness" {
+            // Anchor-stability report: jarring transcript motion (repositions,
+            // insertions above, big pops, blinks, mass reflows) per rendered
+            // frame, with expected motion (scroll/resize/tail-follow) excluded.
+            return crate::tui::ui::smoothness_report_json();
+        }
+        if cmd == "smoothness:reset" {
+            crate::tui::ui::smoothness_reset();
+            return "OK: smoothness stats reset".to_string();
+        }
         if cmd == "overlay" || cmd == "overlay:status" {
             let overlay = crate::tui::visual_debug::overlay_enabled();
             return serde_json::json!({
@@ -208,6 +229,7 @@ impl App {
                             "new_string": new_string,
                         }),
                         intent: None,
+                        thought_signature: None,
                     },
                 ),
             ];
@@ -252,6 +274,50 @@ impl App {
             let raw = raw.trim();
             let limit = raw.parse::<usize>().ok();
             self.debug_picker_state_json(limit)
+        } else if let Some(raw) = cmd.strip_prefix("swarm-gallery:") {
+            // Debug-only: inject synthetic inline swarm members and force the
+            // inline gallery active so the band can be captured in a frame.
+            // Format: swarm-gallery:<N>  (N synthetic agents), or
+            //         swarm-gallery:off  (clear injected members + force flag).
+            let raw = raw.trim();
+            if raw == "off" {
+                self.debug_force_inline_gallery = false;
+                self.remote_swarm_members.clear();
+                "OK: inline swarm gallery cleared".to_string()
+            } else {
+                let n: usize = raw.parse().unwrap_or(3);
+                let statuses = ["running", "thinking", "ready", "completed", "blocked"];
+                let names = [
+                    "fox", "owl", "bee", "elk", "ant", "cat", "dog", "jay", "ram", "yak", "ox",
+                    "emu",
+                ];
+                let samples = [
+                    "Editing crates/jcode-tui/src/tui/ui.rs\n  carving the gallery band off chat_area",
+                    "Thinking about how to wire the bus tap\n  into the streaming loop without",
+                    "Running cargo build --profile selfdev\n  Compiling jcode-app-core",
+                    "Done: 4 tests passed, committed.",
+                    "Waiting on coordinator approval for plan",
+                ];
+                self.remote_swarm_members = (0..n)
+                    .map(|i| crate::protocol::SwarmMemberStatus {
+                        session_id: format!("session_{:02}", i),
+                        friendly_name: Some(names[i % names.len()].to_string()),
+                        status: statuses[i % statuses.len()].to_string(),
+                        detail: Some(format!("task {}", i + 1)),
+                        role: if i == 0 {
+                            Some("coordinator".to_string())
+                        } else {
+                            Some("agent".to_string())
+                        },
+                        is_headless: Some(i != 0),
+                        live_attachments: Some(1),
+                        status_age_secs: Some((i as u64) * 7),
+                        output_tail: Some(samples[i % samples.len()].to_string()),
+                    })
+                    .collect();
+                self.debug_force_inline_gallery = true;
+                format!("OK: injected {n} inline swarm members; gallery forced active")
+            }
         } else if cmd == "swarm" || cmd == "swarm-status" {
             if self.is_remote {
                 serde_json::json!({
@@ -280,6 +346,7 @@ impl App {
                         is_headless: Some(false),
                         live_attachments: Some(1),
                         status_age_secs: Some(0),
+                        output_tail: None,
                     }],
                 })
                 .to_string()
@@ -532,6 +599,9 @@ impl App {
         } else if cmd == "scroll-suite" || cmd.starts_with("scroll-suite:") {
             let raw = cmd.strip_prefix("scroll-suite:");
             self.run_scroll_suite(raw)
+        } else if cmd == "widget-stability" || cmd.starts_with("widget-stability:") {
+            let raw = cmd.strip_prefix("widget-stability:");
+            self.run_widget_stability(raw)
         } else if cmd == "side-panel-latency" || cmd.starts_with("side-panel-latency:") {
             let raw = cmd.strip_prefix("side-panel-latency:");
             self.run_side_panel_latency_bench(raw)
@@ -717,6 +787,7 @@ impl App {
                  - scroll:<up|down|top|bottom> - control scroll\n\
                  - scroll-test[:<json>] - run offscreen scroll+diagram test\n\
                  - scroll-suite[:<json>] - run scroll+diagram test suite\n\
+                 - widget-stability[:<json>] - quantify info-widget movement while scrolling current transcript\n\
                  - side-panel-latency[:<json>] - benchmark headless side-panel input->frame latency\n\
                  - keys:<keyspec> - inject key events (e.g. keys:ctrl+r)\n\
                  - input - get current input buffer\n\

@@ -167,11 +167,7 @@ pub fn format_account_model_availability_detail(
 }
 
 pub(crate) fn normalize_model_id(model: &str) -> String {
-    let normalized = model.trim().to_ascii_lowercase();
-    normalized
-        .strip_suffix("[1m]")
-        .unwrap_or(&normalized)
-        .to_string()
+    jcode_provider_core::model_id::canonical(model)
 }
 
 fn normalize_provider_id(provider: &str) -> String {
@@ -197,10 +193,16 @@ fn current_claude_account_scope() -> String {
 }
 
 fn current_anthropic_catalog_scope() -> String {
-    if std::env::var("ANTHROPIC_API_KEY")
-        .ok()
-        .map(|key| !key.trim().is_empty())
-        .unwrap_or(false)
+    // Match the credential-resolution order used by the Anthropic provider:
+    // the API key can come from the process env *or* the persisted
+    // anthropic.env file. Checking only the env var made env-file-keyed
+    // sessions read/write the OAuth scope while requests actually used the
+    // API key, so the `api-key` catalog scope went permanently stale.
+    if crate::provider_catalog::load_api_key_from_env_or_config(
+        "ANTHROPIC_API_KEY",
+        "anthropic.env",
+    )
+    .is_some()
     {
         "api-key".to_string()
     } else {
@@ -269,7 +271,7 @@ fn model_ids_with_context_aliases(models: Vec<String>) -> Vec<String> {
         if seen.insert(model.clone()) {
             deduped.push(model.clone());
         }
-        if get_cached_context_limit(&normalized).unwrap_or_default() >= 1_000_000 {
+        if model_exposes_1m_alias(&normalized) {
             let alias = format!("{}[1m]", normalized);
             if seen.insert(alias.clone()) {
                 deduped.push(alias);
@@ -278,6 +280,27 @@ fn model_ids_with_context_aliases(models: Vec<String>) -> Vec<String> {
     }
 
     deduped
+}
+
+/// Whether a `<model>[1m]` long-context picker alias should be surfaced.
+///
+/// For *known* Claude models this is authoritative: only opt-in 1M models (Opus
+/// 4.6, Sonnet 4.6) get an alias. Native-1M models (Opus 4.8, 4.7) already use
+/// 1M by default, so a `[1m]` alias would be a redundant duplicate, and
+/// 200K-only models (Sonnet 4.5, which the live catalog wrongly advertises as
+/// 1M) get no alias. Unknown/future Claude ids and all non-Claude models keep
+/// the prior behavior: alias when the cached catalog limit is >= 1M.
+fn model_exposes_1m_alias(normalized_model: &str) -> bool {
+    if normalized_model.starts_with("claude-") {
+        let mode = jcode_provider_core::anthropic_context_mode(normalized_model);
+        // Only trust the classifier for models it actually recognizes; for
+        // anything it maps to `Standard` we can't tell a genuine 200K model from
+        // an unrecognized future one, so fall back to the catalog heuristic.
+        if mode != jcode_provider_core::AnthropicContextMode::Standard {
+            return mode.exposes_1m_alias();
+        }
+    }
+    get_cached_context_limit(normalized_model).unwrap_or_default() >= 1_000_000
 }
 
 fn live_catalog_model_ids(service: &ModelCatalogService, scope: &str) -> Option<Vec<String>> {
@@ -379,7 +402,7 @@ fn hydrate_catalog_cache_from_disk(
     }
 
     let observed_at = system_time_from_unix_secs(persisted.observed_at_unix_secs);
-    service.replace_scope_models(scope, normalized, observed_at);
+    service.hydrate_scope_models_from_snapshot(scope, normalized, observed_at);
     if !persisted.context_limits.is_empty() {
         populate_context_limits(persisted.context_limits.clone());
     }
@@ -397,6 +420,16 @@ pub fn cached_openai_model_ids() -> Option<Vec<String>> {
     let scope = current_openai_account_scope();
     live_catalog_model_ids(&OPENAI_MODEL_CATALOG_SERVICE, &scope)
         .or_else(|| load_openai_catalog_from_disk(&scope))
+}
+
+/// Test-only: clear the process-global in-memory model catalogs. The catalog
+/// services are statics shared by every test in the process; a test that
+/// hydrates a scope (directly or via `persist_*` + `cached_*`) otherwise leaks
+/// fixture models into later tests' `known_*_model_ids()` validation.
+#[cfg(test)]
+pub(crate) fn reset_model_catalog_services_for_tests() {
+    OPENAI_MODEL_CATALOG_SERVICE.reset_for_tests();
+    ANTHROPIC_MODEL_CATALOG_SERVICE.reset_for_tests();
 }
 
 pub fn persist_openai_model_catalog(catalog: &OpenAIModelCatalog) {
@@ -437,6 +470,36 @@ pub fn populate_context_limits(models: HashMap<String, usize>) {
             ));
             cache.insert(model.clone(), *limit);
         }
+    }
+}
+
+/// Populate the context limit cache from named provider model configs in the
+/// user's config file.
+///
+/// Custom OpenAI-compatible providers that lack a usable `/v1/models` endpoint
+/// rely on per-model `context_window` config. That value is honored by the
+/// provider instance's own `context_window()` method, but every other
+/// resolution path (TUI info widget, compaction budget, model switching) goes
+/// through the global [`CONTEXT_LIMIT_CACHE`] via
+/// [`context_limit_for_model_with_provider`]. Seed that cache here so the
+/// configured limit is respected globally instead of falling back to
+/// [`DEFAULT_CONTEXT_LIMIT`].
+pub fn populate_context_limits_from_config() {
+    let cfg = crate::config::config();
+    let mut limits = HashMap::new();
+    for provider_cfg in cfg.providers.values() {
+        for model in &provider_cfg.models {
+            let id = model.id.trim();
+            if id.is_empty() {
+                continue;
+            }
+            if let Some(limit) = model.context_window {
+                limits.insert(id.to_ascii_lowercase(), limit);
+            }
+        }
+    }
+    if !limits.is_empty() {
+        populate_context_limits(limits);
     }
 }
 
@@ -960,9 +1023,9 @@ pub fn provider_for_model_with_hint(
     let model = model.trim();
     if model.contains('@') {
         Some("openrouter")
-    } else if ALL_CLAUDE_MODELS.contains(&model) {
+    } else if jcode_provider_core::model_id::matches_known_model(model, ALL_CLAUDE_MODELS) {
         Some("claude")
-    } else if ALL_OPENAI_MODELS.contains(&model) {
+    } else if jcode_provider_core::model_id::matches_known_model(model, ALL_OPENAI_MODELS) {
         Some("openai")
     } else if crate::provider::bedrock::BedrockProvider::is_bedrock_model_id(model) {
         Some("bedrock")

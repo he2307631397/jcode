@@ -7,7 +7,26 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
+pub mod repo_ranking;
+
 pub type ImportCoreResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+/// Truncate a string at a valid UTF-8 character boundary.
+///
+/// Returns a slice of at most `max_bytes` bytes, ending at a valid char
+/// boundary so it never panics on multibyte input. This mirrors
+/// `jcode_core::util::truncate_str`, duplicated here to keep this leaf crate
+/// free of the heavier `jcode-core` dependency.
+fn truncate_str(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
 
 /// Entry in the Claude Code sessions-index.json file.
 #[derive(Debug, Deserialize)]
@@ -113,12 +132,34 @@ pub enum ClaudeCodeContentBlock {
     },
     ToolResult {
         tool_use_id: String,
+        // Claude Code (notably newer/macOS builds) sometimes writes
+        // `tool_result.content` as an array of content blocks
+        // (e.g. `[{"type":"text","text":"..."}]`) rather than a plain string.
+        // Accept both so the whole JSONL entry does not fail to parse and get
+        // silently dropped during import.
+        #[serde(default, deserialize_with = "deserialize_tool_result_content")]
         content: String,
         #[serde(default)]
         is_error: Option<bool>,
     },
     #[serde(other)]
     Unknown,
+}
+
+/// Deserialize a Claude Code `tool_result` content value that may be either a
+/// plain string or an array of content blocks. Array forms are flattened to
+/// their textual content so the importer keeps these messages instead of
+/// dropping the entire entry on a type mismatch.
+fn deserialize_tool_result_content<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::String(text) => text,
+        serde_json::Value::Null => String::new(),
+        other => extract_external_text_from_json(&other, true),
+    })
 }
 
 pub fn parse_rfc3339_string(value: Option<&str>) -> Option<DateTime<Utc>> {
@@ -399,6 +440,67 @@ pub fn extract_external_text_from_json(value: &serde_json::Value, include_tools:
     out.join("\n")
 }
 
+/// Extract the textual body of an OpenCode message from its part files.
+///
+/// Modern OpenCode (Go storage, v1.x) stores message bodies in
+/// `storage/part/<messageID>/*.json` rather than inline on the message JSON.
+/// Each part has a `type` (`text`, `reasoning`, `tool`, `step-start`,
+/// `step-finish`, ...). Plain `text` parts are always included; reasoning and
+/// tool input/output are included only when `include_tools` is set.
+pub fn extract_opencode_part_text(
+    parts_base: &Path,
+    message_id: &str,
+    include_tools: bool,
+) -> String {
+    let message_parts = parts_base.join(message_id);
+    if !message_parts.exists() {
+        return String::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for part_path in collect_files_recursive(&message_parts, "json") {
+        let Ok(file) = File::open(&part_path) else {
+            continue;
+        };
+        let Ok(part) = serde_json::from_reader::<_, serde_json::Value>(file) else {
+            continue;
+        };
+        let part_type = part.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        match part_type {
+            "text" => {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str())
+                    && !text.trim().is_empty()
+                {
+                    out.push(text.trim().to_string());
+                }
+            }
+            "reasoning" if include_tools => {
+                if let Some(text) = part.get("text").and_then(|v| v.as_str())
+                    && !text.trim().is_empty()
+                {
+                    out.push(text.trim().to_string());
+                }
+            }
+            "tool" if include_tools => {
+                if let Some(state) = part.get("state") {
+                    if let Some(input) = state.get("input") {
+                        let input_text = extract_external_text_from_json(input, include_tools);
+                        if !input_text.trim().is_empty() {
+                            out.push(input_text.trim().to_string());
+                        }
+                    }
+                    if let Some(output) = state.get("output").and_then(|v| v.as_str())
+                        && !output.trim().is_empty()
+                    {
+                        out.push(output.trim().to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out.join("\n")
+}
+
 pub fn file_modified_datetime(path: &Path) -> Option<DateTime<Utc>> {
     std::fs::metadata(path)
         .and_then(|meta| meta.modified())
@@ -553,10 +655,10 @@ pub fn load_codex_external_session(
     Ok(Some(ExternalSessionRecord {
         source: "codex",
         session_id: session_id.to_string(),
-        short_name: Some(format!("codex {}", &session_id[..session_id.len().min(8)])),
+        short_name: Some(format!("codex {}", truncate_str(&session_id, 8))),
         title: Some(format!(
             "Codex session {}",
-            &session_id[..session_id.len().min(8)]
+            truncate_str(&session_id, 8)
         )),
         working_dir,
         provider_key: Some("openai-codex".to_string()),
@@ -648,10 +750,10 @@ pub fn load_pi_external_session(
     Ok(Some(ExternalSessionRecord {
         source: "pi",
         session_id: session_id.to_string(),
-        short_name: Some(format!("pi {}", &session_id[..session_id.len().min(8)])),
+        short_name: Some(format!("pi {}", truncate_str(&session_id, 8))),
         title: Some(format!(
             "Pi session {}",
-            &session_id[..session_id.len().min(8)]
+            truncate_str(&session_id, 8)
         )),
         working_dir,
         provider_key,
@@ -666,6 +768,7 @@ pub fn load_pi_external_session(
 pub fn load_opencode_external_session(
     path: &Path,
     messages_base: &Path,
+    parts_base: &Path,
     include_tools: bool,
     max_scan_sessions: usize,
 ) -> ImportCoreResult<Option<ExternalSessionRecord>> {
@@ -698,7 +801,7 @@ pub fn load_opencode_external_session(
         .unwrap_or_else(|| {
             format!(
                 "OpenCode session {}",
-                &session_id[..session_id.len().min(8)]
+                truncate_str(&session_id, 8)
             )
         });
     let mut provider_key = Some("opencode".to_string());
@@ -732,11 +835,23 @@ pub fn load_opencode_external_session(
                 .and_then(|v| v.as_str())
                 .map(str::to_string)
                 .or(provider_key);
-            let text = msg_value
-                .get("summary")
-                .or_else(|| msg_value.get("content"))
-                .map(|value| extract_external_text_from_json(value, include_tools))
+            let message_id = msg_value
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            // Modern OpenCode stores body text in part files keyed by message id.
+            // Fall back to legacy inline content/summary for older stores.
+            let mut text = message_id
+                .as_deref()
+                .map(|id| extract_opencode_part_text(parts_base, id, include_tools))
                 .unwrap_or_default();
+            if text.trim().is_empty() {
+                text = msg_value
+                    .get("content")
+                    .or_else(|| msg_value.get("summary"))
+                    .map(|value| extract_external_text_from_json(value, include_tools))
+                    .unwrap_or_default();
+            }
             if text.trim().is_empty() {
                 continue;
             }
@@ -744,10 +859,7 @@ pub fn load_opencode_external_session(
                 role: role.to_string(),
                 text,
                 timestamp: None,
-                id: msg_value
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
+                id: message_id,
             });
         }
     }
@@ -756,7 +868,7 @@ pub fn load_opencode_external_session(
         session_id: session_id.to_string(),
         short_name: Some(format!(
             "opencode {}",
-            &session_id[..session_id.len().min(8)]
+            truncate_str(&session_id, 8)
         )),
         title: Some(title),
         working_dir,
@@ -927,6 +1039,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Some("a"), Some("b")]
         );
+    }
+
+    #[test]
+    fn tool_result_content_accepts_array_blocks() {
+        // Newer/macOS Claude Code writes tool_result.content as an array of
+        // content blocks. The entry must still parse (not be dropped) and the
+        // array must flatten to its textual content.
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"hello world"}]}]}}"#;
+        let entry = serde_json::from_str::<ClaudeCodeEntry>(line)
+            .expect("entry with array tool_result content should parse");
+        let ClaudeCodeContent::Blocks(blocks) = entry.message.unwrap().content else {
+            panic!("expected block content");
+        };
+        match &blocks[0] {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => {
+                assert_eq!(content, "hello world");
+            }
+            other => panic!("expected tool_result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tool_result_content_accepts_string() {
+        let line = r#"{"type":"user","uuid":"u1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"t1","content":"plain"}]}}"#;
+        let entry = serde_json::from_str::<ClaudeCodeEntry>(line).unwrap();
+        let ClaudeCodeContent::Blocks(blocks) = entry.message.unwrap().content else {
+            panic!("expected block content");
+        };
+        match &blocks[0] {
+            ClaudeCodeContentBlock::ToolResult { content, .. } => assert_eq!(content, "plain"),
+            other => panic!("expected tool_result, got {other:?}"),
+        }
     }
 
     #[test]
